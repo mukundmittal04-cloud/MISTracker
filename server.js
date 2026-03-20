@@ -3,7 +3,6 @@ const https = require('https');
 const http = require('http');
 const app = express();
 app.use(express.json());
-app.use((req, res, next) => { res.header('Access-Control-Allow-Origin', '*'); res.header('Access-Control-Allow-Headers', '*'); next(); });
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'fidato_mis_2026';
 const PORT = process.env.PORT || 3000;
@@ -209,5 +208,253 @@ app.get('/api/ocr', (req, res) => { const o = messages.filter(m => m.source === 
 app.get('/api/daily-status', (req, res) => { const today = new Date().toISOString().split('T')[0]; const date = req.query.date || today; const dayMsgs = messages.filter(m => m.date === date); const reports = EXPECTED_REPORTS.map(r => { const received = dayMsgs.filter(m => m.type === r.type); const latest = received.length > 0 ? received[received.length - 1] : null; return { type: r.type, label: r.label, icon: r.icon, status: received.length > 0 ? 'received' : 'missing', count: received.length, lastReceived: latest ? { time: latest.time, sender: latest.sender, source: latest.source, amounts: latest.amounts.length } : null }; }); const rc = reports.filter(r => r.status === 'received').length; const mc = reports.filter(r => r.status === 'missing').length; const hour = new Date().getHours(); let urgency = 'normal'; if (hour >= 18 && mc > 0) urgency = 'critical'; else if (hour >= 14 && mc > 2) urgency = 'warning'; res.json({ date, totalExpected: 5, received: rc, missing: mc, completionPct: Math.round((rc / 5) * 100), urgency, reports, allMessages: dayMsgs.length }); });
 app.get('/api/debug', (req, res) => { res.json({ currentFilter: GROUP_ID || "NONE", claudeOCR: CLAUDE_API_KEY ? "ENABLED" : "DISABLED", gupshupKey: GUPSHUP_API_KEY ? "SET" : "MISSING", totalStored: messages.length, recentPayloads: debugLog.slice(-10).reverse() }); });
 app.get('/', (req, res) => { res.json({ status: 'running', app: 'Fidato MIS Bot', messages: messages.length, groupFilter: GROUP_ID || 'all', ocrEnabled: !!CLAUDE_API_KEY, gupshupAuth: !!GUPSHUP_API_KEY, uptime: Math.floor(process.uptime()) + 's' }); });
+
+// ═══ LIVE DASHBOARD ═══
+app.get('/dashboard', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fidato Group — MIS Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'DM Sans',system-ui,sans-serif;background:#F7F5F2;color:#1C1917;min-height:100vh}
+.hdr{background:#1C1917;color:#fff;padding:20px 24px 14px}
+.hdr h1{font-size:22px;font-weight:800}
+.hdr .sub{font-size:10px;color:#A8A29E;margin-top:3px}
+.health{background:rgba(220,38,38,.2);border:1px solid rgba(220,38,38,.4);border-radius:8px;padding:6px 14px;text-align:center;font-size:14px;font-weight:800;color:#FCA5A5}
+.tabs{display:flex;gap:3px;margin-top:12px;overflow-x:auto}
+.tabs button{background:transparent;color:#78716C;border:none;border-radius:6px;padding:7px 12px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.tabs button.active{background:rgba(255,255,255,.12);color:#fff}
+.main{padding:14px;max-width:1100px;margin:0 auto}
+.grid{display:grid;gap:10px;margin-bottom:14px}
+.g4{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.g2{grid-template-columns:1fr 1fr}
+.card{background:#fff;border-radius:14px;border:1px solid #E5E0D8;padding:18px 20px;position:relative;overflow:hidden}
+.card .bar{position:absolute;top:0;left:0;right:0;height:3px}
+.card .lbl{font-size:10px;color:#8C857D;letter-spacing:.1em;text-transform:uppercase;font-family:'JetBrains Mono',monospace;margin-bottom:6px}
+.card .val{font-size:24px;font-weight:800;line-height:1.1}
+.card .sub{font-size:11px;color:#8C857D;margin-top:5px}
+.warn{color:#DC2626!important}
+.alert{border-radius:10px;padding:12px 14px;margin-bottom:8px;border-left:4px solid}
+.alert.critical{background:#FEF2F2;border-color:#DC2626}.alert.critical .t{color:#DC2626}
+.alert.warning{background:#FFFBEB;border-color:#D97706}.alert.warning .t{color:#D97706}
+.alert.info{background:#EFF6FF;border-color:#2563EB}.alert.info .t{color:#2563EB}
+.alert .t{font-weight:700;font-size:12px;margin-bottom:3px}
+.alert .d{font-size:11px;color:#374151;line-height:1.5}
+.rpt-grid{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.rpt{flex:1 1 110px;border-radius:8px;padding:8px 10px;text-align:center}
+.rpt.ok{background:#ECFDF5;border:1px solid #A7F3D0}
+.rpt.miss{background:#FEF2F2;border:1px solid #FECACA}
+.rpt .ic{font-size:14px;margin-bottom:2px}
+.rpt .nm{font-size:9px;font-weight:600}
+.rpt.ok .nm{color:#065F46}.rpt.miss .nm{color:#991B1B}
+.rpt .st{font-size:8px;font-family:'JetBrains Mono',monospace;margin-top:2px}
+.rpt.ok .st{color:#2D6A4F}.rpt.miss .st{color:#DC2626}
+.wa-bubble{background:#DCF8C6;border-radius:10px 10px 10px 3px;padding:8px 12px;margin-bottom:6px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+.wa-bubble .sn{font-size:10px;font-weight:700;color:#075E54;margin-bottom:3px}
+.wa-bubble .msg{font-size:11px;color:#111;line-height:1.5;max-height:120px;overflow:hidden}
+.wa-bubble .dt{font-size:9px;color:#888;text-align:right;margin-top:3px}
+.sig{border-radius:8px;padding:8px 10px;margin-bottom:5px;font-size:10px}
+.sig .sl{font-size:8px;font-weight:700;font-family:'JetBrains Mono',monospace;text-transform:uppercase}
+.sig .sm{font-size:10px;color:#1F2937;line-height:1.4;margin-top:2px;max-height:60px;overflow:hidden}
+.mono{font-family:'JetBrains Mono',monospace}
+.status-bar{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.dot{width:10px;height:10px;border-radius:50%}
+.dot.on{background:#2D6A4F;box-shadow:0 0 6px rgba(45,106,79,.5)}
+.dot.off{background:#DC2626}
+.dot.wait{background:#D4A843}
+.refresh-btn{background:#1C1917;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:10px;font-weight:600;cursor:pointer}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{padding:9px 12px;text-align:left;font-weight:600;font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:#8C857D;font-family:'JetBrains Mono',monospace;background:#F5F3F0}
+td{padding:8px 12px;border-top:1px solid #E5E0D8}
+.hidden{display:none}
+</style></head><body>
+<div class="hdr">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
+    <div>
+      <div style="font-size:9px;letter-spacing:.15em;text-transform:uppercase;color:#78716C;font-family:'JetBrains Mono',monospace;margin-bottom:3px">Live MIS Tracker</div>
+      <h1>Fidato Group</h1>
+      <div class="sub">Fidatocity · Trinity · Hansaflon · Dholpur · Auto-refreshes every 30s</div>
+    </div>
+    <div class="health" id="health-badge">LOADING</div>
+  </div>
+  <div class="tabs" id="tabs">
+    <button class="active" data-tab="overview">◉ Overview</button>
+    <button data-tab="messages">💬 Messages</button>
+    <button data-tab="ocr">📸 OCR Data</button>
+    <button data-tab="signals">⚠️ Signals</button>
+  </div>
+</div>
+
+<div class="main">
+  <!-- OVERVIEW TAB -->
+  <div id="tab-overview">
+    <div id="report-status" class="card" style="margin-bottom:14px"></div>
+    <div class="grid g4" id="metrics"></div>
+    <div id="alerts"></div>
+  </div>
+
+  <!-- MESSAGES TAB -->
+  <div id="tab-messages" class="hidden">
+    <div class="status-bar">
+      <div class="dot wait" id="live-dot"></div>
+      <div>
+        <div style="font-size:11px;font-weight:600" id="live-label">Connecting...</div>
+        <div style="font-size:9px;color:#8C857D" class="mono" id="live-detail">Waiting for first sync...</div>
+      </div>
+      <button class="refresh-btn" onclick="fetchAll()">Refresh Now</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div>
+        <div style="font-size:9px;font-weight:600;color:#8C857D;font-family:'JetBrains Mono',monospace;text-transform:uppercase;margin-bottom:6px">Messages (<span id="msg-count">0</span>)</div>
+        <div id="msg-list" style="background:#E5DDD5;border-radius:10px;padding:8px;max-height:500px;overflow-y:auto"></div>
+      </div>
+      <div>
+        <div style="font-size:9px;font-weight:600;color:#8C857D;font-family:'JetBrains Mono',monospace;text-transform:uppercase;margin-bottom:6px">Signals (<span id="sig-count">0</span>)</div>
+        <div id="sig-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- OCR TAB -->
+  <div id="tab-ocr" class="hidden">
+    <div id="ocr-list"></div>
+  </div>
+
+  <!-- SIGNALS TAB -->
+  <div id="tab-signals" class="hidden">
+    <div id="signals-full"></div>
+  </div>
+</div>
+
+<script>
+const SIG_STYLES={cost_escalation:{bg:'#FEF3C7',brd:'#FDE68A',c:'#92400E',l:'Cost'},risk:{bg:'#FEF2F2',brd:'#FECACA',c:'#991B1B',l:'Risk'},revenue:{bg:'#ECFDF5',brd:'#A7F3D0',c:'#065F46',l:'Revenue'},progress:{bg:'#EFF6FF',brd:'#BFDBFE',c:'#1E40AF',l:'Progress'},compliance:{bg:'#F5F3FF',brd:'#DDD6FE',c:'#5B21B6',l:'Compliance'},cost_info:{bg:'#FFF7ED',brd:'#FED7AA',c:'#9A3412',l:'Cost Info'},cost:{bg:'#FEF3C7',brd:'#FDE68A',c:'#92400E',l:'Cost'}};
+let allMessages=[],dailyStatus=null,signals=[];
+
+// Tab switching
+document.querySelectorAll('.tabs button').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    ['overview','messages','ocr','signals'].forEach(t=>{
+      document.getElementById('tab-'+t).classList.toggle('hidden',t!==btn.dataset.tab);
+    });
+  });
+});
+
+function fmt(n){return '₹'+Math.round(n).toLocaleString('en-IN')}
+
+async function fetchAll(){
+  try{
+    const [msgR,statusR,sigR]=await Promise.all([
+      fetch('/api/messages?limit=100'),
+      fetch('/api/daily-status'),
+      fetch('/api/signals'),
+    ]);
+    if(msgR.ok){const d=await msgR.json();allMessages=d.messages||[];document.getElementById('msg-count').textContent=d.count;}
+    if(statusR.ok){dailyStatus=await statusR.json();}
+    if(sigR.ok){const d=await sigR.json();signals=d.signals||[];}
+    document.getElementById('live-dot').className='dot on';
+    document.getElementById('live-label').textContent='Live — Connected';
+    document.getElementById('live-label').style.color='#2D6A4F';
+    document.getElementById('live-detail').textContent='Last sync: '+new Date().toLocaleTimeString()+' · '+allMessages.length+' messages';
+    render();
+  }catch(e){
+    document.getElementById('live-dot').className='dot off';
+    document.getElementById('live-label').textContent='Disconnected';
+    document.getElementById('live-label').style.color='#DC2626';
+  }
+}
+
+function render(){
+  // Health badge
+  const hb=document.getElementById('health-badge');
+  if(dailyStatus){
+    if(dailyStatus.urgency==='critical'){hb.textContent='CRITICAL';hb.style.color='#FCA5A5';}
+    else if(dailyStatus.urgency==='warning'){hb.textContent='CAUTION';hb.style.color='#FDE68A';}
+    else if(dailyStatus.completionPct===100){hb.textContent='ALL RECEIVED';hb.style.color='#86EFAC';hb.style.background='rgba(45,106,79,.2)';hb.style.borderColor='rgba(45,106,79,.4)';}
+    else{hb.textContent=dailyStatus.received+'/5 REPORTS';hb.style.color='#FDE68A';}
+  }
+
+  // Report status
+  if(dailyStatus){
+    let html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div style="font-size:12px;font-weight:700">Today\\'s MIS — '+dailyStatus.received+'/'+dailyStatus.totalExpected+' received</div>';
+    html+='<div style="display:flex;align-items:center;gap:6px"><div style="background:#E5E0D8;border-radius:3px;height:6px;width:120px;overflow:hidden"><div style="background:'+(dailyStatus.completionPct===100?'#2D6A4F':'#D4A843')+';height:100%;width:'+dailyStatus.completionPct+'%;border-radius:3px"></div></div><span class="mono" style="font-size:10px;font-weight:700;color:'+(dailyStatus.completionPct===100?'#2D6A4F':'#D4A843')+'">'+dailyStatus.completionPct+'%</span></div></div>';
+    html+='<div class="rpt-grid">';
+    dailyStatus.reports.forEach(r=>{
+      const ok=r.status==='received';
+      html+='<div class="rpt '+(ok?'ok':'miss')+'"><div class="ic">'+r.icon+'</div><div class="nm">'+r.label+'</div><div class="st">'+(ok?'✓ '+r.lastReceived.time+' · '+(r.lastReceived.source==='image_ocr'?'IMG':'TXT'):'✗ NOT RECEIVED')+'</div></div>';
+    });
+    html+='</div>';
+    if(dailyStatus.urgency==='critical'&&dailyStatus.missing>0){
+      html+='<div style="background:#FEF2F2;border-radius:6px;padding:6px 10px;font-size:10px;color:#991B1B;border-left:3px solid #DC2626">'+dailyStatus.missing+' report(s) missing: '+dailyStatus.reports.filter(r=>r.status==='missing').map(r=>r.label).join(', ')+'</div>';
+    }
+    document.getElementById('report-status').innerHTML=html;
+  }
+
+  // Metrics
+  const ocrMsgs=allMessages.filter(m=>m.source==='image_ocr');
+  const totalAmounts=allMessages.reduce((s,m)=>s+(m.amounts||[]).length,0);
+  const riskCount=allMessages.filter(m=>(m.signals||[]).length>0).length;
+  document.getElementById('metrics').innerHTML=[
+    {l:'Total Messages',v:allMessages.length,s:'Today',a:'#4A7FB5'},
+    {l:'OCR Processed',v:ocrMsgs.length,s:'Images parsed',a:'#2D6A4F'},
+    {l:'Amounts Extracted',v:totalAmounts,s:'Financial data points',a:'#D4A843'},
+    {l:'Risk Signals',v:riskCount,s:'Flagged messages',a:'#DC2626',w:riskCount>0},
+  ].map(m=>'<div class="card"><div class="bar" style="background:'+m.a+'"></div><div class="lbl">'+m.l+'</div><div class="val'+(m.w?' warn':'')+'">'+m.v+'</div><div class="sub">'+m.s+'</div></div>').join('');
+
+  // Alerts from signals
+  let alertHtml='<div style="font-size:12px;font-weight:700;margin-bottom:8px">⚡ Live Signals</div>';
+  signals.slice(0,10).forEach(s=>{
+    const st=SIG_STYLES[s.signals?.[0]?.type||'risk']||SIG_STYLES.risk;
+    alertHtml+='<div class="alert '+(s.signals?.[0]?.type==='risk'?'critical':'warning')+'"><div class="t">'+(s.signals?.map(x=>x.keyword).join(', ')||'signal')+' — '+s.sender+'</div><div class="d">'+((s.raw||s.message||'').substring(0,200))+'</div></div>';
+  });
+  if(signals.length===0) alertHtml+='<div style="font-size:11px;color:#8C857D">No risk signals detected today.</div>';
+  document.getElementById('alerts').innerHTML=alertHtml;
+
+  // Messages list
+  let msgHtml='';
+  allMessages.forEach(m=>{
+    const txt=(m.raw||m.message||'').substring(0,300);
+    const src=m.source==='image_ocr'?'<span style="background:#ECFDF5;color:#065F46;font-size:8px;padding:1px 4px;border-radius:3px;margin-left:4px">IMG OCR</span>':'';
+    msgHtml+='<div class="wa-bubble"><div class="sn">'+m.sender+src+'</div><div class="msg">'+txt.replace(/\\n/g,'<br>').substring(0,300)+'</div><div class="dt">'+m.date+' '+m.time+' · '+m.type+'</div></div>';
+  });
+  document.getElementById('msg-list').innerHTML=msgHtml||'<div style="text-align:center;padding:20px;color:#78716C;font-size:11px">No messages yet</div>';
+
+  // Signals list
+  let sigHtml='';
+  document.getElementById('sig-count').textContent=signals.length;
+  signals.forEach(s=>{
+    const st=SIG_STYLES[s.signals?.[0]?.type||'risk']||SIG_STYLES.risk;
+    sigHtml+='<div class="sig" style="background:'+st.bg+';border:1px solid '+st.brd+'"><div class="sl" style="color:'+st.c+'">'+st.l+' · '+s.sender+'</div><div class="sm">'+((s.raw||'').substring(0,150))+'</div></div>';
+  });
+  document.getElementById('sig-list').innerHTML=sigHtml||'<div style="font-size:11px;color:#8C857D;padding:10px">No signals</div>';
+
+  // OCR tab
+  let ocrHtml='<div style="font-size:14px;font-weight:700;margin-bottom:10px">OCR Extracted Reports ('+ocrMsgs.length+')</div>';
+  ocrMsgs.forEach(m=>{
+    ocrHtml+='<div class="card" style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;margin-bottom:8px"><span style="font-size:12px;font-weight:700">'+m.type+'</span><span class="mono" style="font-size:10px;color:#8C857D">'+m.date+' '+m.time+' · '+(m.amounts||[]).length+' amounts</span></div>';
+    ocrHtml+='<div style="font-size:11px;line-height:1.6;max-height:300px;overflow-y:auto;white-space:pre-wrap">'+((m.raw||'').substring(0,2000).replace(/</g,'&lt;'))+'</div></div>';
+  });
+  if(ocrMsgs.length===0) ocrHtml+='<div style="font-size:11px;color:#8C857D">No OCR data yet. Send MIS screenshots to the bot.</div>';
+  document.getElementById('ocr-list').innerHTML=ocrHtml;
+
+  // Signals full tab
+  let sfHtml='<div style="font-size:14px;font-weight:700;margin-bottom:10px">All Risk Signals ('+signals.length+')</div>';
+  signals.forEach(s=>{
+    const st=SIG_STYLES[s.signals?.[0]?.type||'risk']||SIG_STYLES.risk;
+    sfHtml+='<div class="card" style="margin-bottom:8px;border-left:4px solid '+st.c+'"><div style="font-size:11px;font-weight:700;color:'+st.c+';margin-bottom:4px">'+st.l+' — '+(s.signals?.map(x=>x.keyword).join(', ')||'')+'</div><div style="font-size:11px;color:#374151;line-height:1.5">'+((s.raw||'').substring(0,300))+'</div><div style="font-size:9px;color:#8C857D;margin-top:4px">'+s.sender+' · '+s.date+'</div></div>';
+  });
+  if(signals.length===0) sfHtml+='<div style="font-size:11px;color:#8C857D">No signals detected.</div>';
+  document.getElementById('signals-full').innerHTML=sfHtml;
+}
+
+// Auto-fetch every 30 seconds
+fetchAll();
+setInterval(fetchAll,30000);
+</script>
+</body></html>`);
+});
+
 app.get('/health', (req, res) => { res.json({ status: 'ok' }); });
-app.listen(PORT, () => { console.log(`Fidato MIS Bot on port ${PORT}`); console.log(`Group: ${GROUP_ID || 'ALL'} | OCR: ${CLAUDE_API_KEY ? 'ON' : 'OFF'} | Gupshup Auth: ${GUPSHUP_API_KEY ? 'ON' : 'OFF'}`); });
+app.listen(PORT, () => { console.log(`Fidato MIS Bot on port ${PORT}`); console.log(`Group: ${GROUP_ID || 'ALL'} | OCR: ${CLAUDE_API_KEY ? 'ON' : 'OFF'} | Gupshup Auth: ${GUPSHUP_API_KEY ? 'ON' : 'OFF'}`); console.log(`Dashboard: http://localhost:${PORT}/dashboard`); });
