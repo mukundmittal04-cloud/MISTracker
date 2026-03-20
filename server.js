@@ -3,6 +3,7 @@ const https = require('https');
 const http = require('http');
 const app = express();
 app.use(express.json());
+app.use((req, res, next) => { res.header('Access-Control-Allow-Origin', '*'); res.header('Access-Control-Allow-Headers', '*'); next(); });
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'fidato_mis_2026';
 const PORT = process.env.PORT || 3000;
