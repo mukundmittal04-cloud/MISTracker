@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fidato Group — MIS Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700;800;900&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'DM Sans',system-ui,sans-serif;background:#F7F5F2;color:#1C1917;min-height:100vh}
+.hdr{background:#1C1917;color:#fff;padding:20px 22px 14px}
+.hdr h1{font-size:24px;font-weight:900;font-family:'Fraunces',Georgia,serif}
+.hdr .sub{font-size:10px;color:#A8A29E;margin-top:3px}
+.health{background:rgba(220,38,38,.2);border:1px solid rgba(220,38,38,.4);border-radius:8px;padding:6px 14px;text-align:center}
+.health .hl{font-size:8px;text-transform:uppercase;letter-spacing:.1em;color:#A8A29E;font-family:'JetBrains Mono',monospace}
+.health .hv{font-size:16px;font-weight:800;color:#FCA5A5;font-family:'Fraunces',serif}
+.tabs{display:flex;gap:2px;margin-top:14px;overflow-x:auto;padding-bottom:2px}
+.tabs button{background:transparent;color:#78716C;border:none;border-radius:6px;padding:6px 10px;font-size:10px;font-weight:600;cursor:pointer;white-space:nowrap;transition:all .15s;font-family:'DM Sans',sans-serif}
+.tabs button.active{background:rgba(255,255,255,.12);color:#fff}
+.main{padding:14px;max-width:1100px;margin:0 auto}
+.card{background:#fff;border-radius:14px;border:1px solid #E5E0D8;padding:18px 20px;position:relative;overflow:hidden;margin-bottom:10px}
+.card .bar{position:absolute;top:0;left:0;right:0;height:3px}
+.card .lbl{font-size:10px;color:#8C857D;letter-spacing:.1em;text-transform:uppercase;font-family:'JetBrains Mono',monospace;margin-bottom:6px}
+.card .val{font-size:24px;font-weight:800;font-family:'Fraunces',Georgia,serif;line-height:1.1}
+.card .sub{font-size:11px;color:#8C857D;margin-top:5px;line-height:1.4}
+.warn{color:#DC2626!important}
+.grid{display:grid;gap:10px;margin-bottom:14px}
+.g4{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.alert{border-radius:10px;padding:12px 14px;margin-bottom:8px;border-left:4px solid}
+.alert.critical{background:#FEF2F2;border-color:#DC2626}.alert.critical .t{color:#DC2626}
+.alert.warning{background:#FFFBEB;border-color:#D97706}.alert.warning .t{color:#D97706}
+.alert.info{background:#EFF6FF;border-color:#2563EB}.alert.info .t{color:#2563EB}
+.alert .t{font-weight:700;font-size:12px;margin-bottom:3px}
+.alert .d{font-size:11px;color:#374151;line-height:1.5}
+.rpt-grid{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.rpt{flex:1 1 110px;border-radius:8px;padding:8px 10px;text-align:center}
+.rpt.ok{background:#ECFDF5;border:1px solid #A7F3D0}
+.rpt.miss{background:#FEF2F2;border:1px solid #FECACA}
+.rpt .ic{font-size:14px;margin-bottom:2px}
+.rpt .nm{font-size:9px;font-weight:600}
+.rpt.ok .nm{color:#065F46}.rpt.miss .nm{color:#991B1B}
+.rpt .st{font-size:8px;font-family:'JetBrains Mono',monospace;margin-top:2px}
+.rpt.ok .st{color:#2D6A4F}.rpt.miss .st{color:#DC2626}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{padding:9px 12px;text-align:left;font-weight:600;font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:#8C857D;font-family:'JetBrains Mono',monospace;background:#F5F3F0;white-space:nowrap}
+td{padding:8px 12px;border-top:1px solid #E5E0D8}
+.mono{font-family:'JetBrains Mono',monospace}
+.wa-bubble{background:#DCF8C6;border-radius:10px 10px 10px 3px;padding:8px 12px;margin-bottom:6px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+.wa-bubble .sn{font-size:10px;font-weight:700;color:#075E54;margin-bottom:3px}
+.wa-bubble .msg{font-size:11px;color:#111;line-height:1.5;max-height:120px;overflow:hidden}
+.wa-bubble .dt{font-size:9px;color:#888;text-align:right;margin-top:3px}
+.status-bar{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.dot{width:10px;height:10px;border-radius:50%}
+.dot.on{background:#2D6A4F;box-shadow:0 0 6px rgba(45,106,79,.5)}
+.dot.off{background:#DC2626}
+.dot.wait{background:#D4A843;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.refresh-btn{background:#1C1917;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:10px;font-weight:600;cursor:pointer;font-family:'DM Sans',sans-serif}
+.hidden{display:none}
+.spend-bar{display:flex;gap:8px;flex-wrap:wrap}
+.spend-item{flex:1 1 110px;background:#F9F8F6;border-radius:8px;padding:10px}
+.spend-item .si-l{font-size:9px;color:#8C857D;font-weight:600}
+.spend-item .si-v{font-size:16px;font-weight:800;font-family:'Fraunces',serif;margin:2px 0}
+.spend-item .si-p{font-size:9px;font-family:'JetBrains Mono',monospace}
+.tag{display:inline-block;padding:2px 6px;border-radius:4px;font-size:8px;font-weight:700;font-family:'JetBrains Mono',monospace}
+.tag.red{background:#FEF2F2;color:#DC2626;border:1px solid #FECACA}
+.tag.green{background:#ECFDF5;color:#065F46;border:1px solid #A7F3D0}
+.tag.blue{background:#EFF6FF;color:#1E40AF;border:1px solid #BFDBFE}
+.tag.yellow{background:#FFFBEB;color:#92400E;border:1px solid #FDE68A}
+.tabpane{display:none}.tabpane.active{display:block}
+</style></head><body>
+<div class="hdr">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
+<div>
+<div style="font-size:9px;letter-spacing:.15em;text-transform:uppercase;color:#78716C;font-family:'JetBrains Mono',monospace;margin-bottom:3px">Live MIS Tracker</div>
+<h1>Fidato Group</h1>
+<div class="sub">Fidatocity · Trinity · Hansaflon · Dholpur · Auto-refreshes every 30s</div>
+</div>
+<div class="health"><div class="hl">Health</div><div class="hv" id="health-badge">LOADING</div></div>
+</div>
+<div class="tabs" id="tabs"></div>
+</div>
+<div class="main" id="content"></div>
+
+<script>
+// ═══ ALL FINANCIAL DATA ═══
+const FUND=[{c:"Fidatocity-70%",b:"JKB",bb:2572784,ci:0,bu:2572784,u:false,n:"Not Usable"},{c:"Fidatocity-30%",b:"JKB",bb:5097,ci:0,bu:5097,u:true},{c:"Fidato City Homes",b:"JKB",bb:152,ci:0,bu:152,u:true},{c:"Trinity Landspace",b:"JKB",bb:4220,ci:0,bu:4220,u:true},{c:"Hansaflon Buildcon",b:"JKB",bb:74178,ci:71480,bu:2698,u:true},{c:"Hansaflon Buildcon",b:"AXIS",bb:0,ci:0,bu:0,u:true},{c:"Hansaflon Buildcon",b:"HDFC",bb:39991,ci:37940,bu:2051,u:true},{c:"Hansaflon Buildwell",b:"ICICI",bb:4036,ci:0,bu:4036,u:true},{c:"Dholpur Developers",b:"JKB",bb:79730,ci:0,bu:79730,u:true},{c:"Trinity Tulsivan",b:"JKB",bb:5964,ci:0,bu:5964,u:true},{c:"Beatific Hospitality",b:"HDFC",bb:14803,ci:0,bu:14803,u:true},{c:"Chahat Garments",b:"JKB",bb:6403,ci:0,bu:6403,u:true},{c:"Fidato Buildcon",b:"JKB",bb:4601,ci:0,bu:4601,u:true},{c:"Fidato Maintenance",b:"JKB",bb:9496,ci:0,bu:9496,u:true},{c:"Maximal Infra",b:"JKB",bb:5664,ci:0,bu:5664,u:true},{c:"MM PDC",b:"—",bb:900000,ci:0,bu:900000,u:false,n:"PDC"}];
+const OFFICE_BANK=[{i:"Sony Kumari — GST",a:15000},{i:"Electricity — SM",a:1687.30},{i:"Electricity — MM",a:2014.40},{i:"Telephone/Internet",a:1627.06},{i:"Legal — Adv Chetan Mittal",a:4000},{i:"Bank Charges/TDS",a:212.28},{i:"Short Entry Trinity",a:300},{i:"Salary Dec & Jan",a:4351.60},{i:"Geopower Solar",a:240},{i:"Renewal Fees CC",a:193},{i:"Cash Withdrawal",a:600}];
+const OFFICE_PDC=[{i:"Handwash",a:20},{i:"Holi Exp",a:30},{i:"Medicines",a:10},{i:"Misc Exp",a:24},{i:"Salary Dec+Jan",a:6090},{i:"ROC Exp",a:196},{i:"Conveyance",a:120},{i:"Pradeep Agra",a:60}];
+const SITE=[{h:"Contractor",d:3.21,p:0.24,bl:2.97},{h:"Steel",d:0.29,p:0.18,bl:0.12},{h:"RMC",d:0.48,p:0.30,bl:0.18},{h:"Exterior",d:0,p:0,bl:0},{h:"STP",d:0,p:0,bl:0},{h:"Road & Services",d:0,p:0,bl:0},{h:"Completion SCO",d:0.39,p:0.364,bl:0.03},{h:"Electricity",d:0,p:0,bl:0},{h:"Other's",d:0.35,p:0.20,bl:0.15}];
+const RECV=[{h:"Floor (Normal)",d:47.66,r:-7.20,bl:54.86},{h:"Floor (Loan)",d:7.09,r:0,bl:7.09},{h:"Plot Const.",d:27.77,r:0.05,bl:27.72},{h:"Plot A/C",d:1.92,r:0.10,bl:1.82}];
+const LIAB=[{h:"EDC",pr:55,p:0,bl:55},{h:"Loan (Sardarji)",pr:18,p:0,bl:18},{h:"Const Exp",pr:107,p:1.28,bl:105.72},{h:"Office Exp (2yr)",pr:50,p:0,bl:50}];
+const MM_DRAWS=[{d:"2025-10-15",a:250000,p:"Personal"},{d:"2025-11-05",a:180000,p:"Personal"},{d:"2025-12-10",a:300000,p:"Car EMI"},{d:"2026-01-08",a:200000,p:"Personal"},{d:"2026-01-22",a:150000,p:"Family"},{d:"2026-02-12",a:220000,p:"Personal"},{d:"2026-03-01",a:175000,p:"Personal"}];
+const SM_DRAWS=[{d:"2025-10-20",a:200000,p:"Personal"},{d:"2025-11-12",a:150000,p:"Personal"},{d:"2025-12-18",a:280000,p:"Holiday"},{d:"2026-01-15",a:180000,p:"Personal"},{d:"2026-02-05",a:200000,p:"Personal"},{d:"2026-02-20",a:120000,p:"Medical"},{d:"2026-03-01",a:160000,p:"Personal"}];
+
+const fmt=n=>'₹'+Math.round(n).toLocaleString('en-IN');
+const fmtCr=n=>n===0?'—':'₹'+n.toFixed(2)+' Cr';
+const obT=OFFICE_BANK.reduce((s,e)=>s+e.a,0);
+const opT=OFFICE_PDC.reduce((s,e)=>s+e.a,0);
+const mmT=MM_DRAWS.reduce((s,e)=>s+e.a,0);
+const smT=SM_DRAWS.reduce((s,e)=>s+e.a,0);
+const siteOut=SITE.reduce((s,e)=>s+e.bl,0);
+
+// ═══ TABS ═══
+const TABS=[{k:"overview",l:"◉ Overview"},{k:"funds",l:"🏦 Funds"},{k:"daily",l:"📅 Daily"},{k:"office",l:"🏢 Office Exp"},{k:"promoters",l:"👤 MM / SM"},{k:"site",l:"🏗️ Site"},{k:"projections",l:"📊 Projections"},{k:"whatsapp",l:"💬 WhatsApp MIS"}];
+let activeTab="overview";
+const tabsEl=document.getElementById('tabs');
+TABS.forEach(t=>{const b=document.createElement('button');b.textContent=t.l;b.dataset.tab=t.k;if(t.k===activeTab)b.classList.add('active');b.onclick=()=>{activeTab=t.k;document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));b.classList.add('active');render();};tabsEl.appendChild(b);});
+
+// ═══ LIVE DATA ═══
+let liveMessages=[],dailyStatus=null,liveSignals=[],liveStatus='connecting',lastFetch=null;
+
+async function fetchAll(){
+  try{
+    const [m,s,sig]=await Promise.all([fetch('/api/messages?limit=100'),fetch('/api/daily-status'),fetch('/api/signals')]);
+    if(m.ok){const d=await m.json();liveMessages=d.messages||[];}
+    if(s.ok){dailyStatus=await s.json();}
+    if(sig.ok){const d=await sig.json();liveSignals=d.signals||[];}
+    liveStatus='connected';lastFetch=new Date().toLocaleTimeString();
+  }catch(e){liveStatus='error';}
+  render();
+}
+
+// ═══ RENDER ═══
+function render(){
+  const c=document.getElementById('content');
+  const hb=document.getElementById('health-badge');
+  if(dailyStatus){
+    if(dailyStatus.completionPct===100){hb.textContent='ALL RECEIVED';hb.style.color='#86EFAC';}
+    else if(dailyStatus.urgency==='critical'){hb.textContent='CRITICAL';hb.style.color='#FCA5A5';}
+    else{hb.textContent=dailyStatus.received+'/5 REPORTS';hb.style.color='#FDE68A';}
+  }
+
+  if(activeTab==='overview') c.innerHTML=renderOverview();
+  else if(activeTab==='funds') c.innerHTML=renderFunds();
+  else if(activeTab==='daily') c.innerHTML=renderDaily();
+  else if(activeTab==='office') c.innerHTML=renderOffice();
+  else if(activeTab==='promoters') c.innerHTML=renderPromoters();
+  else if(activeTab==='site') c.innerHTML=renderSite();
+  else if(activeTab==='projections') c.innerHTML=renderProjections();
+  else if(activeTab==='whatsapp') c.innerHTML=renderWhatsApp();
+}
+
+function stat(label,value,sub,accent,warn){
+  return `<div class="card"><div class="bar" style="background:${accent}"></div><div class="lbl">${label}</div><div class="val${warn?' warn':''}">${value}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;
+}
+
+function renderReportStatus(){
+  const ds=dailyStatus;
+  if(!ds)return '<div class="card" style="border:1px solid #E5E0D8"><div style="font-size:12px;font-weight:700;font-family:Fraunces,serif">Today\'s MIS Reports — Loading...</div></div>';
+  let h=`<div class="card" style="border:1px solid ${ds.missing>0?'#FECACA':'#A7F3D0'}"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:6px"><div style="font-size:12px;font-weight:700;font-family:Fraunces,serif">Today's MIS — ${ds.received}/${ds.totalExpected} received</div><div style="display:flex;align-items:center;gap:6px"><div style="background:#E5E0D8;border-radius:3px;height:6px;width:120px;overflow:hidden"><div style="background:${ds.completionPct===100?'#2D6A4F':'#D4A843'};height:100%;width:${ds.completionPct}%;border-radius:3px"></div></div><span class="mono" style="font-size:10px;font-weight:700;color:${ds.completionPct===100?'#2D6A4F':'#D4A843'}">${ds.completionPct}%</span></div></div><div class="rpt-grid">`;
+  ds.reports.forEach(r=>{
+    const ok=r.status==='received';
+    h+=`<div class="rpt ${ok?'ok':'miss'}"><div class="ic">${r.icon}</div><div class="nm">${r.label}</div><div class="st">${ok?'✓ '+r.lastReceived.time+' · '+(r.lastReceived.source==='image_ocr'?'IMG':'TXT'):'✗ NOT RECEIVED'}</div></div>`;
+  });
+  h+='</div>';
+  if(ds.urgency==='critical'&&ds.missing>0) h+=`<div style="margin-top:8px;background:#FEF2F2;border-radius:6px;padding:6px 10px;font-size:10px;color:#991B1B;border-left:3px solid #DC2626">${ds.missing} report(s) missing: ${ds.reports.filter(r=>r.status==='missing').map(r=>r.label).join(', ')}</div>`;
+  return h+'</div>';
+}
+
+function renderOverview(){
+  let h=renderReportStatus();
+  h+=`<div class="grid g4">${stat('Net Usable Cash','₹1.45 L','All banks combined','#DC2626',true)}${stat('Receivables','₹75.46 Cr','','#D4A843')}${stat('Liabilities','₹228.72 Cr','','#E85D3A',true)}${stat('Funding Gap',fmtCr(153.26),'','#DC2626',true)}</div>`;
+  h+=`<div class="grid g4">${stat('Unsold Inventory','₹100 Cr','46 floors + 12 plots','#4A7FB5')}${stat('Office Spend',fmt(obT+opT)+'/mo','Bank '+fmt(obT)+' + PDC '+fmt(opT),'#6366F1')}${stat('Promoter Draws',fmt(mmT+smT),'MM: '+fmt(mmT)+' · SM: '+fmt(smT),'#8B5CF6')}${stat('Days of Cash','~16','At current burn','#DC2626',true)}</div>`;
+  // Spend composition
+  h+=`<div class="card"><div style="font-size:12px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">Daily Spend Composition (03.03.2026)</div><div class="spend-bar"><div class="spend-item"><div class="si-l">Capital Site</div><div class="si-v" style="color:#E85D3A">₹25,263</div><div class="si-p" style="color:#E85D3A">41%</div></div><div class="spend-item"><div class="si-l">Office GK-1</div><div class="si-v" style="color:#4A7FB5">₹35,983</div><div class="si-p" style="color:#4A7FB5">59%</div></div><div class="spend-item"><div class="si-l">Directors/CC</div><div class="si-v">₹0</div><div class="si-p">0%</div></div><div class="spend-item"><div class="si-l">Misc/Legal</div><div class="si-v" style="color:#7A8B6D">₹50</div><div class="si-p" style="color:#7A8B6D">0%</div></div></div></div>`;
+  // Alerts
+  const alerts=[
+    {t:'critical',title:'Severe Cash Crunch',msg:'Net usable ₹1.45L. Daily deficit ₹8,828. Cash lasts ~16 days.'},
+    {t:'critical',title:'Funding Gap: ₹153.26 Cr',msg:'Liabilities ₹228.72 Cr vs Receivables ₹75.46 Cr. Even with ₹100 Cr inventory, ₹53.26 Cr gap.'},
+    {t:'warning',title:'Site Outstanding: '+fmtCr(siteOut),msg:'Contractor ₹2.97 Cr, Steel ₹0.12 Cr, RMC ₹0.18 Cr. Payment delays risk work stoppage.'},
+    {t:'warning',title:'Zero New Sales',msg:'46 floors (₹100 Cr) + 12 plots unsold. No bookings this period.'},
+    {t:'warning',title:'Negative Floor Collection: -₹7.20 Cr',msg:'Cancellations exceeding collections. Outstanding grew to ₹54.86 Cr.'},
+    {t:'info',title:'Promoter Draws: '+fmt(mmT+smT),msg:'MM: '+fmt(mmT)+' · SM: '+fmt(smT)+'. Review against cash needs.'},
+    {t:'info',title:'EDC: ₹55 Cr Unpaid',msg:'Government charges fully outstanding. Confirm deadline.'},
+  ];
+  alerts.forEach(a=>{h+=`<div class="alert ${a.t}"><div class="t">${a.t==='critical'?'🔴':a.t==='warning'?'🟡':'🔵'} ${a.title}</div><div class="d">${a.msg}</div></div>`;});
+  return h;
+}
+
+function renderFunds(){
+  let h='<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">Fund Position — 20 Accounts</div><div style="overflow-x:auto"><table><tr><th>Company</th><th>Bank</th><th style="text-align:right">Bal (Bank)</th><th style="text-align:right">Chq Issued</th><th style="text-align:right">Bal (Us)</th><th>Status</th></tr>';
+  FUND.forEach(f=>{
+    h+=`<tr><td style="font-weight:600">${f.c}</td><td><span class="tag blue">${f.b}</span></td><td class="mono" style="text-align:right">${fmt(f.bb)}</td><td class="mono" style="text-align:right">${f.ci?fmt(f.ci):'—'}</td><td class="mono" style="text-align:right;font-weight:700;color:${f.bu<0?'#DC2626':'#1C1917'}">${fmt(f.bu)}</td><td>${f.u?'<span class="tag green">Usable</span>':'<span class="tag red">'+(f.n||'Blocked')+'</span>'}</td></tr>`;
+  });
+  const totalBank=FUND.reduce((s,f)=>s+f.bb,0);
+  const totalUs=FUND.reduce((s,f)=>s+f.bu,0);
+  const usable=FUND.filter(f=>f.u).reduce((s,f)=>s+f.bu,0);
+  h+=`<tr style="background:#F5F3F0;font-weight:700"><td colspan="2">TOTAL</td><td class="mono" style="text-align:right">${fmt(totalBank)}</td><td></td><td class="mono" style="text-align:right">${fmt(totalUs)}</td><td></td></tr>`;
+  h+='</table></div></div>';
+  h+=`<div class="grid g4">${stat('Total Bank Balance',fmt(totalBank),'','#4A7FB5')}${stat('Net Usable',fmt(usable),'Excl blocked + PDC','#2D6A4F')}${stat('Blocked Funds',fmt(totalUs-usable),'Fidatocity 70% + MM PDC','#DC2626',true)}</div>`;
+  return h;
+}
+
+function renderDaily(){
+  let h=`<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">Daily Cash Sheet — 03.03.2026</div><div class="grid g4" style="margin-bottom:10px">${stat('Collection','₹52,468','Capital ₹51,500 + Misc ₹968','#2D6A4F')}${stat('Expenditure','₹61,296','Site ₹25,263 + Office ₹35,983','#DC2626',true)}${stat('Net Cash Flow','-₹8,828','Deficit','#DC2626',true)}${stat('Closing Balance','₹3,493','Bank ₹1,449 + PDC ₹2,044','#D4A843')}</div>`;
+  h+='<div style="overflow-x:auto"><table><tr><th>Head</th><th style="text-align:right">Cheque</th><th style="text-align:right">PDC</th><th style="text-align:right">Total</th></tr>';
+  const daily=[{h:'Capital Site',chq:20000,pdc:31500,type:'coll'},{h:'Misc Receipts',chq:968,pdc:0,type:'coll'},{h:'Capital Site Exp',chq:193,pdc:25070,type:'exp'},{h:'Office GK-1',chq:29433,pdc:6550,type:'exp'},{h:'Misc/Legal',chq:0,pdc:50,type:'exp'}];
+  daily.forEach(d=>{h+=`<tr><td style="font-weight:600">${d.h} <span class="tag ${d.type==='coll'?'green':'red'}">${d.type==='coll'?'COLL':'EXP'}</span></td><td class="mono" style="text-align:right">${d.chq?fmt(d.chq):'—'}</td><td class="mono" style="text-align:right">${d.pdc?fmt(d.pdc):'—'}</td><td class="mono" style="text-align:right;font-weight:700">${fmt(d.chq+d.pdc)}</td></tr>`;});
+  h+='</table></div></div>';
+  h+='<div class="card"><div style="font-size:12px;font-weight:700;font-family:Fraunces,serif;margin-bottom:8px">Balance Summary</div><table><tr><th></th><th style="text-align:right">Bank</th><th style="text-align:right">PDC</th><th style="text-align:right">Total</th></tr><tr><td>Opening</td><td class="mono" style="text-align:right">₹10,707</td><td class="mono" style="text-align:right">₹1,614</td><td class="mono" style="text-align:right;font-weight:700">₹12,321</td></tr><tr><td>Collection</td><td class="mono" style="text-align:right">₹20,968</td><td class="mono" style="text-align:right">₹31,500</td><td class="mono" style="text-align:right;font-weight:700">₹52,468</td></tr><tr><td>Expenditure</td><td class="mono" style="text-align:right;color:#DC2626">₹29,626</td><td class="mono" style="text-align:right;color:#DC2626">₹31,670</td><td class="mono" style="text-align:right;font-weight:700;color:#DC2626">₹61,296</td></tr><tr style="background:#F5F3F0;font-weight:700"><td>Closing</td><td class="mono" style="text-align:right">₹1,449</td><td class="mono" style="text-align:right">₹2,044</td><td class="mono" style="text-align:right;color:#DC2626">₹3,493</td></tr></table></div>';
+  return h;
+}
+
+function renderOffice(){
+  let h='<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">Office GK-1 — Bank Book (March 2026)</div><table><tr><th>Item</th><th style="text-align:right">Amount</th></tr>';
+  OFFICE_BANK.forEach(e=>{h+=`<tr><td>${e.i}</td><td class="mono" style="text-align:right">${fmt(e.a)}</td></tr>`;});
+  h+=`<tr style="background:#F5F3F0;font-weight:700"><td>Bank Book Total</td><td class="mono" style="text-align:right">${fmt(obT)}</td></tr></table></div>`;
+  h+='<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">PDC Book</div><table><tr><th>Item</th><th style="text-align:right">Amount</th></tr>';
+  OFFICE_PDC.forEach(e=>{h+=`<tr><td>${e.i}</td><td class="mono" style="text-align:right">${fmt(e.a)}</td></tr>`;});
+  h+=`<tr style="background:#F5F3F0;font-weight:700"><td>PDC Book Total</td><td class="mono" style="text-align:right">${fmt(opT)}</td></tr></table></div>`;
+  h+=`<div class="grid g4">${stat('Total Office Spend',fmt(obT+opT)+'/mo','','#6366F1')}${stat('Bank Book',fmt(obT),'','#4A7FB5')}${stat('PDC Book',fmt(opT),'','#D4A843')}</div>`;
+  return h;
+}
+
+function renderPromoters(){
+  let h=`<div class="grid g4">${stat('MM Total Draws',fmt(mmT),'7 transactions','#8B5CF6')}${stat('SM Total Draws',fmt(smT),'7 transactions','#6366F1')}${stat('Combined',fmt(mmT+smT),'Review vs cash position','#DC2626',true)}${stat('MM Electricity','₹2,014','Billed to office','#E85D3A')}</div>`;
+  h+='<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">MM (Promoter) — Draws</div><table><tr><th>Date</th><th>Purpose</th><th style="text-align:right">Amount</th></tr>';
+  MM_DRAWS.forEach(d=>{h+=`<tr><td class="mono">${d.d}</td><td>${d.p}</td><td class="mono" style="text-align:right;font-weight:700">${fmt(d.a)}</td></tr>`;});
+  h+=`<tr style="background:#F5F3F0;font-weight:700"><td colspan="2">Total MM</td><td class="mono" style="text-align:right">${fmt(mmT)}</td></tr></table></div>`;
+  h+='<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">SM (Promoter) — Draws</div><table><tr><th>Date</th><th>Purpose</th><th style="text-align:right">Amount</th></tr>';
+  SM_DRAWS.forEach(d=>{h+=`<tr><td class="mono">${d.d}</td><td>${d.p}</td><td class="mono" style="text-align:right;font-weight:700">${fmt(d.a)}</td></tr>`;});
+  h+=`<tr style="background:#F5F3F0;font-weight:700"><td colspan="2">Total SM</td><td class="mono" style="text-align:right">${fmt(smT)}</td></tr></table></div>`;
+  return h;
+}
+
+function renderSite(){
+  let h=`<div class="grid g4">${stat('Site Outstanding',fmtCr(siteOut),'Contractor + Steel + RMC','#E85D3A',true)}${stat('Receivables','₹75.46 Cr','Floor + Plot','#D4A843')}${stat('Net Recv - Outstanding',fmtCr(75.46-siteOut),'','#2D6A4F')}</div>`;
+  h+='<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">Site Expenditure Outstanding (₹ Cr)</div><table><tr><th>Head</th><th style="text-align:right">Total Due</th><th style="text-align:right">Paid</th><th style="text-align:right">Balance</th></tr>';
+  SITE.forEach(s=>{h+=`<tr><td style="font-weight:600">${s.h}</td><td class="mono" style="text-align:right">${fmtCr(s.d)}</td><td class="mono" style="text-align:right">${fmtCr(s.p)}</td><td class="mono" style="text-align:right;font-weight:700;color:${s.bl>0?'#DC2626':'#1C1917'}">${fmtCr(s.bl)}</td></tr>`;});
+  h+='</table></div>';
+  h+='<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">Receivables (₹ Cr)</div><table><tr><th>Head</th><th style="text-align:right">Due</th><th style="text-align:right">Received</th><th style="text-align:right">Balance</th></tr>';
+  RECV.forEach(r=>{h+=`<tr><td style="font-weight:600">${r.h}</td><td class="mono" style="text-align:right">${fmtCr(r.d)}</td><td class="mono" style="text-align:right;color:${r.r<0?'#DC2626':'#2D6A4F'}">${fmtCr(r.r)}</td><td class="mono" style="text-align:right;font-weight:700">${fmtCr(r.bl)}</td></tr>`;});
+  const totalRecv=RECV.reduce((s,r)=>s+r.bl,0);
+  h+=`<tr style="background:#F5F3F0;font-weight:700"><td>Total</td><td></td><td></td><td class="mono" style="text-align:right">${fmtCr(totalRecv)}</td></tr></table></div>`;
+  return h;
+}
+
+function renderProjections(){
+  let h=`<div class="grid g4">${stat('Total Liabilities','₹228.72 Cr','','#DC2626',true)}${stat('Total Receivables','₹75.46 Cr','','#D4A843')}${stat('Unsold Inventory','₹100 Cr','46 floors + 12 plots','#4A7FB5')}${stat('Residual Gap','₹53.26 Cr','After inventory sold','#DC2626',true)}</div>`;
+  h+='<div class="card"><div style="font-size:14px;font-weight:700;font-family:Fraunces,serif;margin-bottom:10px">Projected Liabilities (₹ Cr)</div><table><tr><th>Head</th><th style="text-align:right">Provision</th><th style="text-align:right">Paid</th><th style="text-align:right">Balance</th></tr>';
+  LIAB.forEach(l=>{h+=`<tr><td style="font-weight:600">${l.h}</td><td class="mono" style="text-align:right">${fmtCr(l.pr)}</td><td class="mono" style="text-align:right">${fmtCr(l.p)}</td><td class="mono" style="text-align:right;font-weight:700;color:#DC2626">${fmtCr(l.bl)}</td></tr>`;});
+  const totalLiab=LIAB.reduce((s,l)=>s+l.bl,0);
+  h+=`<tr style="background:#F5F3F0;font-weight:700"><td>Total</td><td></td><td></td><td class="mono" style="text-align:right;color:#DC2626">${fmtCr(totalLiab)}</td></tr></table></div>`;
+  h+='<div class="card"><div style="font-size:12px;font-weight:700;font-family:Fraunces,serif;margin-bottom:8px">Funding Waterfall</div><table><tr><th>Source</th><th style="text-align:right">Amount (₹ Cr)</th><th style="text-align:right">Running</th></tr><tr><td>Receivables</td><td class="mono" style="text-align:right;color:#2D6A4F">+75.46</td><td class="mono" style="text-align:right">75.46</td></tr><tr><td>Unsold Inventory</td><td class="mono" style="text-align:right;color:#2D6A4F">+100.00</td><td class="mono" style="text-align:right">175.46</td></tr><tr style="background:#F5F3F0"><td style="font-weight:700">vs Liabilities</td><td class="mono" style="text-align:right;color:#DC2626">-228.72</td><td class="mono" style="text-align:right;font-weight:700;color:#DC2626">-53.26</td></tr></table></div>';
+  return h;
+}
+
+function renderWhatsApp(){
+  const dot=liveStatus==='connected'?'on':liveStatus==='error'?'off':'wait';
+  const lbl=liveStatus==='connected'?'Live — Connected':liveStatus==='error'?'Disconnected':'Connecting...';
+  const col=liveStatus==='connected'?'#2D6A4F':'#DC2626';
+  let h=`<div class="status-bar"><div class="dot ${dot}"></div><div><div style="font-size:11px;font-weight:600;color:${col}">${lbl}</div><div style="font-size:9px;color:#8C857D" class="mono">${lastFetch?'Last sync: '+lastFetch+' · '+liveMessages.length+' messages':'Waiting...'}</div></div><button class="refresh-btn" onclick="fetchAll()">Refresh Now</button></div>`;
+
+  // Report status at top
+  h+=renderReportStatus();
+
+  // OCR messages
+  const ocrMsgs=liveMessages.filter(m=>m.source==='image_ocr');
+  if(ocrMsgs.length>0){
+    h+='<div class="card"><div style="font-size:12px;font-weight:700;font-family:Fraunces,serif;margin-bottom:8px">📸 OCR Extracted Reports ('+ocrMsgs.length+')</div>';
+    ocrMsgs.slice(0,5).forEach(m=>{
+      h+=`<div style="background:#F9F8F6;border-radius:8px;padding:10px;margin-bottom:6px"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><span class="tag green">${m.type}</span><span class="mono" style="font-size:9px;color:#8C857D">${m.date} ${m.time} · ${(m.amounts||[]).length} amounts</span></div><div style="font-size:10px;line-height:1.5;max-height:200px;overflow-y:auto;white-space:pre-wrap">${((m.raw||'').substring(0,1500)).replace(/</g,'&lt;')}</div></div>`;
+    });
+    h+='</div>';
+  }
+
+  // All messages
+  h+='<div class="card"><div style="font-size:12px;font-weight:700;font-family:Fraunces,serif;margin-bottom:8px">All Messages ('+liveMessages.length+')</div><div style="background:#E5DDD5;border-radius:10px;padding:8px;max-height:400px;overflow-y:auto">';
+  if(liveMessages.length===0) h+='<div style="text-align:center;padding:20px;color:#78716C;font-size:11px">No messages yet. Send MIS screenshots to the bot.</div>';
+  liveMessages.forEach(m=>{
+    const src=m.source==='image_ocr'?'<span class="tag green" style="margin-left:4px">IMG OCR</span>':'';
+    h+=`<div class="wa-bubble"><div class="sn">${m.sender}${src}</div><div class="msg">${((m.raw||'').substring(0,300)).replace(/</g,'&lt;').replace(/\n/g,'<br>')}</div><div class="dt">${m.date} ${m.time||''} · ${m.type}</div></div>`;
+  });
+  h+='</div></div>';
+
+  // Signals
+  if(liveSignals.length>0){
+    h+='<div class="card"><div style="font-size:12px;font-weight:700;font-family:Fraunces,serif;margin-bottom:8px">⚠️ Risk Signals ('+liveSignals.length+')</div>';
+    liveSignals.forEach(s=>{
+      h+=`<div class="alert critical"><div class="t">${(s.signals||[]).map(x=>x.keyword).join(', ')} — ${s.sender}</div><div class="d">${((s.raw||'').substring(0,200)).replace(/</g,'&lt;')}</div></div>`;
+    });
+    h+='</div>';
+  }
+  return h;
+}
+
+// ═══ INIT ═══
+fetchAll();
+setInterval(fetchAll,30000);
+</script>
+</body></html>
