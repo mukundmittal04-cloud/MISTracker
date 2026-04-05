@@ -6,7 +6,7 @@
 const express = require('express');
 const { google } = require('googleapis');
 const fetch = require('node-fetch');
-const puppeteer = require('puppeteer');
+// No puppeteer - using html-to-image cloud API instead (lightweight, no Chromium needed)
 const cron = require('node-cron');
 const app = express();
 app.use(express.json());
@@ -331,32 +331,56 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 }
 
 // ============================================================
-// RENDER HTML → JPEG
+// RENDER HTML → IMAGE (using hcti.io API - free 50/month)
+// Falls back to serving HTML directly if API fails
 // ============================================================
 async function renderToJPEG(html, width = 600) {
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  // Method 1: Use hcti.io (HTML/CSS to Image API - free tier)
+  const HCTI_USER = process.env.HCTI_USER_ID;
+  const HCTI_KEY = process.env.HCTI_API_KEY;
   
-  const page = await browser.newPage();
-  await page.setViewport({ width, height: 800 });
-  await page.setContent(html, { waitUntil: 'networkidle0' });
+  if (HCTI_USER && HCTI_KEY) {
+    try {
+      const hctiRes = await fetch('https://hcti.io/v1/image', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Basic ' + Buffer.from(HCTI_USER + ':' + HCTI_KEY).toString('base64'),
+        },
+        body: JSON.stringify({
+          html: html,
+          css: '',
+          google_fonts: 'Inter',
+          viewport_width: width,
+          device_scale: 2,
+        }),
+      });
+      
+      const hctiData = await hctiRes.json();
+      
+      if (hctiData.url) {
+        // Download the generated image
+        const imgRes = await fetch(hctiData.url + '.jpg');
+        const buffer = await imgRes.buffer();
+        console.log('Image rendered via HCTI: ' + (buffer.length / 1024).toFixed(1) + ' KB');
+        return buffer;
+      }
+    } catch (err) {
+      console.error('HCTI render failed:', err.message);
+    }
+  }
   
-  // Get actual content height
-  const bodyHandle = await page.$('body');
-  const boundingBox = await bodyHandle.boundingBox();
-  await page.setViewport({ width, height: Math.ceil(boundingBox.height) + 20 });
+  // Method 2: Use self-hosted rendering via /api/render endpoint
+  // The server hosts the HTML, and we take a screenshot using an external service
+  // For now, generate a simple image placeholder
+  console.log('No HCTI credentials. Storing HTML for preview at /api/preview');
   
-  const buffer = await page.screenshot({ 
-    type: 'jpeg', 
-    quality: 90, 
-    fullPage: true,
-    clip: { x: 0, y: 0, width, height: Math.ceil(boundingBox.height) + 20 }
-  });
+  // Store the HTML so it can be accessed via URL
+  global._lastReportHTML = html;
+  global._lastReportDate = new Date().toISOString();
   
-  await browser.close();
-  return buffer;
+  // Return null - the sendWhatsAppImage function will send as a link instead
+  return null;
 }
 
 // ============================================================
@@ -368,8 +392,15 @@ async function sendWhatsAppImage(imageBuffer, caption, destination) {
     return { success: false, error: 'No API key' };
   }
   
-  // Upload image to a temporary host (or use base64)
-  // Gupshup requires a URL for images, so we'll use their media upload
+  // If no image buffer (HCTI not configured), send the preview link as text
+  if (!imageBuffer) {
+    var previewUrl = 'https://mistracker-production.up.railway.app/api/preview';
+    var msg = caption + '\n\nView full report: ' + previewUrl;
+    await sendTextMessage(msg);
+    return { success: true, method: 'text_link' };
+  }
+  
+  // Upload image to Gupshup file server
   const FormData = require('form-data');
   const form = new FormData();
   form.append('file', imageBuffer, { filename: 'daily-report.jpg', contentType: 'image/jpeg' });
@@ -515,6 +546,12 @@ app.get('/api/preview-image', async (req, res) => {
     const summary = computeSummary(transactions);
     const html = generateDailyReportHTML(transactions, summary, dateStr);
     const imageBuffer = await renderToJPEG(html);
+    
+    if (!imageBuffer) {
+      // No HCTI configured - redirect to HTML preview
+      res.setHeader('Content-Type', 'text/html');
+      return res.send(html);
+    }
     
     res.setHeader('Content-Type', 'image/jpeg');
     res.setHeader('Content-Disposition', `inline; filename="fidato-mis-${dateStr}.jpg"`);
