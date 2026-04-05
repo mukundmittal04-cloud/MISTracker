@@ -1,227 +1,698 @@
+// ============================================================
+// FIDATO MIS DAILY REPORT SERVER
+// Reads Google Sheet → Generates visual report → Sends via WhatsApp
+// ============================================================
+
 const express = require('express');
-const https = require('https');
-const http = require('http');
+const { google } = require('googleapis');
+const fetch = require('node-fetch');
+const puppeteer = require('puppeteer');
+const cron = require('node-cron');
 const app = express();
 app.use(express.json());
 
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'fidato_mis_2026';
-const PORT = process.env.PORT || 3000;
-const GROUP_ID = process.env.GROUP_ID || "";
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY || "";
-const GUPSHUP_API_KEY = process.env.GUPSHUP_API_KEY || "";
+// ============================================================
+// CONFIGURATION (set these as Railway environment variables)
+// ============================================================
+const CONFIG = {
+  // Google Sheets
+  SHEET_ID: process.env.SHEET_ID || '1h_62f7kQB1i8_YOWTHKjcbnz4piMr5tYoKJJpKKqwLM',
+  GOOGLE_CREDENTIALS: process.env.GOOGLE_CREDENTIALS, // JSON string of service account
+  
+  // Gupshup WhatsApp
+  GUPSHUP_API_KEY: process.env.GUPSHUP_API_KEY,
+  GUPSHUP_APP_ID: process.env.GUPSHUP_APP_ID || 'c424883c-779c-4e35-be26-b8a26e3469f2',
+  GUPSHUP_SOURCE: process.env.GUPSHUP_SOURCE || '919870111582',
+  WHATSAPP_GROUP_ID: process.env.WHATSAPP_GROUP_ID, // Group JID
+  
+  // Anthropic (for Claude-generated summaries if needed)
+  CLAUDE_API_KEY: process.env.CLAUDE_API_KEY,
+  
+  PORT: process.env.PORT || 3000,
+};
 
-const messages = [];
-const debugLog = [];
+// ============================================================
+// GOOGLE SHEETS AUTH
+// ============================================================
+let sheetsClient = null;
 
-const EXPECTED_REPORTS = [
-  { type: 'daily_mis', label: 'Daily Cash Sheet', icon: '📅', keywords: ['collection','expenditure','closing balance','opening balance','daily mis'] },
-  { type: 'fund_position', label: 'Fund Position', icon: '🏦', keywords: ['fund position','net usable','bank balance','bal as per bank','useable'] },
-  { type: 'pdc_bankbook', label: 'PDC & Bank Book', icon: '📄', keywords: ['pdc','bank book','vipin kackar','closing balance pdc'] },
-  { type: 'site_update', label: 'Site & Receivables', icon: '🏗️', keywords: ['expenditure at site','contractor','steel','rmc','floor (normal)','receivable','plot const'] },
-  { type: 'projections', label: 'Projected Liabilities', icon: '📊', keywords: ['projected','provision','edc','liability','balance floor','balance plot','unsold'] },
-];
+async function getSheets() {
+  if (sheetsClient) return sheetsClient;
+  
+  if (!CONFIG.GOOGLE_CREDENTIALS) {
+    throw new Error('GOOGLE_CREDENTIALS not set. Add service account JSON as env variable.');
+  }
+  
+  const credentials = JSON.parse(CONFIG.GOOGLE_CREDENTIALS);
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+  });
+  
+  sheetsClient = google.sheets({ version: 'v4', auth });
+  return sheetsClient;
+}
 
-// ═══ IMAGE DOWNLOAD — with Gupshup auth ═══
-function downloadImage(url) {
-  return new Promise((resolve, reject) => {
-    // Add apikey to Gupshup URLs
-    let fetchUrl = url;
-    if (url.includes('filemanager.gupshup.io') || url.includes('gupshup')) {
-      const sep = url.includes('?') ? '&' : '?';
-      fetchUrl = url.replace('download=false', 'download=true');
-      if (!fetchUrl.includes('download=true')) fetchUrl += sep + 'download=true';
+// ============================================================
+// READ LEDGER DATA FOR A SPECIFIC DATE
+// ============================================================
+async function getLedgerData(dateStr) {
+  const sheets = await getSheets();
+  
+  // Read all Ledger data (A5:K500)
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: CONFIG.SHEET_ID,
+    range: 'Ledger!A5:K500',
+    valueRenderOption: 'UNFORMATTED_VALUE',
+    dateTimeRenderOption: 'SERIAL_NUMBER',
+  });
+  
+  const rows = res.data.values || [];
+  
+  // Convert target date to serial number for comparison
+  // Google Sheets serial: Jan 1, 1900 = 1 (with the Lotus bug: Feb 29 1900 exists)
+  const targetDate = new Date(dateStr);
+  const targetSerial = dateToSerial(targetDate);
+  
+  // Filter transactions for the target date
+  const transactions = [];
+  for (const row of rows) {
+    if (!row[0] || typeof row[0] !== 'number') continue; // Skip non-date rows (separators, summaries)
+    
+    const rowSerial = Math.floor(row[0]);
+    if (rowSerial !== targetSerial) continue;
+    
+    transactions.push({
+      date: serialToDate(rowSerial),
+      entity: row[1] || '',
+      head: row[2] || '',
+      description: row[3] || '',
+      tag: row[4] || '',
+      inOut: row[5] || '',
+      amount: row[6] || 0,
+      mode: row[7] || '',
+      person: row[8] || '',
+      bank: row[9] || '',
+      notes: row[10] || '',
+    });
+  }
+  
+  return transactions;
+}
+
+// Date ↔ Serial conversion (Google Sheets epoch)
+function dateToSerial(date) {
+  const epoch = new Date(1899, 11, 30); // Dec 30, 1899 (Lotus bug offset)
+  const diff = date.getTime() - epoch.getTime();
+  return Math.floor(diff / 86400000);
+}
+
+function serialToDate(serial) {
+  const epoch = new Date(1899, 11, 30);
+  return new Date(epoch.getTime() + serial * 86400000);
+}
+
+// ============================================================
+// READ FUND POSITION DATA
+// ============================================================
+async function getFundPositionData() {
+  const sheets = await getSheets();
+  
+  // Read main table (rows 5-22, cols A-J)
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: CONFIG.SHEET_ID,
+    range: "'Fund Position'!A5:J22",
+    valueRenderOption: 'FORMATTED_VALUE',
+  });
+  
+  const rows = res.data.values || [];
+  const accounts = [];
+  
+  for (const row of rows) {
+    accounts.push({
+      company: row[1] || '',
+      bankAC: row[2] || '',
+      opening: row[3] || '₹0',
+      todayIn: row[4] || '₹0',
+      todayOut: row[5] || '₹0',
+      closing: row[6] || '₹0',
+      chqIssued: row[7] || '₹0',
+      netBal: row[8] || '₹0',
+      status: row[9] || '',
+    });
+  }
+  
+  // Read totals
+  const totRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: CONFIG.SHEET_ID,
+    range: "'Fund Position'!D23:I25",
+    valueRenderOption: 'FORMATTED_VALUE',
+  });
+  
+  return { accounts, totals: totRes.data.values || [] };
+}
+
+// ============================================================
+// COMPUTE DAILY SUMMARY FROM TRANSACTIONS
+// ============================================================
+function computeSummary(transactions) {
+  let totalIn = 0, totalOut = 0;
+  const inflowByEntity = {};
+  const inflowByHead = {};
+  const outflowByHead = {};
+  const outflowByEntity = {};
+  const promoterDraws = { MM: 0, SM: 0 };
+  
+  for (const t of transactions) {
+    const amt = Number(t.amount) || 0;
+    
+    if (t.inOut === 'IN') {
+      totalIn += amt;
+      inflowByEntity[t.entity] = (inflowByEntity[t.entity] || 0) + amt;
+      inflowByHead[t.head] = (inflowByHead[t.head] || 0) + amt;
+    } else if (t.inOut === 'OUT') {
+      totalOut += amt;
+      outflowByHead[t.head] = (outflowByHead[t.head] || 0) + amt;
+      outflowByEntity[t.entity] = (outflowByEntity[t.entity] || 0) + amt;
+      
+      if (t.person === 'MM') promoterDraws.MM += amt;
+      if (t.person === 'SM') promoterDraws.SM += amt;
+    }
+  }
+  
+  return {
+    totalIn, totalOut,
+    netCash: totalIn - totalOut,
+    txnCount: transactions.length,
+    inflowByEntity, inflowByHead,
+    outflowByHead, outflowByEntity,
+    promoterDraws,
+  };
+}
+
+// ============================================================
+// FORMAT AMOUNT IN LAKHS
+// ============================================================
+function toLakhs(amt) {
+  const lakhs = Math.abs(amt) / 100000;
+  const sign = amt < 0 ? '-' : '';
+  if (lakhs >= 100) return sign + '₹' + lakhs.toFixed(1) + 'L';
+  if (lakhs >= 10) return sign + '₹' + lakhs.toFixed(1) + 'L';
+  return sign + '₹' + lakhs.toFixed(2) + 'L';
+}
+
+function toINR(amt) {
+  return '₹' + Math.abs(amt).toLocaleString('en-IN');
+}
+
+// ============================================================
+// GENERATE HTML REPORT (Card 1: Daily MIS)
+// ============================================================
+function generateDailyReportHTML(transactions, summary, dateStr) {
+  const dateObj = new Date(dateStr);
+  const dateFormatted = dateObj.toLocaleDateString('en-GB', { 
+    day: '2-digit', month: 'long', year: 'numeric', weekday: 'long' 
+  });
+  
+  // Build bar rows for inflow
+  const inflowBars = Object.entries(summary.inflowByHead)
+    .sort((a, b) => b[1] - a[1])
+    .map(([head, amt]) => {
+      const pct = Math.round((amt / summary.totalIn) * 100);
+      return `<div class="br"><span class="nm">${head}</span><span class="tk"><span class="fl g" style="width:${pct}%"></span></span><span class="am">${toLakhs(amt)}</span></div>`;
+    }).join('');
+  
+  // Build bar rows for outflow
+  const outflowBars = Object.entries(summary.outflowByHead)
+    .sort((a, b) => b[1] - a[1])
+    .map(([head, amt]) => {
+      const pct = Math.round((amt / summary.totalOut) * 100);
+      return `<div class="br"><span class="nm">${head}</span><span class="tk"><span class="fl r" style="width:${pct}%"></span></span><span class="am">${toLakhs(amt)}</span></div>`;
+    }).join('');
+  
+  // Build transaction rows
+  const txnRows = transactions.map((t, i) => {
+    const isIN = t.inOut === 'IN';
+    const color = isIN ? 'gn' : 'rd';
+    const details = [t.tag, t.mode, t.person !== '—' ? t.person : '', t.bank].filter(x => x && x !== '—').join(' · ');
+    return `<div class="txr">
+      <span class="en">${t.entity}</span><span class="hd">${t.head}</span>
+      <span class="ds" style="grid-column:span 2">${t.description}${details ? '<br><span class="txd">' + details + '</span>' : ''}</span>
+      <span class="io ${color}">${t.inOut}</span><span class="av ${color}">${toLakhs(t.amount)}</span>
+    </div>`;
+  }).join('');
+  
+  // Split IN and OUT transactions
+  const inTxns = transactions.filter(t => t.inOut === 'IN');
+  const outTxns = transactions.filter(t => t.inOut === 'OUT');
+  
+  const inRows = inTxns.map(t => {
+    const details = [t.tag, t.mode, t.person !== '—' ? t.person : '', t.bank].filter(x => x && x !== '—').join(' · ');
+    return `<div class="txr"><span class="en">${t.entity}</span><span class="hd">${t.head}</span>
+      <span class="ds" style="grid-column:span 2">${t.description}${details ? '<br><span class="txd">' + details + '</span>' : ''}</span>
+      <span class="io gn">IN</span><span class="av gn">${toLakhs(t.amount)}</span></div>`;
+  }).join('');
+  
+  const outRows = outTxns.map(t => {
+    const details = [t.tag, t.mode, t.person !== '—' ? t.person : '', t.bank].filter(x => x && x !== '—').join(' · ');
+    return `<div class="txr"><span class="en">${t.entity}</span><span class="hd">${t.head}</span>
+      <span class="ds" style="grid-column:span 2">${t.description}${details ? '<br><span class="txd">' + details + '</span>' : ''}</span>
+      <span class="io rd">OUT</span><span class="av rd">${toLakhs(t.amount)}</span></div>`;
+  }).join('');
+  
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f4}
+.rpt{max-width:600px;margin:0 auto;background:#fff;overflow:hidden}
+.hdr{background:#1C1917;color:#fff;padding:20px 24px 16px}
+.hdr h1{font-size:14px;font-weight:500;letter-spacing:0.5px;opacity:0.6;margin-bottom:2px}
+.hdr .date{font-size:20px;font-weight:500}
+.hdr .sub{font-size:11px;opacity:0.4;margin-top:3px}
+.pill{display:inline-block;background:rgba(255,255,255,0.12);padding:3px 10px;border-radius:20px;font-size:11px;margin-top:8px;color:rgba(255,255,255,0.75)}
+.sum3{display:grid;grid-template-columns:1fr 1fr 1fr;border-bottom:1px solid #e5e5e5}
+.sum3 .c{padding:14px 16px;text-align:center}
+.sum3 .c:not(:last-child){border-right:1px solid #e5e5e5}
+.sum3 .lb{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px}
+.sum3 .vl{font-size:20px;font-weight:600}
+.gn{color:#16A34A}.rd{color:#DC2626}
+.sec{padding:14px 20px;border-bottom:1px solid #e5e5e5}
+.st{font-size:10px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px}
+.br{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.br .nm{font-size:12px;color:#333;width:100px;flex-shrink:0}
+.br .tk{flex:1;height:16px;background:#f0f0f0;border-radius:3px;overflow:hidden}
+.br .fl{height:100%;border-radius:3px}
+.br .fl.g{background:#16A34A}.br .fl.r{background:#DC2626}
+.br .am{font-size:11px;font-weight:600;color:#666;width:70px;text-align:right;flex-shrink:0}
+.pm{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.pc{padding:8px 12px;border-radius:6px;background:#f5f5f4}
+.pc .w{font-size:11px;font-weight:500;color:#888;margin-bottom:2px}
+.pc .pv{font-size:16px;font-weight:600;color:#DC2626}
+.txhdr{background:#292524;padding:8px 20px;display:grid;grid-template-columns:72px 80px 90px 1fr 56px 70px;gap:4px;font-size:10px;font-weight:600;color:#A8A29E;text-transform:uppercase;letter-spacing:0.3px}
+.txr{padding:7px 20px;display:grid;grid-template-columns:72px 80px 90px 1fr 56px 70px;gap:4px;font-size:12px;align-items:center;border-bottom:1px solid #f0f0f0}
+.txr:nth-child(even){background:#fafafa}
+.txr .en{color:#888;font-size:11px}.txr .hd{font-weight:600;color:#333;font-size:11px}
+.txr .ds{color:#666;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.txr .io{font-weight:600;font-size:11px}.txr .av{font-weight:600;text-align:right;font-size:12px}
+.txd{font-size:9px;color:#aaa;margin-top:1px}
+.ft{background:#f5f5f4;padding:10px 20px;text-align:center;font-size:10px;color:#aaa}
+</style></head><body>
+<div class="rpt">
+  <div class="hdr">
+    <h1>FIDATO GROUP — DAILY MIS</h1>
+    <div class="date">${dateFormatted}</div>
+    <div class="sub">Auto-generated from Ledger at 7:00 PM IST</div>
+    <div class="pill">${summary.txnCount} transactions</div>
+  </div>
+  <div class="sum3">
+    <div class="c"><div class="lb">Inflow</div><div class="vl gn">${toLakhs(summary.totalIn)}</div></div>
+    <div class="c"><div class="lb">Outflow</div><div class="vl rd">${toLakhs(summary.totalOut)}</div></div>
+    <div class="c"><div class="lb">Net cash</div><div class="vl">${summary.netCash >= 0 ? '+' : ''}${toLakhs(summary.netCash)}</div></div>
+  </div>
+  <div class="sec"><div class="st">Inflow breakdown</div>${inflowBars}</div>
+  <div class="sec"><div class="st">Outflow by head</div>${outflowBars}</div>
+  <div class="sec"><div class="st">Promoter draws today</div>
+    <div class="pm">
+      <div class="pc"><div class="w">MM (Mukund)</div><div class="pv">${toLakhs(summary.promoterDraws.MM)}</div></div>
+      <div class="pc"><div class="w">SM</div><div class="pv">${toLakhs(summary.promoterDraws.SM)}</div></div>
+    </div>
+  </div>
+  <div style="padding:14px 20px 6px;border-bottom:1px solid #e5e5e5"><div class="st" style="margin-bottom:0">All ${summary.txnCount} transactions</div></div>
+  <div class="txhdr"><span>Entity</span><span>Head</span><span>Description</span><span></span><span>IN/OUT</span><span style="text-align:right">Amount</span></div>
+  ${inRows}
+  <div style="background:#292524;padding:4px 20px;font-size:10px;color:#4ADE80;font-weight:600;text-align:right">TOTAL INFLOW: ${toINR(summary.totalIn)}</div>
+  ${outRows}
+  <div style="background:#292524;padding:4px 20px;font-size:10px;color:#F87171;font-weight:600;text-align:right">TOTAL OUTFLOW: ${toINR(summary.totalOut)}</div>
+  <div style="background:#1C1917;padding:10px 20px;display:flex;justify-content:space-between;font-size:13px;font-weight:600;color:#fff">
+    <span>NET CASH FLOW</span><span style="color:#4ADE80">${summary.netCash >= 0 ? '+' : ''} ${toINR(summary.netCash)}</span>
+  </div>
+  <div class="ft">Fidato Group — MIS Tracker · Generated by Claude AI · ${dateFormatted}, 7:00 PM IST</div>
+</div>
+</body></html>`;
+}
+
+// ============================================================
+// RENDER HTML → JPEG
+// ============================================================
+async function renderToJPEG(html, width = 600) {
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+  
+  const page = await browser.newPage();
+  await page.setViewport({ width, height: 800 });
+  await page.setContent(html, { waitUntil: 'networkidle0' });
+  
+  // Get actual content height
+  const bodyHandle = await page.$('body');
+  const boundingBox = await bodyHandle.boundingBox();
+  await page.setViewport({ width, height: Math.ceil(boundingBox.height) + 20 });
+  
+  const buffer = await page.screenshot({ 
+    type: 'jpeg', 
+    quality: 90, 
+    fullPage: true,
+    clip: { x: 0, y: 0, width, height: Math.ceil(boundingBox.height) + 20 }
+  });
+  
+  await browser.close();
+  return buffer;
+}
+
+// ============================================================
+// SEND IMAGE VIA GUPSHUP WHATSAPP
+// ============================================================
+async function sendWhatsAppImage(imageBuffer, caption, destination) {
+  if (!CONFIG.GUPSHUP_API_KEY) {
+    console.log('GUPSHUP_API_KEY not set, skipping WhatsApp send');
+    return { success: false, error: 'No API key' };
+  }
+  
+  // Upload image to a temporary host (or use base64)
+  // Gupshup requires a URL for images, so we'll use their media upload
+  const FormData = require('form-data');
+  const form = new FormData();
+  form.append('file', imageBuffer, { filename: 'daily-report.jpg', contentType: 'image/jpeg' });
+  
+  // Upload to Gupshup file server
+  const uploadRes = await fetch('https://api.gupshup.io/wa/api/v1/msg/media/upload', {
+    method: 'POST',
+    headers: { 'apikey': CONFIG.GUPSHUP_API_KEY },
+    body: form,
+  });
+  
+  const uploadData = await uploadRes.json();
+  
+  if (!uploadData.mediaUri) {
+    console.error('Failed to upload image:', uploadData);
+    return { success: false, error: 'Upload failed' };
+  }
+  
+  // Send image message
+  const sendRes = await fetch('https://api.gupshup.io/wa/api/v1/msg', {
+    method: 'POST',
+    headers: {
+      'apikey': CONFIG.GUPSHUP_API_KEY,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      channel: 'whatsapp',
+      source: CONFIG.GUPSHUP_SOURCE,
+      destination: destination || CONFIG.WHATSAPP_GROUP_ID,
+      'message.payload': JSON.stringify({
+        type: 'image',
+        url: uploadData.mediaUri,
+        caption: caption || 'Fidato Group — Daily MIS Report',
+      }),
+    }),
+  });
+  
+  const sendData = await sendRes.json();
+  console.log('WhatsApp send result:', sendData);
+  return { success: true, data: sendData };
+}
+
+// ============================================================
+// MAIN: GENERATE AND SEND DAILY REPORT
+// ============================================================
+async function generateAndSendDailyReport(dateStr) {
+  const startTime = Date.now();
+  console.log(`\n=== Generating Daily Report for ${dateStr} ===`);
+  
+  try {
+    // 1. Read Ledger data
+    const transactions = await getLedgerData(dateStr);
+    console.log(`Found ${transactions.length} transactions`);
+    
+    if (transactions.length === 0) {
+      console.log('No transactions found for this date. Skipping report.');
+      return { success: false, reason: 'No transactions' };
     }
     
-    const urlObj = new URL(fetchUrl);
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: {
-        'Accept': 'image/jpeg,image/*,*/*',
-        'User-Agent': 'MISTracker/1.0',
-      }
+    // 2. Compute summary
+    const summary = computeSummary(transactions);
+    console.log(`IN: ${toLakhs(summary.totalIn)}, OUT: ${toLakhs(summary.totalOut)}, NET: ${toLakhs(summary.netCash)}`);
+    
+    // 3. Generate HTML
+    const html = generateDailyReportHTML(transactions, summary, dateStr);
+    
+    // 4. Render to JPEG
+    const imageBuffer = await renderToJPEG(html);
+    console.log(`Image rendered: ${(imageBuffer.length / 1024).toFixed(1)} KB`);
+    
+    // 5. Send via WhatsApp
+    const caption = `📊 Fidato MIS — ${new Date(dateStr).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}\n` +
+      `Inflow: ${toLakhs(summary.totalIn)} | Outflow: ${toLakhs(summary.totalOut)} | Net: ${toLakhs(summary.netCash)}\n` +
+      `${summary.txnCount} transactions`;
+    
+    const result = await sendWhatsAppImage(imageBuffer, caption);
+    
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`Report generated and sent in ${elapsed}s`);
+    
+    return { 
+      success: true, 
+      summary: { in: summary.totalIn, out: summary.totalOut, net: summary.netCash, txns: summary.txnCount },
+      elapsed: elapsed + 's',
     };
     
-    // Add Gupshup API key for their file manager
-    if (GUPSHUP_API_KEY && (url.includes('gupshup') || url.includes('filemanager'))) {
-      options.headers['apikey'] = GUPSHUP_API_KEY;
-      options.headers['token'] = GUPSHUP_API_KEY;
-      options.headers['Authorization'] = 'Bearer ' + GUPSHUP_API_KEY;
-    }
-    
-    console.log(`  Fetching: ${fetchUrl.substring(0, 120)}...`);
-    
-    const client = fetchUrl.startsWith('https') ? https : http;
-    const req = client.request(options, (res) => {
-      console.log(`  Download status: ${res.statusCode} ${res.statusMessage}`);
-      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
-        console.log(`  Redirect to: ${res.headers.location}`);
-        return downloadImage(res.headers.location).then(resolve).catch(reject);
-      }
-      if (res.statusCode === 401 || res.statusCode === 403) {
-        console.log(`  Auth failed! Headers sent: apikey=${GUPSHUP_API_KEY ? 'SET' : 'MISSING'}`);
-        return reject(new Error(`Auth failed: ${res.statusCode}`));
-      }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
-      }
-      const chunks = [];
-      res.on('data', chunk => chunks.push(chunk));
-      res.on('end', () => {
-        const buf = Buffer.concat(chunks);
-        console.log(`  Downloaded: ${buf.length} bytes, content-type: ${res.headers['content-type']}`);
-        resolve(buf);
-      });
-      res.on('error', reject);
-    });
-    req.on('error', (err) => {
-      console.log(`  Download error: ${err.message}`);
-      reject(err);
-    });
-    req.setTimeout(15000, () => {
-      console.log('  Download timeout after 15s');
-      req.destroy(new Error('Timeout'));
-    });
-    req.end();
-  });
-}
-
-// ═══ CLAUDE OCR ═══
-async function extractTextFromImage(imageBuffer, mediaType) {
-  if (!CLAUDE_API_KEY) { console.log('  No CLAUDE_API_KEY'); return null; }
-  const base64 = imageBuffer.toString('base64');
-  const body = JSON.stringify({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 4000,
-    messages: [{
-      role: "user",
-      content: [
-        { type: "image", source: { type: "base64", media_type: mediaType || 'image/jpeg', data: base64 } },
-        { type: "text", text: `This is an MIS report from a real estate group. Extract ALL financial data. Output: 1) Report type 2) Date 3) ALL amounts with labels 4) Totals and balances 5) Key figures. Use ₹ symbol. Be exhaustive.` }
-      ]
-    }]
-  });
-  console.log(`  Calling Claude API (${(Buffer.byteLength(body)/1024).toFixed(0)}KB payload)...`);
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'Content-Length': Buffer.byteLength(body) }
-    }, (res) => {
-      console.log(`  Claude API status: ${res.statusCode}`);
-      const chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString();
-        try {
-          const r = JSON.parse(raw);
-          if (r.error) { console.log(`  Claude error: ${r.error.message || JSON.stringify(r.error)}`); resolve(null); return; }
-          const text = r.content?.[0]?.text || null;
-          if (text) console.log(`  Claude OCR success: ${text.substring(0, 100)}...`);
-          else console.log(`  Claude returned no text: ${raw.substring(0, 200)}`);
-          resolve(text);
-        } catch(e) { console.log(`  Claude parse error: ${e.message}, raw: ${raw.substring(0, 200)}`); reject(e); }
-      });
-      res.on('error', reject);
-    });
-    req.on('error', (err) => { console.log(`  Claude request error: ${err.message}`); reject(err); });
-    req.setTimeout(60000, () => { console.log('  Claude timeout 60s'); req.destroy(new Error('Claude timeout')); });
-    req.write(body);
-    req.end();
-  });
-}
-
-// ═══ MIS PARSER ═══
-function parseMIS(text, sender, timestamp, source) {
-  const result = { raw: text, sender, source: source || 'text', date: new Date(timestamp * 1000).toISOString().split('T')[0], time: new Date(timestamp * 1000).toISOString().split('T')[1].slice(0, 5), type: 'general', amounts: [], signals: [] };
-  const lower = text.toLowerCase();
-  for (const m of text.matchAll(/₹?\s*(\d+(?:[.,]\d+)?)\s*(?:cr|crore)/gi)) result.amounts.push({ value: parseFloat(m[1].replace(/,/g, '')), unit: 'Cr', raw: m[0].trim() });
-  for (const m of text.matchAll(/₹?\s*(\d+(?:[.,]\d+)?)\s*(?:l|lakh|lac)/gi)) result.amounts.push({ value: parseFloat(m[1].replace(/,/g, '')), unit: 'L', raw: m[0].trim() });
-  for (const m of text.matchAll(/₹\s*(\d{1,3}(?:,\d{2,3})*(?:\.\d+)?)/g)) { const val = parseFloat(m[1].replace(/,/g, '')); if (!result.amounts.some(a => m[0].includes(a.raw))) result.amounts.push({ value: val, unit: 'Rs', raw: m[0].trim() }); }
-  for (const report of EXPECTED_REPORTS) { if (report.keywords.some(kw => lower.includes(kw))) { result.type = report.type; break; } }
-  if (result.type === 'general') {
-    if (lower.includes('mm ') || lower.includes('sm ') || lower.includes('drawing')) result.type = 'promoter_draw';
-    else if (lower.includes('office') || lower.includes('gk-1') || lower.includes('salary')) result.type = 'office_expense';
-    else if (lower.includes('booking') || lower.includes('unsold')) result.type = 'sales_update';
+  } catch (err) {
+    console.error('Report generation failed:', err.message);
+    return { success: false, error: err.message };
   }
-  for (const k of ['pressing','delay','shortage','risk','overrun','urgent','critical','crunch','deficit','negative','cancel','refund']) if (lower.includes(k)) result.signals.push({ type: 'risk', keyword: k });
-  for (const k of ['price up','price increase','hike','escalation']) if (lower.includes(k)) result.signals.push({ type: 'cost', keyword: k });
-  return result;
 }
 
-// ═══ PROCESS IMAGE ═══
-async function processImage(body, sender, ts, groupId) {
-  try {
-    const payload = body.payload || body;
-    const mediaUrl = payload.payload?.url || payload.url || payload.mediaUrl || payload.payload?.mediaUrl || body.mediaUrl || '';
-    const caption = payload.payload?.caption || payload.caption || body.caption || '';
-    const mediaType = payload.payload?.contentType || payload.contentType || 'image/jpeg';
-    console.log(`  Image URL: ${mediaUrl.substring(0, 120)}`);
-    if (!mediaUrl) { messages.push({ raw: `[Image — no URL] ${caption}`, sender, date: new Date(ts*1000).toISOString().split('T')[0], time: new Date(ts*1000).toISOString().split('T')[1].slice(0,5), type: 'image_no_url', source: 'image', amounts: [], signals: [], groupId }); return; }
-    const buf = await downloadImage(mediaUrl);
-    if (buf.length < 1000) { console.log(`  Image too small (${buf.length}B) — likely error page`); messages.push({ raw: `[Image — download returned ${buf.length}B, likely error]`, sender, date: new Date(ts*1000).toISOString().split('T')[0], time: new Date(ts*1000).toISOString().split('T')[1].slice(0,5), type: 'image_download_error', source: 'image', amounts: [], signals: [], groupId }); return; }
-    const ocrText = await extractTextFromImage(buf, mediaType);
-    if (ocrText) {
-      const parsed = parseMIS(ocrText, sender, ts, 'image_ocr');
-      parsed.groupId = groupId; parsed.caption = caption; parsed.ocrFull = ocrText;
-      messages.push(parsed);
-      if (messages.length > 2000) messages.shift();
-      console.log(`  STORED (OCR): ${parsed.type} | ${parsed.amounts.length} amounts`);
-    } else {
-      messages.push({ raw: `[Image — OCR failed] ${caption}`, sender, date: new Date(ts*1000).toISOString().split('T')[0], time: new Date(ts*1000).toISOString().split('T')[1].slice(0,5), type: 'image_ocr_failed', source: 'image', amounts: [], signals: [], groupId });
-    }
-  } catch (err) { console.error(`  Image error: ${err.message}`); messages.push({ raw: `[Image error: ${err.message}]`, sender, date: new Date(ts*1000).toISOString().split('T')[0], time: new Date(ts*1000).toISOString().split('T')[1].slice(0,5), type: 'image_error', source: 'image', amounts: [], signals: [] }); }
-}
+// ============================================================
+// API ENDPOINTS
+// ============================================================
 
-// ═══ WEBHOOK ═══
-app.post('/webhook', async (req, res) => {
-  res.status(200).send('OK');
-  try {
-    const body = req.body;
-    debugLog.push({ timestamp: new Date().toISOString(), payload: JSON.stringify(body).substring(0, 3000) }); if (debugLog.length > 50) debugLog.shift();
-    console.log('\n--- INCOMING ---');
-    console.log(JSON.stringify(body).substring(0, 400));
-    if (body.type || body.payload || body.app) {
-      const payload = body.payload || body;
-      const sender = payload.sender?.name || payload.sender?.phone || payload.source || body.senderName || 'Unknown';
-      const ts = body.timestamp ? Math.floor(new Date(body.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
-      const msgGroupId = body.waGroupId || body.groupId || payload.waGroupId || payload.groupId || '';
-      if (GROUP_ID && msgGroupId && msgGroupId !== GROUP_ID) { console.log('  SKIP group'); return; }
-      const payloadType = payload.payload?.type || payload.type || body.type || '';
-      if (payloadType === 'image' || payload.payload?.url || (payload.contentType && payload.contentType.startsWith('image'))) {
-        console.log('  IMAGE — OCR pipeline');
-        await processImage(body, sender, ts, msgGroupId);
-      } else {
-        const text = payload.payload?.text || payload.text || payload.body || body.text || '';
-        if (text) { const parsed = parseMIS(text, sender, ts, 'text'); parsed.groupId = msgGroupId; messages.push(parsed); if (messages.length > 2000) messages.shift(); console.log(`  STORED: ${parsed.type}`); }
-      }
-    }
-    if (body.object === 'whatsapp_business_account') { for (const entry of body.entry || []) { for (const change of entry.changes || []) { if (change.field === 'messages') { for (const msg of change.value?.messages || []) { if (msg.type === 'text') { const contact = (change.value.contacts || []).find(c => c.wa_id === msg.from); const sender = contact?.profile?.name || msg.from; const parsed = parseMIS(msg.text.body, sender, parseInt(msg.timestamp), 'text'); messages.push(parsed); if (messages.length > 2000) messages.shift(); } } } } } }
-  } catch (err) { console.error('Webhook error:', err.message); }
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'Fidato MIS Daily Report',
+    sheetsConnected: !!CONFIG.GOOGLE_CREDENTIALS,
+    gupshupConnected: !!CONFIG.GUPSHUP_API_KEY,
+    cronSchedule: '30 13 * * *', // 1:30 PM UTC = 7:00 PM IST
+    sheetId: CONFIG.SHEET_ID,
+  });
 });
-app.get('/webhook', (req, res) => { if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN) return res.status(200).send(req.query['hub.challenge']); res.sendStatus(403); });
 
-// ═══ API ═══
-app.get('/api/messages', (req, res) => { const limit = parseInt(req.query.limit) || 50; const type = req.query.type; const source = req.query.source; const date = req.query.date; let f = messages; if (type) f = f.filter(m => m.type === type); if (source) f = f.filter(m => m.source === source); if (date) f = f.filter(m => m.date === date); res.json({ count: f.length, messages: f.slice(-limit).reverse() }); });
-app.get('/api/signals', (req, res) => { res.json({ count: messages.filter(m => m.signals.length > 0).length, signals: messages.filter(m => m.signals.length > 0).slice(-20).reverse() }); });
-app.get('/api/ocr', (req, res) => { const o = messages.filter(m => m.source === 'image_ocr'); res.json({ count: o.length, messages: o.slice(-10).reverse().map(m => ({ date: m.date, sender: m.sender, type: m.type, amounts: m.amounts, ocrText: m.ocrFull || m.raw })) }); });
-app.get('/api/daily-status', (req, res) => { const today = new Date().toISOString().split('T')[0]; const date = req.query.date || today; const dayMsgs = messages.filter(m => m.date === date); const reports = EXPECTED_REPORTS.map(r => { const received = dayMsgs.filter(m => m.type === r.type); const latest = received.length > 0 ? received[received.length - 1] : null; return { type: r.type, label: r.label, icon: r.icon, status: received.length > 0 ? 'received' : 'missing', count: received.length, lastReceived: latest ? { time: latest.time, sender: latest.sender, source: latest.source, amounts: latest.amounts.length } : null }; }); const rc = reports.filter(r => r.status === 'received').length; const mc = reports.filter(r => r.status === 'missing').length; const hour = new Date().getHours(); let urgency = 'normal'; if (hour >= 18 && mc > 0) urgency = 'critical'; else if (hour >= 14 && mc > 2) urgency = 'warning'; res.json({ date, totalExpected: 5, received: rc, missing: mc, completionPct: Math.round((rc / 5) * 100), urgency, reports, allMessages: dayMsgs.length }); });
-app.get('/api/debug', (req, res) => { res.json({ currentFilter: GROUP_ID || "NONE", claudeOCR: CLAUDE_API_KEY ? "ENABLED" : "DISABLED", gupshupKey: GUPSHUP_API_KEY ? "SET" : "MISSING", totalStored: messages.length, recentPayloads: debugLog.slice(-10).reverse() }); });
-app.get('/', (req, res) => { res.json({ status: 'running', app: 'Fidato MIS Bot', messages: messages.length, groupFilter: GROUP_ID || 'all', ocrEnabled: !!CLAUDE_API_KEY, gupshupAuth: !!GUPSHUP_API_KEY, uptime: Math.floor(process.uptime()) + 's' }); });
+// Manually trigger daily report for a specific date
+app.get('/api/daily-report', async (req, res) => {
+  const dateStr = req.query.date || new Date().toISOString().split('T')[0];
+  const result = await generateAndSendDailyReport(dateStr);
+  res.json(result);
+});
 
-
-// ═══ LIVE DASHBOARD ═══
-const fss = require('fs');
-const pathMod = require('path');
-app.get('/dashboard', (req, res) => {
-  const htmlPath = pathMod.join(__dirname, 'dashboard.html');
-  if (fss.existsSync(htmlPath)) {
+// Preview report HTML (for testing without sending)
+app.get('/api/preview', async (req, res) => {
+  const dateStr = req.query.date || new Date().toISOString().split('T')[0];
+  
+  try {
+    const transactions = await getLedgerData(dateStr);
+    if (transactions.length === 0) {
+      return res.send('<h1>No transactions found for ' + dateStr + '</h1>');
+    }
+    const summary = computeSummary(transactions);
+    const html = generateDailyReportHTML(transactions, summary, dateStr);
     res.setHeader('Content-Type', 'text/html');
-    res.send(fss.readFileSync(htmlPath, 'utf8'));
-  } else {
-    res.status(404).send('dashboard.html not found. Upload it to the repo alongside server.js.');
+    res.send(html);
+  } catch (err) {
+    res.status(500).send('Error: ' + err.message);
   }
 });
 
-app.get('/health', (req, res) => { res.json({ status: 'ok' }); });
-app.listen(PORT, () => { console.log(`Fidato MIS Bot on port ${PORT}`); console.log(`Group: ${GROUP_ID || 'ALL'} | OCR: ${CLAUDE_API_KEY ? 'ON' : 'OFF'} | Gupshup Auth: ${GUPSHUP_API_KEY ? 'ON' : 'OFF'}`); console.log(`Dashboard: http://localhost:${PORT}/dashboard`); });
+// Preview as JPEG image
+app.get('/api/preview-image', async (req, res) => {
+  const dateStr = req.query.date || new Date().toISOString().split('T')[0];
+  
+  try {
+    const transactions = await getLedgerData(dateStr);
+    if (transactions.length === 0) {
+      return res.status(404).json({ error: 'No transactions for ' + dateStr });
+    }
+    const summary = computeSummary(transactions);
+    const html = generateDailyReportHTML(transactions, summary, dateStr);
+    const imageBuffer = await renderToJPEG(html);
+    
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Content-Disposition', `inline; filename="fidato-mis-${dateStr}.jpg"`);
+    res.send(imageBuffer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Read raw Ledger data for a date
+app.get('/api/ledger', async (req, res) => {
+  const dateStr = req.query.date || new Date().toISOString().split('T')[0];
+  try {
+    const transactions = await getLedgerData(dateStr);
+    const summary = computeSummary(transactions);
+    res.json({ date: dateStr, transactions, summary });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fund Position endpoint
+app.get('/api/fund-position', async (req, res) => {
+  try {
+    const data = await getFundPositionData();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Existing webhook endpoint (keep for Gupshup incoming messages)
+app.post('/webhook', (req, res) => {
+  console.log('Webhook received:', JSON.stringify(req.body).substring(0, 200));
+  res.sendStatus(200);
+});
+
+// ============================================================
+// SMART REMINDER SYSTEM
+// Tracks whether today's MIS has been posted.
+// Schedule: 7 PM → 8 PM → 9 PM → 12 AM → 9 AM next day
+// ============================================================
+const reportStatus = {};
+
+function getTodayIST() {
+  const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function getYesterdayIST() {
+  const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  d.setDate(d.getDate() - 1);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function formatDateNice(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+async function sendTextMessage(message) {
+  if (!CONFIG.GUPSHUP_API_KEY || !CONFIG.WHATSAPP_GROUP_ID) {
+    console.log('[No WhatsApp] Reminder:', message);
+    return;
+  }
+  try {
+    await fetch('https://api.gupshup.io/wa/api/v1/msg', {
+      method: 'POST',
+      headers: {
+        'apikey': CONFIG.GUPSHUP_API_KEY,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        channel: 'whatsapp',
+        source: CONFIG.GUPSHUP_SOURCE,
+        destination: CONFIG.WHATSAPP_GROUP_ID,
+        'message.payload': JSON.stringify({ type: 'text', text: message }),
+      }),
+    });
+    console.log('Reminder sent:', message.substring(0, 80));
+  } catch (err) {
+    console.error('Reminder failed:', err.message);
+  }
+}
+
+async function checkAndReport(dateStr, checkType) {
+  console.log('\n--- ' + checkType + ' check for ' + dateStr + ' ---');
+  
+  if (reportStatus[dateStr] && reportStatus[dateStr].sent) {
+    console.log('Report already sent for ' + dateStr + ' at ' + reportStatus[dateStr].sentAt + '. Skipping.');
+    return;
+  }
+  
+  try {
+    const transactions = await getLedgerData(dateStr);
+    
+    if (transactions.length > 0) {
+      console.log('Found ' + transactions.length + ' transactions. Generating report...');
+      const result = await generateAndSendDailyReport(dateStr);
+      if (result.success) {
+        reportStatus[dateStr] = {
+          sent: true,
+          txnCount: transactions.length,
+          sentAt: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }),
+        };
+      }
+    } else {
+      var dateNice = formatDateNice(dateStr);
+      var msgs = {
+        '7PM': 'MIS Reminder\n\nNo entries found in the Ledger for ' + dateNice + '.\n\nPlease update today\'s transactions in the MIS Tracker sheet.\nNext check: 8:00 PM',
+        '8PM': 'MIS Still Pending\n\nThe Ledger for ' + dateNice + ' has not been updated yet.\n\nPlease complete the entries. Next check: 9:00 PM',
+        '9PM': 'MIS Overdue\n\nToday\'s MIS (' + dateNice + ') is still not updated.\n\nPlease update urgently. Final check at midnight.',
+        'MIDNIGHT': 'MIS Not Updated\n\nThe MIS for ' + dateNice + ' was NOT completed today.\n\nPlease update first thing tomorrow morning.',
+        '9AM': 'Good Morning — Yesterday\'s MIS Missing\n\nThe MIS for ' + dateNice + ' was never completed.\n\nPlease update yesterday\'s entries before starting today\'s work.',
+      };
+      await sendTextMessage(msgs[checkType] || 'MIS for ' + dateNice + ' is pending.');
+      console.log('No data for ' + dateStr + '. ' + checkType + ' reminder sent.');
+    }
+  } catch (err) {
+    console.error(checkType + ' check failed:', err.message);
+  }
+}
+
+// 7:00 PM IST — First check: send report if data exists, else first reminder
+cron.schedule('0 19 * * *', function() { checkAndReport(getTodayIST(), '7PM'); }, { timezone: 'Asia/Kolkata' });
+
+// 8:00 PM IST — Second check
+cron.schedule('0 20 * * *', function() { checkAndReport(getTodayIST(), '8PM'); }, { timezone: 'Asia/Kolkata' });
+
+// 9:00 PM IST — Third check
+cron.schedule('0 21 * * *', function() { checkAndReport(getTodayIST(), '9PM'); }, { timezone: 'Asia/Kolkata' });
+
+// 12:00 AM IST (midnight) — Final check for the day that just ended
+cron.schedule('0 0 * * *', function() { checkAndReport(getYesterdayIST(), 'MIDNIGHT'); }, { timezone: 'Asia/Kolkata' });
+
+// 9:00 AM IST — Morning check: if yesterday was never completed
+cron.schedule('0 9 * * *', function() {
+  var yesterday = getYesterdayIST();
+  if (!reportStatus[yesterday] || !reportStatus[yesterday].sent) {
+    checkAndReport(yesterday, '9AM');
+  } else {
+    console.log('9AM check: Yesterday (' + yesterday + ') was already reported.');
+  }
+}, { timezone: 'Asia/Kolkata' });
+
+// Status endpoint
+app.get('/api/report-status', function(req, res) {
+  res.json({
+    schedule: {
+      '7:00 PM': 'First check — send report or first reminder',
+      '8:00 PM': 'Second check — send report or gentle nudge',
+      '9:00 PM': 'Third check — send report or firm reminder',
+      '12:00 AM': 'Midnight — final check for the day',
+      '9:00 AM': 'Morning — remind about yesterday if never completed',
+    },
+    reportHistory: reportStatus,
+  });
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
+app.listen(CONFIG.PORT, function() {
+  console.log('\nFidato MIS Report Server running on port ' + CONFIG.PORT);
+  console.log('Sheet: ' + CONFIG.SHEET_ID);
+  console.log('Gupshup: ' + (CONFIG.GUPSHUP_API_KEY ? 'Connected' : 'Not configured'));
+  console.log('\nDaily Schedule (IST):');
+  console.log('   7:00 PM — First check + report or reminder');
+  console.log('   8:00 PM — Second check + nudge if pending');
+  console.log('   9:00 PM — Third check + firm reminder');
+  console.log('  12:00 AM — Midnight final check');
+  console.log('   9:00 AM — Morning check for yesterday');
+  console.log('\nEndpoints:');
+  console.log('  GET /health');
+  console.log('  GET /api/daily-report?date=2026-04-05');
+  console.log('  GET /api/preview?date=2026-04-05');
+  console.log('  GET /api/preview-image?date=2026-04-05');
+  console.log('  GET /api/ledger?date=2026-04-05');
+  console.log('  GET /api/fund-position');
+  console.log('  GET /api/report-status');
+});
