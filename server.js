@@ -96,10 +96,8 @@ async function connectWhatsApp() {
   }
 }
 
-// Start WhatsApp connection on server boot
-connectWhatsApp().catch(function(err) {
-  console.error('WhatsApp connection failed:', err.message);
-});
+// Do NOT auto-connect on boot — wait for user to visit /api/pair
+console.log('WhatsApp: Ready to pair. Visit /api/pair?phone=YOUR_NUMBER when ready.');
 
 // ============================================================
 // GOOGLE SHEETS AUTH
@@ -563,23 +561,28 @@ app.get('/api/pair', async (req, res) => {
   }
   
   try {
-    if (!waSocket) {
-      await connectWhatsApp();
-    }
-    
-    // Wait a moment for socket to initialize
-    await new Promise(function(r) { setTimeout(r, 3000); });
-    
-    if (waReady) {
-      return res.json({ status: 'connected', message: 'WhatsApp connected during wait!' });
-    }
-    
-    // Request pairing code
     var phone = req.query.phone || CONFIG.WHATSAPP_PHONE;
     if (!phone) {
       return res.json({ error: 'Provide phone number: /api/pair?phone=919870111582' });
     }
     
+    // Only create a new connection if none exists
+    if (!waSocket) {
+      await connectWhatsApp();
+    }
+    
+    // Wait for socket to initialize
+    await new Promise(function(r) { setTimeout(r, 5000); });
+    
+    if (waReady) {
+      return res.json({ status: 'connected', message: 'WhatsApp connected (already paired from saved session)!' });
+    }
+    
+    if (!waSocket) {
+      return res.json({ error: 'Socket failed to initialize. Try again in 30 seconds.' });
+    }
+    
+    // Request pairing code
     var code = await waSocket.requestPairingCode(phone);
     pairingCode = code;
     console.log('Pairing code generated:', code);
@@ -591,7 +594,8 @@ app.get('/api/pair', async (req, res) => {
       phone: phone,
     });
   } catch (err) {
-    res.json({ error: err.message });
+    console.error('Pairing error:', err.message);
+    res.json({ error: err.message, hint: 'If your number has a temporary ban, wait 24-48 hours before trying again.' });
   }
 });
 
