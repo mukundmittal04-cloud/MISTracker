@@ -8,6 +8,10 @@ const { google } = require('googleapis');
 const fetch = require('node-fetch');
 // No puppeteer - using html-to-image cloud API instead (lightweight, no Chromium needed)
 const cron = require('node-cron');
+const makeWASocket = require('@whiskeysockets/baileys').default;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const P = require('pino');
+const fs = require('fs');
 const app = express();
 app.use(express.json());
 
@@ -19,17 +23,78 @@ const CONFIG = {
   SHEET_ID: process.env.SHEET_ID || '1h_62f7kQB1i8_YOWTHKjcbnz4piMr5tYoKJJpKKqwLM',
   GOOGLE_CREDENTIALS: process.env.GOOGLE_CREDENTIALS, // JSON string of service account
   
-  // Gupshup WhatsApp
-  GUPSHUP_API_KEY: process.env.GUPSHUP_API_KEY,
-  GUPSHUP_APP_ID: process.env.GUPSHUP_APP_ID || 'c424883c-779c-4e35-be26-b8a26e3469f2',
-  GUPSHUP_SOURCE: process.env.GUPSHUP_SOURCE || '919870111582',
-  WHATSAPP_GROUP_ID: process.env.WHATSAPP_GROUP_ID, // Group JID
+  // WhatsApp via Baileys (replaces Gupshup)
+  WHATSAPP_GROUP_JID: process.env.WHATSAPP_GROUP_JID, // e.g. '120363xxxxx@g.us'
+  WHATSAPP_PHONE: process.env.WHATSAPP_PHONE || '919870111582', // phone number to pair
+  
+  // HCTI (HTML to Image)
+  HCTI_USER_ID: process.env.HCTI_USER_ID,
+  HCTI_API_KEY: process.env.HCTI_API_KEY,
   
   // Anthropic (for Claude-generated summaries if needed)
   CLAUDE_API_KEY: process.env.CLAUDE_API_KEY,
   
   PORT: process.env.PORT || 3000,
 };
+
+// ============================================================
+// BAILEYS WHATSAPP CONNECTION
+// ============================================================
+let waSocket = null;
+let waReady = false;
+let pairingCode = null;
+
+async function connectWhatsApp() {
+  const authDir = './auth_info';
+  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+  
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { version } = await fetchLatestBaileysVersion();
+  
+  waSocket = makeWASocket({
+    version,
+    auth: state,
+    logger: P({ level: 'silent' }),
+    printQRInTerminal: false,
+    browser: ['Fidato MIS Bot', 'Chrome', '120.0.0'],
+  });
+  
+  waSocket.ev.on('creds.update', saveCreds);
+  
+  waSocket.ev.on('connection.update', function(update) {
+    var connection = update.connection;
+    var lastDisconnect = update.lastDisconnect;
+    
+    if (connection === 'close') {
+      waReady = false;
+      var statusCode = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output ? lastDisconnect.error.output.statusCode : 0;
+      var shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log('WhatsApp disconnected. Status:', statusCode, shouldReconnect ? '- Reconnecting...' : '- Logged out');
+      if (shouldReconnect) {
+        setTimeout(connectWhatsApp, 5000);
+      }
+    } else if (connection === 'open') {
+      waReady = true;
+      pairingCode = null;
+      console.log('WhatsApp connected successfully!');
+      
+      // List groups to find the MIS group JID
+      if (!CONFIG.WHATSAPP_GROUP_JID) {
+        console.log('No WHATSAPP_GROUP_JID set. Use /api/groups to find your group JID.');
+      }
+    }
+  });
+  
+  // If not registered, request pairing code
+  if (!state.creds.registered) {
+    console.log('WhatsApp not paired yet. Visit /api/pair to get a pairing code.');
+  }
+}
+
+// Start WhatsApp connection on server boot
+connectWhatsApp().catch(function(err) {
+  console.error('WhatsApp connection failed:', err.message);
+});
 
 // ============================================================
 // GOOGLE SHEETS AUTH
@@ -384,12 +449,18 @@ async function renderToJPEG(html, width = 600) {
 }
 
 // ============================================================
-// SEND IMAGE VIA GUPSHUP WHATSAPP
+// SEND IMAGE VIA BAILEYS WHATSAPP
 // ============================================================
 async function sendWhatsAppImage(imageBuffer, caption, destination) {
-  if (!CONFIG.GUPSHUP_API_KEY) {
-    console.log('GUPSHUP_API_KEY not set, skipping WhatsApp send');
-    return { success: false, error: 'No API key' };
+  if (!waReady || !waSocket) {
+    console.log('WhatsApp not connected. Skipping send.');
+    return { success: false, error: 'WhatsApp not connected' };
+  }
+  
+  var groupJid = destination || CONFIG.WHATSAPP_GROUP_JID;
+  if (!groupJid) {
+    console.log('No group JID set. Use /api/groups to find it.');
+    return { success: false, error: 'No group JID configured' };
   }
   
   // If no image buffer (HCTI not configured), send the preview link as text
@@ -400,47 +471,17 @@ async function sendWhatsAppImage(imageBuffer, caption, destination) {
     return { success: true, method: 'text_link' };
   }
   
-  // Upload image to Gupshup file server
-  const FormData = require('form-data');
-  const form = new FormData();
-  form.append('file', imageBuffer, { filename: 'daily-report.jpg', contentType: 'image/jpeg' });
-  
-  // Upload to Gupshup file server
-  const uploadRes = await fetch('https://api.gupshup.io/wa/api/v1/msg/media/upload', {
-    method: 'POST',
-    headers: { 'apikey': CONFIG.GUPSHUP_API_KEY },
-    body: form,
-  });
-  
-  const uploadData = await uploadRes.json();
-  
-  if (!uploadData.mediaUri) {
-    console.error('Failed to upload image:', uploadData);
-    return { success: false, error: 'Upload failed' };
+  try {
+    await waSocket.sendMessage(groupJid, {
+      image: imageBuffer,
+      caption: caption || 'Fidato Group — Daily MIS Report',
+    });
+    console.log('Image sent to group:', groupJid);
+    return { success: true, method: 'baileys_image' };
+  } catch (err) {
+    console.error('Failed to send image:', err.message);
+    return { success: false, error: err.message };
   }
-  
-  // Send image message
-  const sendRes = await fetch('https://api.gupshup.io/wa/api/v1/msg', {
-    method: 'POST',
-    headers: {
-      'apikey': CONFIG.GUPSHUP_API_KEY,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: new URLSearchParams({
-      channel: 'whatsapp',
-      source: CONFIG.GUPSHUP_SOURCE,
-      destination: destination || CONFIG.WHATSAPP_GROUP_ID,
-      'message.payload': JSON.stringify({
-        type: 'image',
-        url: uploadData.mediaUri,
-        caption: caption || 'Fidato Group — Daily MIS Report',
-      }),
-    }),
-  });
-  
-  const sendData = await sendRes.json();
-  console.log('WhatsApp send result:', sendData);
-  return { success: true, data: sendData };
 }
 
 // ============================================================
@@ -503,9 +544,81 @@ app.get('/health', (req, res) => {
     status: 'ok',
     service: 'Fidato MIS Daily Report',
     sheetsConnected: !!CONFIG.GOOGLE_CREDENTIALS,
-    gupshupConnected: !!CONFIG.GUPSHUP_API_KEY,
-    cronSchedule: '30 13 * * *', // 1:30 PM UTC = 7:00 PM IST
+    whatsappConnected: waReady,
+    whatsappGroupJid: CONFIG.WHATSAPP_GROUP_JID || 'NOT SET — use /api/groups',
+    hctiConfigured: !!(CONFIG.HCTI_USER_ID && CONFIG.HCTI_API_KEY),
     sheetId: CONFIG.SHEET_ID,
+  });
+});
+
+// Pairing endpoint — visit this to pair your WhatsApp number
+app.get('/api/pair', async (req, res) => {
+  if (waReady) {
+    return res.json({ status: 'already_connected', message: 'WhatsApp is already connected!' });
+  }
+  
+  try {
+    if (!waSocket) {
+      await connectWhatsApp();
+    }
+    
+    // Wait a moment for socket to initialize
+    await new Promise(function(r) { setTimeout(r, 3000); });
+    
+    if (waReady) {
+      return res.json({ status: 'connected', message: 'WhatsApp connected during wait!' });
+    }
+    
+    // Request pairing code
+    var phone = req.query.phone || CONFIG.WHATSAPP_PHONE;
+    if (!phone) {
+      return res.json({ error: 'Provide phone number: /api/pair?phone=919870111582' });
+    }
+    
+    var code = await waSocket.requestPairingCode(phone);
+    pairingCode = code;
+    console.log('Pairing code generated:', code);
+    
+    res.json({
+      status: 'pairing_code_generated',
+      code: code,
+      instructions: 'Open WhatsApp on your phone → Settings → Linked Devices → Link a Device → Link with Phone Number → Enter this code: ' + code,
+      phone: phone,
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// List groups — to find the MIS group JID
+app.get('/api/groups', async (req, res) => {
+  if (!waReady || !waSocket) {
+    return res.json({ error: 'WhatsApp not connected. Visit /api/pair first.' });
+  }
+  
+  try {
+    var groups = await waSocket.groupFetchAllParticipating();
+    var groupList = Object.values(groups).map(function(g) {
+      return {
+        jid: g.id,
+        name: g.subject,
+        participants: g.participants ? g.participants.length : 0,
+        creation: g.creation,
+      };
+    });
+    res.json({ groups: groupList, hint: 'Set the JID of your MIS group as WHATSAPP_GROUP_JID in Railway variables' });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// WhatsApp status
+app.get('/api/wa-status', (req, res) => {
+  res.json({
+    connected: waReady,
+    groupJid: CONFIG.WHATSAPP_GROUP_JID || 'NOT SET',
+    pairingCode: pairingCode,
+    authExists: fs.existsSync('./auth_info/creds.json'),
   });
 });
 
@@ -583,11 +696,7 @@ app.get('/api/fund-position', async (req, res) => {
   }
 });
 
-// Existing webhook endpoint (keep for Gupshup incoming messages)
-app.post('/webhook', (req, res) => {
-  console.log('Webhook received:', JSON.stringify(req.body).substring(0, 200));
-  res.sendStatus(200);
-});
+// (Gupshup webhook removed — now using Baileys for WhatsApp)
 
 // ============================================================
 // SMART REMINDER SYSTEM
@@ -613,24 +722,12 @@ function formatDateNice(dateStr) {
 }
 
 async function sendTextMessage(message) {
-  if (!CONFIG.GUPSHUP_API_KEY || !CONFIG.WHATSAPP_GROUP_ID) {
+  if (!waReady || !waSocket || !CONFIG.WHATSAPP_GROUP_JID) {
     console.log('[No WhatsApp] Reminder:', message);
     return;
   }
   try {
-    await fetch('https://api.gupshup.io/wa/api/v1/msg', {
-      method: 'POST',
-      headers: {
-        'apikey': CONFIG.GUPSHUP_API_KEY,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        channel: 'whatsapp',
-        source: CONFIG.GUPSHUP_SOURCE,
-        destination: CONFIG.WHATSAPP_GROUP_ID,
-        'message.payload': JSON.stringify({ type: 'text', text: message }),
-      }),
-    });
+    await waSocket.sendMessage(CONFIG.WHATSAPP_GROUP_JID, { text: message });
     console.log('Reminder sent:', message.substring(0, 80));
   } catch (err) {
     console.error('Reminder failed:', err.message);
@@ -717,7 +814,8 @@ app.get('/api/report-status', function(req, res) {
 app.listen(CONFIG.PORT, function() {
   console.log('\nFidato MIS Report Server running on port ' + CONFIG.PORT);
   console.log('Sheet: ' + CONFIG.SHEET_ID);
-  console.log('Gupshup: ' + (CONFIG.GUPSHUP_API_KEY ? 'Connected' : 'Not configured'));
+  console.log('WhatsApp: ' + (waReady ? 'Connected' : 'Not paired — visit /api/pair'));
+  console.log('HCTI: ' + (CONFIG.HCTI_USER_ID ? 'Configured' : 'Not configured'));
   console.log('\nDaily Schedule (IST):');
   console.log('   7:00 PM — First check + report or reminder');
   console.log('   8:00 PM — Second check + nudge if pending');
@@ -726,6 +824,9 @@ app.listen(CONFIG.PORT, function() {
   console.log('   9:00 AM — Morning check for yesterday');
   console.log('\nEndpoints:');
   console.log('  GET /health');
+  console.log('  GET /api/pair?phone=919870111582 — One-time WhatsApp pairing');
+  console.log('  GET /api/groups — List WhatsApp groups to find JID');
+  console.log('  GET /api/wa-status — WhatsApp connection status');
   console.log('  GET /api/daily-report?date=2026-04-05');
   console.log('  GET /api/preview?date=2026-04-05');
   console.log('  GET /api/preview-image?date=2026-04-05');
