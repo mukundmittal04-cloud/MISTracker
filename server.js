@@ -3,6 +3,11 @@
 // Reads Google Sheet → Generates visual report → Sends via WhatsApp
 // ============================================================
 
+// Crypto polyfill needed by Baileys on some Node versions
+if (!globalThis.crypto) {
+  globalThis.crypto = require('crypto').webcrypto;
+}
+
 const express = require('express');
 const { google } = require('googleapis');
 const fetch = require('node-fetch');
