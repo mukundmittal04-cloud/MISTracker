@@ -523,7 +523,11 @@ async function generateAndSendDailyReport(dateStr) {
     
     // 4. Render to JPEG
     const imageBuffer = await renderToJPEG(html);
-    console.log(`Image rendered: ${(imageBuffer.length / 1024).toFixed(1)} KB`);
+    if (imageBuffer) {
+      console.log('Image rendered: ' + (imageBuffer.length / 1024).toFixed(1) + ' KB');
+    } else {
+      console.log('Image rendering skipped — will send as text link');
+    }
     
     // 5. Send via WhatsApp
     const caption = `📊 Fidato MIS — ${new Date(dateStr).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}\n` +
