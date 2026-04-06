@@ -48,6 +48,7 @@ const CONFIG = {
 let waSocket = null;
 let waReady = false;
 let pairingCode = null;
+let latestQR = null;
 
 async function connectWhatsApp() {
   const authDir = './auth_info';
@@ -69,6 +70,13 @@ async function connectWhatsApp() {
   waSocket.ev.on('connection.update', function(update) {
     var connection = update.connection;
     var lastDisconnect = update.lastDisconnect;
+    var qr = update.qr;
+    
+    // Store QR code for the web endpoint
+    if (qr) {
+      latestQR = qr;
+      console.log('New QR code generated. Visit /api/pair to scan.');
+    }
     
     if (connection === 'close') {
       waReady = false;
@@ -81,23 +89,22 @@ async function connectWhatsApp() {
     } else if (connection === 'open') {
       waReady = true;
       pairingCode = null;
+      latestQR = null;
       console.log('WhatsApp connected successfully!');
       
-      // List groups to find the MIS group JID
       if (!CONFIG.WHATSAPP_GROUP_JID) {
         console.log('No WHATSAPP_GROUP_JID set. Use /api/groups to find your group JID.');
       }
     }
   });
   
-  // If not registered, request pairing code
   if (!state.creds.registered) {
-    console.log('WhatsApp not paired yet. Visit /api/pair to get a pairing code.');
+    console.log('WhatsApp not paired yet. Visit /api/pair to scan QR code.');
   }
 }
 
 // Do NOT auto-connect on boot — wait for user to visit /api/pair
-console.log('WhatsApp: Ready to pair. Visit /api/pair?phone=YOUR_NUMBER when ready.');
+console.log('WhatsApp: Ready to pair. Visit /api/pair when ready.');
 
 // ============================================================
 // GOOGLE SHEETS AUTH
@@ -554,48 +561,52 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Pairing endpoint — visit this to pair your WhatsApp number
+// Pairing endpoint — visit this to scan QR code with WhatsApp
 app.get('/api/pair', async (req, res) => {
   if (waReady) {
-    return res.json({ status: 'already_connected', message: 'WhatsApp is already connected!' });
+    return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h1 style="color:green">WhatsApp Connected!</h1><p>The bot is already linked and ready to send messages.</p><p><a href="/api/groups">View Groups</a> | <a href="/health">Health Check</a></p></body></html>');
   }
   
   try {
-    var phone = req.query.phone || CONFIG.WHATSAPP_PHONE;
-    if (!phone) {
-      return res.json({ error: 'Provide phone number: /api/pair?phone=919870111582' });
-    }
-    
-    // Only create a new connection if none exists
+    // Start connection if not already started
     if (!waSocket) {
+      latestQR = null;
       await connectWhatsApp();
     }
     
-    // Wait for socket to initialize
-    await new Promise(function(r) { setTimeout(r, 5000); });
+    // Wait for QR to be generated
+    var attempts = 0;
+    while (!latestQR && !waReady && attempts < 15) {
+      await new Promise(function(r) { setTimeout(r, 1000); });
+      attempts++;
+    }
     
     if (waReady) {
-      return res.json({ status: 'connected', message: 'WhatsApp connected (already paired from saved session)!' });
+      return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h1 style="color:green">WhatsApp Connected!</h1><p>Successfully linked from saved session.</p></body></html>');
     }
     
-    if (!waSocket) {
-      return res.json({ error: 'Socket failed to initialize. Try again in 30 seconds.' });
+    if (!latestQR) {
+      return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h1>Waiting for QR...</h1><p>Refresh this page in 5 seconds.</p><script>setTimeout(function(){location.reload()},5000)</script></body></html>');
     }
     
-    // Request pairing code
-    var code = await waSocket.requestPairingCode(phone);
-    pairingCode = code;
-    console.log('Pairing code generated:', code);
+    // Generate QR code as image using a simple QR library via URL
+    var qrImageUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(latestQR);
     
-    res.json({
-      status: 'pairing_code_generated',
-      code: code,
-      instructions: 'Open WhatsApp on your phone → Settings → Linked Devices → Link a Device → Link with Phone Number → Enter this code: ' + code,
-      phone: phone,
-    });
+    res.send('<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fidato MIS - WhatsApp Pairing</title></head><body style="font-family:sans-serif;text-align:center;padding:20px;background:#f5f5f4">' +
+      '<div style="max-width:400px;margin:0 auto;background:white;border-radius:12px;padding:30px;box-shadow:0 2px 10px rgba(0,0,0,0.1)">' +
+      '<h2 style="margin:0 0 5px;color:#1C1917">Fidato MIS Bot</h2>' +
+      '<p style="color:#888;margin:0 0 20px">Scan this QR code with WhatsApp</p>' +
+      '<img src="' + qrImageUrl + '" style="width:260px;height:260px;border:4px solid #e5e5e5;border-radius:8px" />' +
+      '<p style="margin:20px 0 5px;font-size:13px;color:#666"><b>Steps:</b></p>' +
+      '<p style="font-size:12px;color:#888;line-height:1.6">1. Open WhatsApp on your phone<br>2. Go to Settings → Linked Devices<br>3. Tap "Link a Device"<br>4. Point your camera at this QR code</p>' +
+      '<p style="margin-top:20px;font-size:11px;color:#aaa">QR expires in ~60 seconds. <a href="/api/pair" style="color:#16A34A">Refresh for new code</a></p>' +
+      '</div>' +
+      '<script>setInterval(function(){fetch("/api/wa-status").then(function(r){return r.json()}).then(function(d){if(d.connected){document.body.innerHTML="<div style=\\"text-align:center;padding:60px\\"><h1 style=\\"color:green\\">Connected!</h1><p>WhatsApp linked successfully. <a href=/api/groups>Find your group JID</a></p></div>"}})},3000)</script>' +
+      '</body></html>');
+      
   } catch (err) {
     console.error('Pairing error:', err.message);
-    res.json({ error: err.message, hint: 'If your number has a temporary ban, wait 24-48 hours before trying again.' });
+    res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h1 style="color:red">Error</h1><p>' + err.message + '</p><p><a href="/api/pair">Try Again</a></p></body></html>');
   }
 });
 
