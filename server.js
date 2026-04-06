@@ -3,19 +3,12 @@
 // Reads Google Sheet → Generates visual report → Sends via WhatsApp
 // ============================================================
 
-// Crypto polyfill needed by Baileys on some Node versions
-if (!globalThis.crypto) {
-  globalThis.crypto = require('crypto').webcrypto;
-}
-
 const express = require('express');
 const { google } = require('googleapis');
 const fetch = require('node-fetch');
-// No puppeteer - using html-to-image cloud API instead (lightweight, no Chromium needed)
 const cron = require('node-cron');
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
-const P = require('pino');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode');
 const fs = require('fs');
 const app = express();
 app.use(express.json());
@@ -28,9 +21,8 @@ const CONFIG = {
   SHEET_ID: process.env.SHEET_ID || '1h_62f7kQB1i8_YOWTHKjcbnz4piMr5tYoKJJpKKqwLM',
   GOOGLE_CREDENTIALS: process.env.GOOGLE_CREDENTIALS, // JSON string of service account
   
-  // WhatsApp via Baileys (replaces Gupshup)
+  // WhatsApp via whatsapp-web.js
   WHATSAPP_GROUP_JID: process.env.WHATSAPP_GROUP_JID, // e.g. '120363xxxxx@g.us'
-  WHATSAPP_PHONE: process.env.WHATSAPP_PHONE || '919870111582', // phone number to pair
   
   // Bot on/off toggle — set to 'false' in Railway to pause all sending
   BOT_ENABLED: process.env.BOT_ENABLED !== 'false', // defaults to true
@@ -46,64 +38,73 @@ const CONFIG = {
 };
 
 // ============================================================
-// BAILEYS WHATSAPP CONNECTION
+// WHATSAPP-WEB.JS CONNECTION
 // ============================================================
-let waSocket = null;
+let waClient = null;
 let waReady = false;
-let pairingCode = null;
 let latestQR = null;
+let latestQRDataUrl = null;
 
-async function connectWhatsApp() {
-  const authDir = './auth_info';
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
-  
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
-  
-  waSocket = makeWASocket({
-    version,
-    auth: state,
-    logger: P({ level: 'silent' }),
-    printQRInTerminal: false,
-    browser: ['Fidato MIS Bot', 'Chrome', '120.0.0'],
+function createWhatsAppClient() {
+  waClient = new Client({
+    authStrategy: new LocalAuth({ dataPath: './wa_auth' }),
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu',
+        '--disable-extensions',
+      ],
+    },
   });
-  
-  waSocket.ev.on('creds.update', saveCreds);
-  
-  waSocket.ev.on('connection.update', function(update) {
-    var connection = update.connection;
-    var lastDisconnect = update.lastDisconnect;
-    var qr = update.qr;
+
+  waClient.on('qr', function(qr) {
+    latestQR = qr;
+    qrcode.toDataURL(qr, function(err, url) {
+      if (!err) latestQRDataUrl = url;
+    });
+    console.log('New QR code generated. Visit /api/pair to scan.');
+  });
+
+  waClient.on('ready', function() {
+    waReady = true;
+    latestQR = null;
+    latestQRDataUrl = null;
+    console.log('WhatsApp Web client is ready!');
     
-    // Store QR code for the web endpoint
-    if (qr) {
-      latestQR = qr;
-      console.log('New QR code generated. Visit /api/pair to scan.');
-    }
-    
-    if (connection === 'close') {
-      waReady = false;
-      var statusCode = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output ? lastDisconnect.error.output.statusCode : 0;
-      var shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log('WhatsApp disconnected. Status:', statusCode, shouldReconnect ? '- Reconnecting...' : '- Logged out');
-      if (shouldReconnect) {
-        setTimeout(connectWhatsApp, 5000);
-      }
-    } else if (connection === 'open') {
-      waReady = true;
-      pairingCode = null;
-      latestQR = null;
-      console.log('WhatsApp connected successfully!');
-      
-      if (!CONFIG.WHATSAPP_GROUP_JID) {
-        console.log('No WHATSAPP_GROUP_JID set. Use /api/groups to find your group JID.');
-      }
+    if (!CONFIG.WHATSAPP_GROUP_JID) {
+      console.log('No WHATSAPP_GROUP_JID set. Use /api/groups to find your group JID.');
     }
   });
-  
-  if (!state.creds.registered) {
-    console.log('WhatsApp not paired yet. Visit /api/pair to scan QR code.');
-  }
+
+  waClient.on('authenticated', function() {
+    console.log('WhatsApp authenticated successfully.');
+  });
+
+  waClient.on('auth_failure', function(msg) {
+    console.error('WhatsApp auth failure:', msg);
+    waReady = false;
+  });
+
+  waClient.on('disconnected', function(reason) {
+    console.log('WhatsApp disconnected:', reason);
+    waReady = false;
+    // Auto-reconnect after 10 seconds
+    setTimeout(function() {
+      console.log('Attempting to reconnect WhatsApp...');
+      waClient.initialize().catch(function(err) {
+        console.error('Reconnect failed:', err.message);
+      });
+    }, 10000);
+  });
+
+  return waClient;
 }
 
 // Do NOT auto-connect on boot — wait for user to visit /api/pair
@@ -462,10 +463,10 @@ async function renderToJPEG(html, width = 600) {
 }
 
 // ============================================================
-// SEND IMAGE VIA BAILEYS WHATSAPP
+// SEND IMAGE VIA WHATSAPP-WEB.JS
 // ============================================================
 async function sendWhatsAppImage(imageBuffer, caption, destination) {
-  if (!waReady || !waSocket) {
+  if (!waReady || !waClient) {
     console.log('WhatsApp not connected. Skipping send.');
     return { success: false, error: 'WhatsApp not connected' };
   }
@@ -485,15 +486,21 @@ async function sendWhatsAppImage(imageBuffer, caption, destination) {
   }
   
   try {
-    await waSocket.sendMessage(groupJid, {
-      image: imageBuffer,
-      caption: caption || 'Fidato Group — Daily MIS Report',
-    });
+    var media = new MessageMedia('image/jpeg', imageBuffer.toString('base64'), 'daily-report.jpg');
+    await waClient.sendMessage(groupJid, media, { caption: caption || 'Fidato Group — Daily MIS Report' });
     console.log('Image sent to group:', groupJid);
-    return { success: true, method: 'baileys_image' };
+    return { success: true, method: 'wwjs_image' };
   } catch (err) {
     console.error('Failed to send image:', err.message);
-    return { success: false, error: err.message };
+    // Fallback to text
+    try {
+      var previewUrl2 = 'https://mistracker-production.up.railway.app/api/preview';
+      var msg2 = caption + '\n\nView full report: ' + previewUrl2;
+      await waClient.sendMessage(groupJid, msg2);
+      return { success: true, method: 'text_fallback' };
+    } catch (err2) {
+      return { success: false, error: err.message };
+    }
   }
 }
 
@@ -568,42 +575,41 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Pairing endpoint — visit this to scan QR code with WhatsApp
+// Pairing endpoint — shows QR code to scan
 app.get('/api/pair', async (req, res) => {
   if (waReady) {
     return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h1 style="color:green">WhatsApp Connected!</h1><p>The bot is already linked and ready to send messages.</p><p><a href="/api/groups">View Groups</a> | <a href="/health">Health Check</a></p></body></html>');
   }
   
   try {
-    // Start connection if not already started
-    if (!waSocket) {
-      latestQR = null;
-      await connectWhatsApp();
+    // Initialize client if not started
+    if (!waClient) {
+      createWhatsAppClient();
+      waClient.initialize().catch(function(err) {
+        console.error('WhatsApp init error:', err.message);
+      });
     }
     
-    // Wait for QR to be generated
+    // Wait for QR to generate
     var attempts = 0;
-    while (!latestQR && !waReady && attempts < 15) {
+    while (!latestQRDataUrl && !waReady && attempts < 20) {
       await new Promise(function(r) { setTimeout(r, 1000); });
       attempts++;
     }
     
     if (waReady) {
-      return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h1 style="color:green">WhatsApp Connected!</h1><p>Successfully linked from saved session.</p></body></html>');
+      return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h1 style="color:green">WhatsApp Connected!</h1><p>Successfully linked.</p><p><a href="/api/groups">View Groups</a></p></body></html>');
     }
     
-    if (!latestQR) {
+    if (!latestQRDataUrl) {
       return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h1>Waiting for QR...</h1><p>Refresh this page in 5 seconds.</p><script>setTimeout(function(){location.reload()},5000)</script></body></html>');
     }
-    
-    // Generate QR code as image using a simple QR library via URL
-    var qrImageUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(latestQR);
     
     res.send('<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fidato MIS - WhatsApp Pairing</title></head><body style="font-family:sans-serif;text-align:center;padding:20px;background:#f5f5f4">' +
       '<div style="max-width:400px;margin:0 auto;background:white;border-radius:12px;padding:30px;box-shadow:0 2px 10px rgba(0,0,0,0.1)">' +
       '<h2 style="margin:0 0 5px;color:#1C1917">Fidato MIS Bot</h2>' +
       '<p style="color:#888;margin:0 0 20px">Scan this QR code with WhatsApp</p>' +
-      '<img src="' + qrImageUrl + '" style="width:260px;height:260px;border:4px solid #e5e5e5;border-radius:8px" />' +
+      '<img src="' + latestQRDataUrl + '" style="width:260px;height:260px;border:4px solid #e5e5e5;border-radius:8px" />' +
       '<p style="margin:20px 0 5px;font-size:13px;color:#666"><b>Steps:</b></p>' +
       '<p style="font-size:12px;color:#888;line-height:1.6">1. Open WhatsApp on your phone<br>2. Go to Settings → Linked Devices<br>3. Tap "Link a Device"<br>4. Point your camera at this QR code</p>' +
       '<p style="margin-top:20px;font-size:11px;color:#aaa">QR expires in ~60 seconds. <a href="/api/pair" style="color:#16A34A">Refresh for new code</a></p>' +
@@ -617,23 +623,22 @@ app.get('/api/pair', async (req, res) => {
   }
 });
 
-// List groups — to find the MIS group JID
+// List groups
 app.get('/api/groups', async (req, res) => {
-  if (!waReady || !waSocket) {
+  if (!waReady || !waClient) {
     return res.json({ error: 'WhatsApp not connected. Visit /api/pair first.' });
   }
   
   try {
-    var groups = await waSocket.groupFetchAllParticipating();
-    var groupList = Object.values(groups).map(function(g) {
+    var chats = await waClient.getChats();
+    var groups = chats.filter(function(c) { return c.isGroup; }).map(function(g) {
       return {
-        jid: g.id,
-        name: g.subject,
+        jid: g.id._serialized,
+        name: g.name,
         participants: g.participants ? g.participants.length : 0,
-        creation: g.creation,
       };
     });
-    res.json({ groups: groupList, hint: 'Set the JID of your MIS group as WHATSAPP_GROUP_JID in Railway variables' });
+    res.json({ groups: groups, hint: 'Set the JID of your MIS group as WHATSAPP_GROUP_JID in Railway variables' });
   } catch (err) {
     res.json({ error: err.message });
   }
@@ -644,14 +649,13 @@ app.get('/api/wa-status', (req, res) => {
   res.json({
     connected: waReady,
     groupJid: CONFIG.WHATSAPP_GROUP_JID || 'NOT SET',
-    pairingCode: pairingCode,
-    authExists: fs.existsSync('./auth_info/creds.json'),
+    authExists: fs.existsSync('./wa_auth'),
   });
 });
 
-// Test send — sends a simple text to the group to verify WhatsApp is working
+// Test send — simple text to verify WhatsApp works
 app.get('/api/test-send', async (req, res) => {
-  if (!waReady || !waSocket) {
+  if (!waReady || !waClient) {
     return res.json({ error: 'WhatsApp not connected' });
   }
   var jid = CONFIG.WHATSAPP_GROUP_JID;
@@ -660,8 +664,8 @@ app.get('/api/test-send', async (req, res) => {
   }
   try {
     var msg = req.query.msg || 'MIS Bot test — this message will be deleted';
-    var sent = await waSocket.sendMessage(jid, { text: msg });
-    res.json({ success: true, messageId: sent.key.id, jid: jid, hint: 'Delete from WhatsApp: long press → delete for everyone' });
+    var sent = await waClient.sendMessage(jid, msg);
+    res.json({ success: true, messageId: sent.id._serialized, jid: jid, hint: 'Delete from WhatsApp: long press > delete for everyone' });
   } catch (err) {
     res.json({ success: false, error: err.message, stack: err.stack ? err.stack.substring(0, 500) : '' });
   }
@@ -767,12 +771,12 @@ function formatDateNice(dateStr) {
 }
 
 async function sendTextMessage(message) {
-  if (!waReady || !waSocket || !CONFIG.WHATSAPP_GROUP_JID) {
+  if (!waReady || !waClient || !CONFIG.WHATSAPP_GROUP_JID) {
     console.log('[No WhatsApp] Reminder:', message);
     return;
   }
   try {
-    await waSocket.sendMessage(CONFIG.WHATSAPP_GROUP_JID, { text: message });
+    await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID, message);
     console.log('Reminder sent:', message.substring(0, 80));
   } catch (err) {
     console.error('Reminder failed:', err.message);

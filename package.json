@@ -1,7 +1,7 @@
 {
   "name": "fidato-mis-report",
-  "version": "3.0.0",
-  "description": "Fidato Group MIS Daily Report - Reads Google Sheet, generates visual report, sends via WhatsApp (Baileys)",
+  "version": "4.0.0",
+  "description": "Fidato Group MIS Daily Report - Reads Google Sheet, generates visual report, sends via WhatsApp (whatsapp-web.js)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,9 +11,9 @@
     "googleapis": "^128.0.0",
     "node-fetch": "^2.7.0",
     "node-cron": "^3.0.3",
-    "@whiskeysockets/baileys": "^6.7.16",
-    "pino": "^9.6.0",
-    "@hapi/boom": "^10.0.1"
+    "whatsapp-web.js": "^1.26.1-alpha.3",
+    "qrcode": "^1.5.4",
+    "puppeteer": "^23.0.0"
   },
   "engines": {
     "node": ">=18"
