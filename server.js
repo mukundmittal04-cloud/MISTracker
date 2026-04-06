@@ -32,6 +32,9 @@ const CONFIG = {
   WHATSAPP_GROUP_JID: process.env.WHATSAPP_GROUP_JID, // e.g. '120363xxxxx@g.us'
   WHATSAPP_PHONE: process.env.WHATSAPP_PHONE || '919870111582', // phone number to pair
   
+  // Bot on/off toggle — set to 'false' in Railway to pause all sending
+  BOT_ENABLED: process.env.BOT_ENABLED !== 'false', // defaults to true
+  
   // HCTI (HTML to Image)
   HCTI_USER_ID: process.env.HCTI_USER_ID,
   HCTI_API_KEY: process.env.HCTI_API_KEY,
@@ -755,6 +758,12 @@ async function sendTextMessage(message) {
 }
 
 async function checkAndReport(dateStr, checkType) {
+  // Check if bot is enabled
+  if (!CONFIG.BOT_ENABLED) {
+    console.log('Bot is PAUSED (BOT_ENABLED=false). Skipping ' + checkType + ' check.');
+    return;
+  }
+  
   console.log('\n--- ' + checkType + ' check for ' + dateStr + ' ---');
   
   if (reportStatus[dateStr] && reportStatus[dateStr].sent) {
@@ -817,6 +826,7 @@ cron.schedule('0 9 * * *', function() {
 // Status endpoint
 app.get('/api/report-status', function(req, res) {
   res.json({
+    botEnabled: CONFIG.BOT_ENABLED,
     schedule: {
       '7:00 PM': 'First check — send report or first reminder',
       '8:00 PM': 'Second check — send report or gentle nudge',
@@ -826,6 +836,19 @@ app.get('/api/report-status', function(req, res) {
     },
     reportHistory: reportStatus,
   });
+});
+
+// Toggle bot on/off — visit /api/bot/off to pause, /api/bot/on to resume
+app.get('/api/bot/off', function(req, res) {
+  CONFIG.BOT_ENABLED = false;
+  console.log('Bot PAUSED by user');
+  res.json({ botEnabled: false, message: 'Bot paused. No reports or reminders will be sent. Visit /api/bot/on to resume.' });
+});
+
+app.get('/api/bot/on', function(req, res) {
+  CONFIG.BOT_ENABLED = true;
+  console.log('Bot RESUMED by user');
+  res.json({ botEnabled: true, message: 'Bot is now active. Reports and reminders will be sent on schedule.' });
 });
 
 // ============================================================
