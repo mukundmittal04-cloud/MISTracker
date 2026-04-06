@@ -410,56 +410,58 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 }
 
 // ============================================================
-// RENDER HTML → IMAGE (using hcti.io API - free 50/month)
-// Falls back to serving HTML directly if API fails
+// RENDER HTML → IMAGE (using local Puppeteer from whatsapp-web.js)
+// Since we already have Chromium running, we reuse it for screenshots
 // ============================================================
 async function renderToJPEG(html, width = 600) {
-  // Method 1: Use hcti.io (HTML/CSS to Image API - free tier)
-  const HCTI_USER = process.env.HCTI_USER_ID;
-  const HCTI_KEY = process.env.HCTI_API_KEY;
-  
-  if (HCTI_USER && HCTI_KEY) {
-    try {
-      const hctiRes = await fetch('https://hcti.io/v1/image', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Basic ' + Buffer.from(HCTI_USER + ':' + HCTI_KEY).toString('base64'),
-        },
-        body: JSON.stringify({
-          html: html,
-          css: '',
-          google_fonts: 'Inter',
-          viewport_width: width,
-          device_scale: 2,
-        }),
-      });
-      
-      const hctiData = await hctiRes.json();
-      
-      if (hctiData.url) {
-        // Download the generated image
-        const imgRes = await fetch(hctiData.url + '.jpg');
-        const buffer = await imgRes.buffer();
-        console.log('Image rendered via HCTI: ' + (buffer.length / 1024).toFixed(1) + ' KB');
-        return buffer;
-      }
-    } catch (err) {
-      console.error('HCTI render failed:', err.message);
-    }
+  try {
+    var puppeteer = require('puppeteer');
+    var browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+      ],
+    });
+    
+    var page = await browser.newPage();
+    await page.setViewport({ width: width, height: 800, deviceScaleFactor: 2 });
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 15000 });
+    
+    // Wait a bit for fonts to load
+    await new Promise(function(r) { setTimeout(r, 500); });
+    
+    // Get the full page height
+    var bodyHeight = await page.evaluate(function() {
+      return document.body.scrollHeight;
+    });
+    
+    await page.setViewport({ width: width, height: bodyHeight, deviceScaleFactor: 2 });
+    
+    var buffer = await page.screenshot({ 
+      type: 'jpeg', 
+      quality: 90,
+      fullPage: true,
+    });
+    
+    await page.close();
+    await browser.close();
+    
+    console.log('Image rendered via local Puppeteer: ' + (buffer.length / 1024).toFixed(1) + ' KB');
+    return buffer;
+    
+  } catch (err) {
+    console.error('Puppeteer render failed:', err.message);
+    
+    // Store the HTML for preview fallback
+    global._lastReportHTML = html;
+    global._lastReportDate = new Date().toISOString();
+    
+    return null;
   }
-  
-  // Method 2: Use self-hosted rendering via /api/render endpoint
-  // The server hosts the HTML, and we take a screenshot using an external service
-  // For now, generate a simple image placeholder
-  console.log('No HCTI credentials. Storing HTML for preview at /api/preview');
-  
-  // Store the HTML so it can be accessed via URL
-  global._lastReportHTML = html;
-  global._lastReportDate = new Date().toISOString();
-  
-  // Return null - the sendWhatsAppImage function will send as a link instead
-  return null;
 }
 
 // ============================================================
