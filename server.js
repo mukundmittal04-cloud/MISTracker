@@ -649,6 +649,24 @@ app.get('/api/wa-status', (req, res) => {
   });
 });
 
+// Test send — sends a simple text to the group to verify WhatsApp is working
+app.get('/api/test-send', async (req, res) => {
+  if (!waReady || !waSocket) {
+    return res.json({ error: 'WhatsApp not connected' });
+  }
+  var jid = CONFIG.WHATSAPP_GROUP_JID;
+  if (!jid) {
+    return res.json({ error: 'No group JID set' });
+  }
+  try {
+    var msg = req.query.msg || 'MIS Bot test — this message will be deleted';
+    var sent = await waSocket.sendMessage(jid, { text: msg });
+    res.json({ success: true, messageId: sent.key.id, jid: jid, hint: 'Delete from WhatsApp: long press → delete for everyone' });
+  } catch (err) {
+    res.json({ success: false, error: err.message, stack: err.stack ? err.stack.substring(0, 500) : '' });
+  }
+});
+
 // Manually trigger daily report for a specific date
 app.get('/api/daily-report', async (req, res) => {
   const dateStr = req.query.date || new Date().toISOString().split('T')[0];
