@@ -39,17 +39,74 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const cron = require('node-cron');
 const { google } = require('googleapis');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const SHEET_ID = process.env.SHEET_ID;
 const GROUP_JID = process.env.WHATSAPP_GROUP_JID || '120363425432126351@g.us';
+
+// --- Process-level safety nets: never crash the server on a single bad request ---
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL-CAUGHT] uncaughtException:', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL-CAUGHT] unhandledRejection:', reason && reason.stack ? reason.stack : reason);
+});
+
+// --- Validate env at startup, but don't crash. Surface via /health instead. ---
+const startupIssues = [];
+if (!SHEET_ID) startupIssues.push('SHEET_ID not set');
+if (!process.env.GOOGLE_CREDENTIALS) {
+  startupIssues.push('GOOGLE_CREDENTIALS not set');
+} else {
+  try { JSON.parse(process.env.GOOGLE_CREDENTIALS); }
+  catch (e) { startupIssues.push('GOOGLE_CREDENTIALS is not valid JSON: ' + e.message); }
+}
+if (!GROUP_JID) startupIssues.push('WHATSAPP_GROUP_JID not set (using default)');
+if (startupIssues.length) {
+  console.warn('[Startup] Issues detected:');
+  for (const s of startupIssues) console.warn('  -', s);
+}
+
+// --- Pick a writable auth path. /data on Railway needs a volume; fall back to local. ---
+function pickAuthPath() {
+  const candidates = ['/data/wa-auth', path.join(process.cwd(), '.wa-auth')];
+  for (const p of candidates) {
+    try {
+      fs.mkdirSync(p, { recursive: true });
+      // Test write
+      const testFile = path.join(p, '.write-test');
+      fs.writeFileSync(testFile, 'ok');
+      fs.unlinkSync(testFile);
+      console.log('[Auth] Using path:', p);
+      return p;
+    } catch (e) {
+      console.warn('[Auth] Cannot use', p, '—', e.code || e.message);
+    }
+  }
+  console.error('[Auth] No writable path found — WhatsApp auth will not persist');
+  return null;
+}
+const AUTH_PATH = pickAuthPath();
 
 // §2 ===================================================================
 //    SHEET HELPERS
 // =====================================================================
 
 function getSheetsClient() {
-  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  if (!process.env.GOOGLE_CREDENTIALS) {
+    throw new Error('GOOGLE_CREDENTIALS env var not set');
+  }
+  let credentials;
+  try {
+    credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  } catch (e) {
+    throw new Error('GOOGLE_CREDENTIALS is not valid JSON: ' + e.message);
+  }
+  if (!credentials.client_email || !credentials.private_key) {
+    throw new Error('GOOGLE_CREDENTIALS missing client_email or private_key');
+  }
   const auth = new google.auth.GoogleAuth({
     credentials,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
@@ -853,18 +910,45 @@ ${liquidityRows || '<div style="padding:18px;text-align:center;color:#888;font-s
 // =====================================================================
 
 let browserInstance = null;
+let browserLaunching = null;
+
 async function getBrowser() {
   if (browserInstance && browserInstance.isConnected()) return browserInstance;
-  browserInstance = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--font-render-hinting=none'
-    ]
-  });
-  return browserInstance;
+  if (browserLaunching) return browserLaunching;
+
+  browserLaunching = (async () => {
+    const launchOpts = {
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-zygote',
+        '--font-render-hinting=none'
+      ]
+    };
+    // Honor explicit env path if provided (e.g., Railway with custom Dockerfile)
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+    try {
+      const b = await puppeteer.launch(launchOpts);
+      b.on('disconnected', () => {
+        console.warn('[Puppeteer] Browser disconnected');
+        browserInstance = null;
+      });
+      browserInstance = b;
+      return b;
+    } catch (e) {
+      console.error('[Puppeteer] Launch failed:', e.message);
+      throw new Error('Puppeteer launch failed — Chromium may not be installed: ' + e.message);
+    } finally {
+      browserLaunching = null;
+    }
+  })();
+  return browserLaunching;
 }
 
 async function htmlToPng(html, viewportWidth = 900) {
@@ -873,11 +957,11 @@ async function htmlToPng(html, viewportWidth = 900) {
   try {
     await page.setViewport({ width: viewportWidth, height: 800, deviceScaleFactor: 2 });
     await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
-    await page.evaluate(() => document.fonts.ready);
+    try { await page.evaluate(() => document.fonts.ready); } catch {}
     const buffer = await page.screenshot({ fullPage: true, type: 'png' });
     return buffer;
   } finally {
-    await page.close();
+    try { await page.close(); } catch {}
   }
 }
 
@@ -889,36 +973,60 @@ let waClient = null;
 let waReady = false;
 let lastQR = null;
 let botEnabled = true;
+let waInitAttempts = 0;
 
 function initWhatsApp() {
-  waClient = new Client({
-    authStrategy: new LocalAuth({ dataPath: '/data/wa-auth' }),
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--disable-gpu'
-      ]
-    }
-  });
-  waClient.on('qr', (qr) => {
-    lastQR = qr;
-    console.log('[WA] QR generated. Visit /api/pair to view.');
-    qrcode.generate(qr, { small: true });
-  });
-  waClient.on('ready', () => {
-    waReady = true;
-    lastQR = null;
-    console.log('[WA] Client ready');
-  });
-  waClient.on('disconnected', (reason) => {
-    waReady = false;
-    console.log('[WA] Disconnected:', reason);
-  });
-  waClient.on('auth_failure', (msg) => {
-    console.error('[WA] Auth failed:', msg);
-  });
-  waClient.initialize();
+  waInitAttempts += 1;
+  try {
+    const authStrategy = AUTH_PATH
+      ? new LocalAuth({ dataPath: AUTH_PATH })
+      : new LocalAuth();  // fallback to default in-memory-ish
+
+    waClient = new Client({
+      authStrategy,
+      puppeteer: {
+        headless: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        args: [
+          '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--disable-gpu'
+        ]
+      }
+    });
+
+    waClient.on('qr', (qr) => {
+      lastQR = qr;
+      console.log('[WA] QR generated. Visit /api/pair to view.');
+      try { qrcode.generate(qr, { small: true }); } catch {}
+    });
+    waClient.on('ready', () => {
+      waReady = true;
+      lastQR = null;
+      console.log('[WA] Client ready');
+    });
+    waClient.on('disconnected', (reason) => {
+      waReady = false;
+      console.log('[WA] Disconnected:', reason);
+      // Auto-retry init after 30s, but cap attempts
+      if (waInitAttempts < 5) {
+        setTimeout(() => {
+          console.log('[WA] Retrying init (attempt', waInitAttempts + 1, ')');
+          initWhatsApp();
+        }, 30000);
+      }
+    });
+    waClient.on('auth_failure', (msg) => {
+      console.error('[WA] Auth failed:', msg);
+      waReady = false;
+    });
+
+    waClient.initialize().catch(err => {
+      console.error('[WA] initialize() rejected:', err && err.message);
+    });
+  } catch (e) {
+    console.error('[WA] init threw:', e && e.message);
+    // Don't crash — leave waReady=false so endpoints can report it
+  }
 }
 
 initWhatsApp();
@@ -984,7 +1092,20 @@ async function sendReportsToGroup(date) {
 const app = express();
 app.use(express.json());
 
-app.get('/health', (_req, res) => res.json({ status: 'ok', waReady }));
+app.get('/health', (_req, res) => res.json({
+  status: 'ok',
+  waReady,
+  hasQR: !!lastQR,
+  botEnabled,
+  authPath: AUTH_PATH,
+  startupIssues,
+  env: {
+    hasSheetId: !!SHEET_ID,
+    hasGoogleCreds: !!process.env.GOOGLE_CREDENTIALS,
+    groupJid: GROUP_JID,
+    puppeteerExecPath: process.env.PUPPETEER_EXECUTABLE_PATH || null
+  }
+}));
 
 app.get('/api/wa-status', (_req, res) => {
   res.json({ ready: waReady, hasQR: !!lastQR, botEnabled });
@@ -1047,15 +1168,21 @@ app.post('/api/test-send', async (_req, res) => {
   }
 });
 
-// Daily at 06:30 IST (= 01:00 UTC) → sends *yesterday's* reports
-cron.schedule('0 1 * * *', async () => {
-  try {
-    console.log('[Cron] Sending daily reports');
-    const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
-    await sendReportsToGroup(yesterday);
-  } catch (e) {
-    console.error('[Cron] Failed:', e);
-  }
-}, { timezone: 'UTC' });
+// Daily at 06:30 IST → sends *yesterday's* reports
+try {
+  cron.schedule('30 6 * * *', async () => {
+    try {
+      console.log('[Cron] Sending daily reports');
+      const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+      await sendReportsToGroup(yesterday);
+    } catch (e) {
+      console.error('[Cron] Failed:', e && e.message);
+    }
+  }, { timezone: 'Asia/Kolkata' });
+  console.log('[Cron] Scheduled: 06:30 IST daily');
+} catch (e) {
+  console.error('[Cron] Schedule failed:', e && e.message, '— server will still run, but no auto-send');
+}
 
-app.listen(PORT, () => console.log(`[Server] Listening on ${PORT}`));
+// Bind to 0.0.0.0 so Railway can reach the port
+app.listen(PORT, '0.0.0.0', () => console.log(`[Server] Listening on ${PORT}`));
