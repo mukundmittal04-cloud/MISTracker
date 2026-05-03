@@ -912,6 +912,26 @@ ${liquidityRows || '<div style="padding:18px;text-align:center;color:#888;font-s
 let browserInstance = null;
 let browserLaunching = null;
 
+// Probe common Chromium binary locations as fallbacks
+function findChromiumPath() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
+  const candidates = [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable'
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) {
+        console.log('[Puppeteer] Found system Chromium at', p);
+        return p;
+      }
+    } catch {}
+  }
+  return null; // Let Puppeteer use its own bundled Chrome
+}
+
 async function getBrowser() {
   if (browserInstance && browserInstance.isConnected()) return browserInstance;
   if (browserLaunching) return browserLaunching;
@@ -929,9 +949,12 @@ async function getBrowser() {
         '--font-render-hinting=none'
       ]
     };
-    // Honor explicit env path if provided (e.g., Railway with custom Dockerfile)
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-      launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    const execPath = findChromiumPath();
+    if (execPath) {
+      launchOpts.executablePath = execPath;
+      console.log('[Puppeteer] Using executable:', execPath);
+    } else {
+      console.log('[Puppeteer] Using bundled Chromium (no system path found)');
     }
     try {
       const b = await puppeteer.launch(launchOpts);
@@ -954,13 +977,33 @@ async function getBrowser() {
 async function htmlToPng(html, viewportWidth = 900) {
   const browser = await getBrowser();
   const page = await browser.newPage();
+  // Hard outer timeout so a hung page never blocks the request forever
+  const HARD_TIMEOUT_MS = 25000;
+  let hardTimer;
+  const hardTimeout = new Promise((_, rej) => {
+    hardTimer = setTimeout(() => rej(new Error('htmlToPng exceeded ' + HARD_TIMEOUT_MS + 'ms')), HARD_TIMEOUT_MS);
+  });
   try {
     await page.setViewport({ width: viewportWidth, height: 800, deviceScaleFactor: 2 });
-    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
-    try { await page.evaluate(() => document.fonts.ready); } catch {}
-    const buffer = await page.screenshot({ fullPage: true, type: 'png' });
+    // domcontentloaded = HTML parsed; we don't need network requests since the page is self-contained
+    await Promise.race([
+      page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 15000 }),
+      hardTimeout
+    ]);
+    // Font wait with its own timeout, never blocks
+    try {
+      await Promise.race([
+        page.evaluate(() => document.fonts && document.fonts.ready),
+        new Promise(res => setTimeout(res, 500))
+      ]);
+    } catch {}
+    const buffer = await Promise.race([
+      page.screenshot({ fullPage: true, type: 'png' }),
+      hardTimeout
+    ]);
     return buffer;
   } finally {
+    clearTimeout(hardTimer);
     try { await page.close(); } catch {}
   }
 }
