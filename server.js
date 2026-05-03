@@ -285,29 +285,31 @@ async function getFundPosition() {
 
 async function buildFundPosition(asOfDate) {
   const rows = await getFundPosition(asOfDate);
-  const totals = rows.reduce((acc, r) => ({
+
+  // Hide the generic "PDC" account from the table (team's report doesn't show it).
+  // Keep MM PDC and SM PDC visible; only the bare "PDC" row is hidden.
+  const visibleRows = rows.filter(r => !/^PDC$/i.test(r.bankAcKey));
+
+  const totals = visibleRows.reduce((acc, r) => ({
     balBank: acc.balBank + r.balBank,
     lessChq: acc.lessChq + r.lessChq,
     balUs:   acc.balUs + r.balUs
   }), { balBank: 0, lessChq: 0, balUs: 0 });
 
-  // Match the Sheet's bottom-of-table logic:
-  // Net Useable = Total Bal as per Us  −  (everything Blocked, which includes Fidatocity-70%, MM PDC, SM PDC, PDC)
-  const blockedTotal = rows.filter(r => r.notUsable).reduce((s, r) => s + r.balUs, 0);
-
-  // For display: split blocked into Fidatocity-70% and PDC pool
-  const fidatocity70 = rows.filter(r => r.notUsable && /Fidatocity-70/i.test(r.bankAcKey)).reduce((s, r) => s + r.balUs, 0);
-  const pdcPool = rows.filter(r => r.notUsable && /PDC/i.test(r.bankAcKey)).reduce((s, r) => s + r.balUs, 0);
+  // Match the team's deduction logic: only Fidatocity-70% AND MM PDC are deducted.
+  // SM PDC stays in usable cash. Generic PDC isn't shown.
+  const fidatocity70 = visibleRows.filter(r => /Fidatocity-70/i.test(r.bankAcKey)).reduce((s, r) => s + r.balUs, 0);
+  const mmPdc = visibleRows.filter(r => /^MM\s*PDC$/i.test(r.bankAcKey)).reduce((s, r) => s + r.balUs, 0);
 
   return {
     asOfDate,
-    rows,
+    rows: visibleRows,
     totals,
     deductions: [
       { label: 'Less : Funds not useable (Fidatocity-70%)', amount: fidatocity70 },
-      { label: 'Less : PDC pool (MM PDC + SM PDC + PDC)', amount: pdcPool }
+      { label: 'Less : MM PDC', amount: mmPdc }
     ],
-    netUseable: totals.balUs - blockedTotal
+    netUseable: totals.balUs - fidatocity70 - mmPdc
   };
 }
 
@@ -327,9 +329,14 @@ async function getBalanceLogRow(date) {
     const d = parseDate(row[0]);
     if (!d) continue;
     if (sameDate(d, target)) {
-      // Sum bank columns (B..T = indices 1..19 within the slice starting at A)
+      // Column layout (relative to A=index 0):
+      //   B (1) = Fidatocity-70% (escrow — excluded from "usable bank" total)
+      //   C..S (2..18) = Usable bank accounts
+      //   T (19) = empty separator
+      //   U (20) = MM PDC, V (21) = SM PDC, W (22) = PDC general
+      const fidato70 = num(row[1]);
       let bankTotal = 0;
-      for (let i = 1; i <= 19; i++) bankTotal += num(row[i]);
+      for (let i = 2; i <= 18; i++) bankTotal += num(row[i]);
       const mmPdc = num(row[20]);
       const smPdc = num(row[21]);
       const pdcGen = num(row[22]);
@@ -337,7 +344,8 @@ async function getBalanceLogRow(date) {
       const netUsable = num(row[24]);
       return {
         date: d,
-        bankTotal,           // sum of all non-PDC bank columns
+        bankTotal,           // sum of usable bank accounts (excludes Fidatocity-70%)
+        fidato70,            // available separately if needed
         mmPdc, smPdc, pdcGen,
         pdcPool: mmPdc + smPdc + pdcGen,
         total,
