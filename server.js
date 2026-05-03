@@ -312,24 +312,40 @@ async function buildFundPosition(asOfDate) {
 }
 
 // Read the Daily Closing Balance Log: returns total bank balance across all bank accounts on the given date.
-// The log lives at Fund Position sheet rows 40-1000, columns B onward (one column per bank account).
-// Returns 0 if no row matches the date.
-async function getBankBalanceFromLog(date) {
+// The log lives at Fund Position sheet rows 40+, with this layout:
+//   A = Date
+//   B..T = Per-account columns (Fidatocity-70%, Fidatocity-30%, ... Maximal JKB)
+//   U = MM PDC
+//   V = SM PDC
+//   W = PDC (general)
+//   X = Total
+//   Y = Net Usable
+async function getBalanceLogRow(date) {
   const target = startOfDay(date);
-  const data = await getRange('Fund Position!A40:S200');  // wide enough to cover ~20 bank columns
+  const data = await getRange('Fund Position!A40:Y200');
   for (const row of data) {
     const d = parseDate(row[0]);
     if (!d) continue;
     if (sameDate(d, target)) {
-      // Sum all numeric columns from B onwards
-      let total = 0;
-      for (let i = 1; i < row.length; i++) {
-        total += num(row[i]);
-      }
-      return total;
+      // Sum bank columns (B..T = indices 1..19 within the slice starting at A)
+      let bankTotal = 0;
+      for (let i = 1; i <= 19; i++) bankTotal += num(row[i]);
+      const mmPdc = num(row[20]);
+      const smPdc = num(row[21]);
+      const pdcGen = num(row[22]);
+      const total = num(row[23]);
+      const netUsable = num(row[24]);
+      return {
+        date: d,
+        bankTotal,           // sum of all non-PDC bank columns
+        mmPdc, smPdc, pdcGen,
+        pdcPool: mmPdc + smPdc + pdcGen,
+        total,
+        netUsable
+      };
     }
   }
-  return null;  // not found
+  return null;
 }
 
 async function buildExpenditure(date) {
@@ -341,13 +357,29 @@ async function buildExpenditure(date) {
   const pdcRows = dayRows.filter(isPdc);
   const bankRows = dayRows.filter(r => !isPdc(r));
 
-  // PDC opening: sum all PDC IN/OUT in the Ledger before today (no PDC column in the Balance Log)
-  const beforeDay = all.filter(r => r.date < startOfDay(date));
-  const pdcOpening = beforeDay.filter(isPdc).reduce((s, r) => {
-    if (r.inOut === 'IN') return s + r.amount;
-    if (r.inOut === 'OUT') return s - r.amount;
-    return s;
-  }, 0);
+  // Opening balances: prefer the Daily Closing Balance Log for yesterday (= today's opening).
+  const yesterday = new Date(date); yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayLog = await getBalanceLogRow(yesterday);
+  const todayLog = await getBalanceLogRow(date);
+
+  let pdcOpening, bankOpening;
+  if (yesterdayLog) {
+    pdcOpening = yesterdayLog.pdcPool;
+    bankOpening = yesterdayLog.bankTotal;
+  } else {
+    // Fallback: sum Ledger transactions from history (less accurate, ignores TRANSFERs)
+    const beforeDay = all.filter(r => r.date < startOfDay(date));
+    pdcOpening = beforeDay.filter(isPdc).reduce((s, r) => {
+      if (r.inOut === 'IN') return s + r.amount;
+      if (r.inOut === 'OUT') return s - r.amount;
+      return s;
+    }, 0);
+    bankOpening = beforeDay.filter(r => !isPdc(r)).reduce((s, r) => {
+      if (r.inOut === 'IN') return s + r.amount;
+      if (r.inOut === 'OUT') return s - r.amount;
+      return s;
+    }, 0);
+  }
 
   const cashWithdrawal = pdcRows
     .filter(r => r.inOut === 'IN' && /cash/i.test(r.description))
@@ -360,9 +392,15 @@ async function buildExpenditure(date) {
   const pdcTotal = pdcExpenseItems.reduce((s, it) => s + it.amount, 0);
   const pdcRunningTotal = pdcOpening + cashWithdrawal - pdcTotal;
 
-  const fp = await getFundPosition(date);
-  const smRow = fp.find(r => r.bankAcKey === 'SM PDC');
-  const closingWithSM = smRow ? smRow.balUs : 0;
+  // SM PDC closing comes from today's row (preferred) or Fund Position
+  let closingWithSM;
+  if (todayLog) {
+    closingWithSM = todayLog.smPdc;
+  } else {
+    const fp = await getFundPosition(date);
+    const smRow = fp.find(r => r.bankAcKey === 'SM PDC');
+    closingWithSM = smRow ? smRow.balUs : 0;
+  }
   const closingWithOffice = pdcRunningTotal - closingWithSM;
 
   const bankItems = bankRows.map(r => ({
@@ -375,23 +413,8 @@ async function buildExpenditure(date) {
   const bankTotalIn = bankItems.reduce((s, it) => s + it.inAmount, 0);
   const bankTotalOut = bankItems.reduce((s, it) => s + it.outAmount, 0);
 
-  // Bank opening: prefer reading yesterday's closing from the Daily Closing Balance Log.
-  // Fall back to summing Ledger if log doesn't have yesterday.
-  const yesterday = new Date(date); yesterday.setDate(yesterday.getDate() - 1);
-  let bankOpening = await getBankBalanceFromLog(yesterday);
-  if (bankOpening === null) {
-    bankOpening = beforeDay.filter(r => !isPdc(r)).reduce((s, r) => {
-      if (r.inOut === 'IN') return s + r.amount;
-      if (r.inOut === 'OUT') return s - r.amount;
-      return s;
-    }, 0);
-  }
-
   // Bank closing: prefer reading today's row from the Balance Log; otherwise compute.
-  let bankClosing = await getBankBalanceFromLog(date);
-  if (bankClosing === null) {
-    bankClosing = bankOpening + bankTotalIn - bankTotalOut;
-  }
+  const bankClosing = todayLog ? todayLog.bankTotal : (bankOpening + bankTotalIn - bankTotalOut);
 
   return {
     date,
