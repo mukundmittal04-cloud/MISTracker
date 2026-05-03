@@ -205,19 +205,68 @@ const BANK_AC_MAP = {
   'PDC':                  { company: 'PDC General', bank: 'PDC' }
 };
 
+// Fund Position sheet actual layout (header row 4, data rows 5–26):
+//   B = Company / Entity            (display name)
+//   C = Bank A/C (as in Ledger)     (key — matches Ledger column J)
+//   D = Opening Bal (auto from log)
+//   E = (blank)
+//   F = Today IN (from Ledger)
+//   G = (blank)
+//   H = (blank)
+//   I = Today OUT (from Ledger)
+//   J = Closing Bal (auto)          → "Bal as per Bank"
+//   K = Cheques issued until <date> → "Less : Chq Issued"
+//   L = Net Bal (auto)              → "Balance as per Us"
+//   M = Status (Blocked / Usable)
+// Indices when reading from B: r[0]=B, r[1]=C, r[2]=D, ... r[8]=J, r[9]=K, r[10]=L, r[11]=M
+
+// Infer bank label from the Bank A/C name in column C
+function inferBank(bankAc) {
+  if (!bankAc) return '';
+  const s = String(bankAc).trim();
+  if (/^MM\s*PDC$|^SM\s*PDC$|^PDC$/i.test(s)) return 'PDC';
+  if (/AXIS/i.test(s)) return 'AXIS';
+  if (/HDFC/i.test(s)) return 'HDFC';
+  if (/ICICI|Buildwell/i.test(s)) return 'ICICI';
+  if (/SBI/i.test(s)) return 'SBI';
+  if (/JKB/i.test(s)) return 'JKB';
+  if (/Fidatocity/i.test(s)) return 'JKB';                 // Fidatocity-70%, Fidatocity-30%
+  if (/Fidato City Homes|Fidato Maintenance|Fidato Buildcon|Maximal|Beatific|Chahat|Dholpur|Trinity Tulsivan|Pitam/i.test(s)) return 'JKB';
+  return 'JKB'; // default fallback
+}
+
 async function getFundPosition() {
-  const rows = await getRange('Fund Position!B5:I23');
+  // Read columns B..M (12 columns), rows 5..26
+  const rows = await getRange('Fund Position!B5:M26');
   const out = [];
   for (const r of rows) {
-    const bankAc = r[1];
+    const company = (r[0] || '').toString().trim();
+    const bankAc = (r[1] || '').toString().trim();
+    const balBank = num(r[8]);   // J — Closing Bal
+    const lessChq = num(r[9]);   // K — Cheques issued
+    const balUs   = num(r[10]);  // L — Net Bal
+    const status  = (r[11] || '').toString().trim();
+
+    // Skip rows without a bank account key, totals, "Others (combined)"
     if (!bankAc) continue;
-    const meta = BANK_AC_MAP[bankAc];
-    if (!meta) continue;
-    const balBank = num(r[5]);
-    const lessChq = num(r[6]);
-    const balUs = num(r[7]);
+    if (/^total$/i.test(company) || /^others/i.test(company)) continue;
+
+    // Skip completely empty rows (no balance, no cheques, no net)
     if (balBank === 0 && lessChq === 0 && balUs === 0) continue;
-    out.push({ ...meta, bankAcKey: bankAc, balBank, lessChq, balUs });
+
+    const isBlocked = /^blocked$/i.test(status);
+    const isPDC = /PDC/i.test(bankAc);
+
+    out.push({
+      company,
+      bank: inferBank(bankAc),
+      bankAcKey: bankAc,
+      balBank,
+      lessChq,
+      balUs,
+      notUsable: isBlocked,
+      isPDC
+    });
   }
   return out;
 }
@@ -234,18 +283,23 @@ async function buildFundPosition(asOfDate) {
     balUs:   acc.balUs + r.balUs
   }), { balBank: 0, lessChq: 0, balUs: 0 });
 
-  const notUseable = rows.filter(r => r.notUsable).reduce((s, r) => s + r.balUs, 0);
-  const mmPdc = rows.filter(r => r.bankAcKey === 'MM PDC').reduce((s, r) => s + r.balUs, 0);
+  // Match the Sheet's bottom-of-table logic:
+  // Net Useable = Total Bal as per Us  −  (everything Blocked, which includes Fidatocity-70%, MM PDC, SM PDC, PDC)
+  const blockedTotal = rows.filter(r => r.notUsable).reduce((s, r) => s + r.balUs, 0);
+
+  // For display: split blocked into Fidatocity-70% and PDC pool
+  const fidatocity70 = rows.filter(r => r.notUsable && /Fidatocity-70/i.test(r.bankAcKey)).reduce((s, r) => s + r.balUs, 0);
+  const pdcPool = rows.filter(r => r.notUsable && /PDC/i.test(r.bankAcKey)).reduce((s, r) => s + r.balUs, 0);
 
   return {
     asOfDate,
     rows,
     totals,
     deductions: [
-      { label: 'Less : Funds not useable (Fidatocity-70%)', amount: notUseable },
-      { label: 'Less : MM PDC', amount: mmPdc }
+      { label: 'Less : Funds not useable (Fidatocity-70%)', amount: fidatocity70 },
+      { label: 'Less : PDC pool (MM PDC + SM PDC + PDC)', amount: pdcPool }
     ],
-    netUseable: totals.balUs - notUseable - mmPdc
+    netUseable: totals.balUs - blockedTotal
   };
 }
 
