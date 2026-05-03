@@ -166,6 +166,9 @@ function startOfDay(d) {
 }
 
 async function getLedgerRows() {
+  // The Ledger interleaves real transactions with per-day section headers and DAY TOTAL summary rows.
+  // Real transactions have a non-empty Head (C), IN/OUT (F), Mode (H), AND Bank A/C (J).
+  // Section/total rows fail at least one of those (Mode and Bank A/C are always blank on summary rows).
   const rows = await getRange('Ledger!A7:L1000');
   return rows.map(r => ({
     date: parseDate(r[0]),
@@ -177,10 +180,15 @@ async function getLedgerRows() {
     amount: num(r[6]),
     mode: r[7] || '',
     person: r[8] || '',
-    bankAc: r[9] || '',
-    transferTo: r[10] || '',
-    notes: r[11] || ''
-  })).filter(r => r.date && r.amount !== 0);
+    bankAc: r[9] || ''
+  })).filter(r =>
+    r.date &&
+    r.amount !== 0 &&
+    r.head &&            // section/header rows have empty Head
+    r.inOut &&           // section/header rows may have IN/OUT but only as labels — guard with the others
+    r.mode &&            // summary rows never have Mode
+    r.bankAc             // summary rows never have Bank A/C
+  );
 }
 
 // Maps Bank A/C (column J in Ledger) to display name + bank label
@@ -303,6 +311,27 @@ async function buildFundPosition(asOfDate) {
   };
 }
 
+// Read the Daily Closing Balance Log: returns total bank balance across all bank accounts on the given date.
+// The log lives at Fund Position sheet rows 40-1000, columns B onward (one column per bank account).
+// Returns 0 if no row matches the date.
+async function getBankBalanceFromLog(date) {
+  const target = startOfDay(date);
+  const data = await getRange('Fund Position!A40:S200');  // wide enough to cover ~20 bank columns
+  for (const row of data) {
+    const d = parseDate(row[0]);
+    if (!d) continue;
+    if (sameDate(d, target)) {
+      // Sum all numeric columns from B onwards
+      let total = 0;
+      for (let i = 1; i < row.length; i++) {
+        total += num(row[i]);
+      }
+      return total;
+    }
+  }
+  return null;  // not found
+}
+
 async function buildExpenditure(date) {
   const all = await getLedgerRows();
   const dayRows = all.filter(r => sameDate(r.date, date));
@@ -312,6 +341,7 @@ async function buildExpenditure(date) {
   const pdcRows = dayRows.filter(isPdc);
   const bankRows = dayRows.filter(r => !isPdc(r));
 
+  // PDC opening: sum all PDC IN/OUT in the Ledger before today (no PDC column in the Balance Log)
   const beforeDay = all.filter(r => r.date < startOfDay(date));
   const pdcOpening = beforeDay.filter(isPdc).reduce((s, r) => {
     if (r.inOut === 'IN') return s + r.amount;
@@ -345,13 +375,23 @@ async function buildExpenditure(date) {
   const bankTotalIn = bankItems.reduce((s, it) => s + it.inAmount, 0);
   const bankTotalOut = bankItems.reduce((s, it) => s + it.outAmount, 0);
 
-  const bankOpening = beforeDay.filter(r => !isPdc(r)).reduce((s, r) => {
-    if (r.inOut === 'IN') return s + r.amount;
-    if (r.inOut === 'OUT') return s - r.amount;
-    return s;
-  }, 0);
+  // Bank opening: prefer reading yesterday's closing from the Daily Closing Balance Log.
+  // Fall back to summing Ledger if log doesn't have yesterday.
+  const yesterday = new Date(date); yesterday.setDate(yesterday.getDate() - 1);
+  let bankOpening = await getBankBalanceFromLog(yesterday);
+  if (bankOpening === null) {
+    bankOpening = beforeDay.filter(r => !isPdc(r)).reduce((s, r) => {
+      if (r.inOut === 'IN') return s + r.amount;
+      if (r.inOut === 'OUT') return s - r.amount;
+      return s;
+    }, 0);
+  }
 
-  const bankClosing = bankOpening + bankTotalIn - bankTotalOut;
+  // Bank closing: prefer reading today's row from the Balance Log; otherwise compute.
+  let bankClosing = await getBankBalanceFromLog(date);
+  if (bankClosing === null) {
+    bankClosing = bankOpening + bankTotalIn - bankTotalOut;
+  }
 
   return {
     date,
