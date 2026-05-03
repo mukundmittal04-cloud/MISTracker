@@ -1001,7 +1001,8 @@ async function htmlToPng(html, viewportWidth = 900) {
       page.screenshot({ fullPage: true, type: 'png' }),
       hardTimeout
     ]);
-    return buffer;
+    // Puppeteer 23+ may return Uint8Array; force Node Buffer for downstream consumers
+    return Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
   } finally {
     clearTimeout(hardTimer);
     try { await page.close(); } catch {}
@@ -1120,7 +1121,8 @@ async function sendReportsToGroup(date) {
   ];
 
   for (const { name, report } of sequence) {
-    const media = new MessageMedia('image/png', report.png.toString('base64'), report.filename);
+    const buf = Buffer.isBuffer(report.png) ? report.png : Buffer.from(report.png);
+    const media = new MessageMedia('image/png', buf.toString('base64'), report.filename);
     await waClient.sendMessage(GROUP_JID, media, { caption: name });
     await new Promise(res => setTimeout(res, 1500));
   }
@@ -1185,8 +1187,11 @@ app.get('/api/preview-image', async (req, res) => {
     const all = await generateThreeReports(date);
     const map = { fund: 'fundPosition', expenditure: 'expenditure', analysis: 'analysis' };
     const key = map[which] || 'fundPosition';
+    const buf = Buffer.isBuffer(all[key].png) ? all[key].png : Buffer.from(all[key].png);
     res.set('Content-Type', 'image/png');
-    res.send(all[key].png);
+    res.set('Content-Length', String(buf.length));
+    res.set('Cache-Control', 'no-store');
+    res.end(buf);
   } catch (e) {
     res.status(500).send(`<pre>${e.stack}</pre>`);
   }
