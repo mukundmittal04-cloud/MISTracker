@@ -1,21 +1,20 @@
 {
-  "name": "fidato-mis-report",
-  "version": "4.0.0",
-  "description": "Fidato Group MIS Daily Report - Reads Google Sheet, generates visual report, sends via WhatsApp (whatsapp-web.js)",
+  "name": "fidato-mis-tracker",
+  "version": "3.0.0",
+  "description": "Fidato Group MIS Tracker — daily WhatsApp reports (single-file build)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
-    "express": "^4.18.2",
-    "googleapis": "^128.0.0",
-    "node-fetch": "^2.7.0",
-    "node-cron": "^3.0.3",
-    "whatsapp-web.js": "^1.26.1-alpha.3",
-    "qrcode": "^1.5.4",
-    "puppeteer": "^23.0.0"
-  },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "googleapis": "^144.0.0",
+    "node-cron": "^3.0.3",
+    "puppeteer": "^23.5.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.26.0"
   }
 }
