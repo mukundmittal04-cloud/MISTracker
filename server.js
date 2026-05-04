@@ -1,1361 +1,755 @@
-// =====================================================================
-// FIDATO GROUP MIS TRACKER — server.js (consolidated single-file build)
-// =====================================================================
-// Daily WhatsApp reports for Fidato Group, generated from Google Sheet
-// ledger data and rendered as PNG images via Puppeteer.
-//
-// Sections (search for the dividers to jump):
-//   §1  Imports & config
-//   §2  Sheet helpers (auth, parsing, ranges)
-//   §3  Data builders (buildFundPosition, buildExpenditure, buildAnalysis)
-//   §4  Outlier detection
-//   §5  Formatting helpers (₹ Indian format, dates, pills)
-//   §6  HTML templates (renderFundPosition, renderExpenditure, renderAnalysis)
-//   §7  Puppeteer renderer (HTML → PNG)
-//   §8  WhatsApp client + sender
-//   §9  Express endpoints + cron
-//
-// Endpoints:
-//   GET  /health
-//   GET  /api/wa-status            connection state
-//   GET  /api/pair                 QR for first-time pairing
-//   POST /api/bot/on               enable scheduled sends
-//   POST /api/bot/off              disable scheduled sends
-//   GET  /api/preview?date=&report=fund|expenditure|analysis    HTML preview
-//   GET  /api/preview-image?date=&report=...                    PNG preview
-//   GET  /api/daily-report?date=   manually trigger send
-//   POST /api/test-send            send today's reports right now
-//
-// Daily cron: 06:30 IST (= 01:00 UTC) sends *yesterday's* reports.
-// =====================================================================
-
-// §1 ===================================================================
-//    IMPORTS & CONFIG
-// =====================================================================
+// ============================================================
+// FIDATO MIS DAILY REPORT + APPROVAL AUDIT SERVER v2.0
+// Reads Google Sheet, generates reports, sends via WhatsApp
+// Reads approval group chat, tracks MM/SM responses
+// ============================================================
 
 const express = require('express');
-const puppeteer = require('puppeteer');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const cron = require('node-cron');
 const { google } = require('googleapis');
+const fetch = require('node-fetch');
+const cron = require('node-cron');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode');
+const puppeteer = require('puppeteer');
 const fs = require('fs');
-const path = require('path');
-
-const PORT = process.env.PORT || 3000;
-const SHEET_ID = process.env.SHEET_ID;
-const GROUP_JID = process.env.WHATSAPP_GROUP_JID || '120363425432126351@g.us';
-
-// --- Process-level safety nets: never crash the server on a single bad request ---
-process.on('uncaughtException', (err) => {
-  console.error('[FATAL-CAUGHT] uncaughtException:', err && err.stack ? err.stack : err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL-CAUGHT] unhandledRejection:', reason && reason.stack ? reason.stack : reason);
-});
-
-// --- Validate env at startup, but don't crash. Surface via /health instead. ---
-const startupIssues = [];
-if (!SHEET_ID) startupIssues.push('SHEET_ID not set');
-if (!process.env.GOOGLE_CREDENTIALS) {
-  startupIssues.push('GOOGLE_CREDENTIALS not set');
-} else {
-  try { JSON.parse(process.env.GOOGLE_CREDENTIALS); }
-  catch (e) { startupIssues.push('GOOGLE_CREDENTIALS is not valid JSON: ' + e.message); }
-}
-if (!GROUP_JID) startupIssues.push('WHATSAPP_GROUP_JID not set (using default)');
-if (startupIssues.length) {
-  console.warn('[Startup] Issues detected:');
-  for (const s of startupIssues) console.warn('  -', s);
-}
-
-// --- Pick a writable auth path. /data on Railway needs a volume; fall back to local. ---
-function pickAuthPath() {
-  const candidates = ['/data/wa-auth', path.join(process.cwd(), '.wa-auth')];
-  for (const p of candidates) {
-    try {
-      fs.mkdirSync(p, { recursive: true });
-      // Test write
-      const testFile = path.join(p, '.write-test');
-      fs.writeFileSync(testFile, 'ok');
-      fs.unlinkSync(testFile);
-      console.log('[Auth] Using path:', p);
-      return p;
-    } catch (e) {
-      console.warn('[Auth] Cannot use', p, '—', e.code || e.message);
-    }
-  }
-  console.error('[Auth] No writable path found — WhatsApp auth will not persist');
-  return null;
-}
-const AUTH_PATH = pickAuthPath();
-
-// §2 ===================================================================
-//    SHEET HELPERS
-// =====================================================================
-
-function getSheetsClient() {
-  if (!process.env.GOOGLE_CREDENTIALS) {
-    throw new Error('GOOGLE_CREDENTIALS env var not set');
-  }
-  let credentials;
-  try {
-    credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-  } catch (e) {
-    throw new Error('GOOGLE_CREDENTIALS is not valid JSON: ' + e.message);
-  }
-  if (!credentials.client_email || !credentials.private_key) {
-    throw new Error('GOOGLE_CREDENTIALS missing client_email or private_key');
-  }
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  return google.sheets({ version: 'v4', auth });
-}
-
-async function getRange(range) {
-  const sheets = getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range,
-    valueRenderOption: 'UNFORMATTED_VALUE',
-    dateTimeRenderOption: 'FORMATTED_STRING',
-  });
-  return res.data.values || [];
-}
-
-function parseDate(v) {
-  if (!v) return null;
-  if (v instanceof Date) return v;
-  if (typeof v === 'number') {
-    const epoch = new Date(Date.UTC(1899, 11, 30));
-    return new Date(epoch.getTime() + v * 86400000);
-  }
-  const s = String(v).trim();
-  const m = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
-  if (m) {
-    const day = parseInt(m[1], 10);
-    const month = parseInt(m[2], 10) - 1;
-    let year = parseInt(m[3], 10);
-    if (year < 100) year += 2000;
-    return new Date(year, month, day);
-  }
-  const d = new Date(s);
-  return isNaN(d) ? null : d;
-}
-
-function sameDate(a, b) {
-  if (!a || !b) return false;
-  return a.getFullYear() === b.getFullYear() &&
-         a.getMonth() === b.getMonth() &&
-         a.getDate() === b.getDate();
-}
-
-function num(v) {
-  if (v === null || v === undefined || v === '') return 0;
-  if (typeof v === 'number') return v;
-  const n = parseFloat(String(v).replace(/[,₹\s]/g, ''));
-  return isNaN(n) ? 0 : n;
-}
-
-function startOfDay(d) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
-}
-
-async function getLedgerRows() {
-  // The Ledger interleaves real transactions with per-day section headers and DAY TOTAL summary rows.
-  // Real transactions have a non-empty Head (C), IN/OUT (F), Mode (H), AND Bank A/C (J).
-  // Section/total rows fail at least one of those (Mode and Bank A/C are always blank on summary rows).
-  const rows = await getRange('Ledger!A7:L1000');
-  return rows.map(r => ({
-    date: parseDate(r[0]),
-    entity: r[1] || '',
-    head: r[2] || '',
-    description: r[3] || '',
-    tag: r[4] || '',
-    inOut: r[5] || '',
-    amount: num(r[6]),
-    mode: r[7] || '',
-    person: r[8] || '',
-    bankAc: r[9] || ''
-  })).filter(r =>
-    r.date &&
-    r.amount !== 0 &&
-    r.head &&            // section/header rows have empty Head
-    r.inOut &&           // section/header rows may have IN/OUT but only as labels — guard with the others
-    r.mode &&            // summary rows never have Mode
-    r.bankAc             // summary rows never have Bank A/C
-  );
-}
-
-// Maps Bank A/C (column J in Ledger) to display name + bank label
-const BANK_AC_MAP = {
-  'Fidatocity-70%':       { company: 'Fidatocity-70%', bank: 'JKB', notUsable: true },
-  'Fidatocity-30%':       { company: 'Fidatocity-30%', bank: 'JKB' },
-  'Fidato City Homes':    { company: 'Fidato City Homes — Normal', bank: 'JKB' },
-  'Trinity JKB':          { company: 'Trinity Landspace Pvt Ltd', bank: 'JKB' },
-  'Hansaflon JKB':        { company: 'Hansaflon Buildcon Pvt Ltd', bank: 'JKB' },
-  'Hansaflon AXIS':       { company: 'Hansaflon Buildcon Pvt Ltd', bank: 'AXIS' },
-  'Hansaflon HDFC':       { company: 'Hansaflon Buildcon Pvt Ltd', bank: 'HDFC' },
-  'Hansaflon Buildwell':  { company: 'Hansaflon Buildwell Pvt Ltd', bank: 'ICICI' },
-  'Dholpur JKB':          { company: 'Dholpur Developers Pvt Ltd', bank: 'JKB' },
-  'Trinity Tulsivan':     { company: 'Trinity Tulsivan Reality — 1089', bank: 'JKB' },
-  'Beatific HDFC':        { company: 'Beatific Hospitality', bank: 'HDFC' },
-  'Chahat JKB':           { company: 'Chahat Garments', bank: 'JKB' },
-  'Fidato Buildcon':      { company: 'Fidato Buildcon', bank: 'JKB' },
-  'Fidato Maintenance':   { company: 'Fidato Maintenance — 980', bank: 'JKB' },
-  'Maximal JKB':          { company: 'Maximal Infrastructure', bank: 'JKB' },
-  'MM PDC':               { company: 'MM PDC', bank: 'PDC' },
-  'SM PDC':               { company: 'SM PDC', bank: 'PDC' },
-  'PDC':                  { company: 'PDC General', bank: 'PDC' }
-};
-
-// Fund Position sheet actual layout (header row 4, data rows 5–26):
-//   B = Company / Entity            (display name)
-//   C = Bank A/C (as in Ledger)     (key — matches Ledger column J)
-//   D = Opening Bal (auto from log)
-//   E = (blank)
-//   F = Today IN (from Ledger)
-//   G = (blank)
-//   H = (blank)
-//   I = Today OUT (from Ledger)
-//   J = Closing Bal (auto)          → "Bal as per Bank"
-//   K = Cheques issued until <date> → "Less : Chq Issued"
-//   L = Net Bal (auto)              → "Balance as per Us"
-//   M = Status (Blocked / Usable)
-// Indices when reading from B: r[0]=B, r[1]=C, r[2]=D, ... r[8]=J, r[9]=K, r[10]=L, r[11]=M
-
-// Infer bank label from the Bank A/C name in column C
-function inferBank(bankAc) {
-  if (!bankAc) return '';
-  const s = String(bankAc).trim();
-  if (/^MM\s*PDC$|^SM\s*PDC$|^PDC$/i.test(s)) return 'PDC';
-  if (/AXIS/i.test(s)) return 'AXIS';
-  if (/HDFC/i.test(s)) return 'HDFC';
-  if (/ICICI|Buildwell/i.test(s)) return 'ICICI';
-  if (/SBI/i.test(s)) return 'SBI';
-  if (/JKB/i.test(s)) return 'JKB';
-  if (/Fidatocity/i.test(s)) return 'JKB';                 // Fidatocity-70%, Fidatocity-30%
-  if (/Fidato City Homes|Fidato Maintenance|Fidato Buildcon|Maximal|Beatific|Chahat|Dholpur|Trinity Tulsivan|Pitam/i.test(s)) return 'JKB';
-  return 'JKB'; // default fallback
-}
-
-async function getFundPosition() {
-  // Read columns B..M (12 columns), rows 5..26
-  const rows = await getRange('Fund Position!B5:M26');
-  const out = [];
-  for (const r of rows) {
-    const company = (r[0] || '').toString().trim();
-    const bankAc = (r[1] || '').toString().trim();
-    const balBank = num(r[8]);   // J — Closing Bal
-    const lessChq = num(r[9]);   // K — Cheques issued
-    const balUs   = num(r[10]);  // L — Net Bal
-    const status  = (r[11] || '').toString().trim();
-
-    // Skip rows without a bank account key, totals, "Others (combined)"
-    if (!bankAc) continue;
-    if (/^total$/i.test(company) || /^others/i.test(company)) continue;
-
-    // Skip completely empty rows (no balance, no cheques, no net)
-    if (balBank === 0 && lessChq === 0 && balUs === 0) continue;
-
-    const isBlocked = /^blocked$/i.test(status);
-    const isPDC = /PDC/i.test(bankAc);
-
-    out.push({
-      company,
-      bank: inferBank(bankAc),
-      bankAcKey: bankAc,
-      balBank,
-      lessChq,
-      balUs,
-      notUsable: isBlocked,
-      isPDC
-    });
-  }
-  return out;
-}
-
-// §3 ===================================================================
-//    DATA BUILDERS
-// =====================================================================
-
-async function buildFundPosition(asOfDate) {
-  const rows = await getFundPosition(asOfDate);
-
-  // Hide the generic "PDC" account from the table (team's report doesn't show it).
-  // Keep MM PDC and SM PDC visible; only the bare "PDC" row is hidden.
-  const visibleRows = rows.filter(r => !/^PDC$/i.test(r.bankAcKey));
-
-  const totals = visibleRows.reduce((acc, r) => ({
-    balBank: acc.balBank + r.balBank,
-    lessChq: acc.lessChq + r.lessChq,
-    balUs:   acc.balUs + r.balUs
-  }), { balBank: 0, lessChq: 0, balUs: 0 });
-
-  // Match the team's deduction logic: only Fidatocity-70% AND MM PDC are deducted.
-  // SM PDC stays in usable cash. Generic PDC isn't shown.
-  const fidatocity70 = visibleRows.filter(r => /Fidatocity-70/i.test(r.bankAcKey)).reduce((s, r) => s + r.balUs, 0);
-  const mmPdc = visibleRows.filter(r => /^MM\s*PDC$/i.test(r.bankAcKey)).reduce((s, r) => s + r.balUs, 0);
-
-  return {
-    asOfDate,
-    rows: visibleRows,
-    totals,
-    deductions: [
-      { label: 'Less : Funds not useable (Fidatocity-70%)', amount: fidatocity70 },
-      { label: 'Less : MM PDC', amount: mmPdc }
-    ],
-    netUseable: totals.balUs - fidatocity70 - mmPdc
-  };
-}
-
-// Read the Daily Closing Balance Log: returns total bank balance across all bank accounts on the given date.
-// The log lives at Fund Position sheet rows 40+, with this layout:
-//   A = Date
-//   B..T = Per-account columns (Fidatocity-70%, Fidatocity-30%, ... Maximal JKB)
-//   U = MM PDC
-//   V = SM PDC
-//   W = PDC (general)
-//   X = Total
-//   Y = Net Usable
-async function getBalanceLogRow(date) {
-  const target = startOfDay(date);
-  const data = await getRange('Fund Position!A40:Y200');
-  for (const row of data) {
-    const d = parseDate(row[0]);
-    if (!d) continue;
-    if (sameDate(d, target)) {
-      // Column layout (relative to A=index 0):
-      //   B (1) = Fidatocity-70% (escrow — excluded from "usable bank" total)
-      //   C..S (2..18) = Usable bank accounts
-      //   T (19) = empty separator
-      //   U (20) = MM PDC, V (21) = SM PDC, W (22) = PDC general
-      const fidato70 = num(row[1]);
-      let bankTotal = 0;
-      for (let i = 2; i <= 18; i++) bankTotal += num(row[i]);
-      const mmPdc = num(row[20]);
-      const smPdc = num(row[21]);
-      const pdcGen = num(row[22]);
-      const total = num(row[23]);
-      const netUsable = num(row[24]);
-      return {
-        date: d,
-        bankTotal,           // sum of usable bank accounts (excludes Fidatocity-70%)
-        fidato70,            // available separately if needed
-        mmPdc, smPdc, pdcGen,
-        pdcPool: mmPdc + smPdc + pdcGen,
-        total,
-        netUsable
-      };
-    }
-  }
-  return null;
-}
-
-async function buildExpenditure(date) {
-  const all = await getLedgerRows();
-  const dayRows = all.filter(r => sameDate(r.date, date));
-
-  const isPdc = r => /PDC/i.test(r.bankAc) || /PDC/i.test(r.mode);
-
-  const pdcRows = dayRows.filter(isPdc);
-  const bankRows = dayRows.filter(r => !isPdc(r));
-
-  // Opening balances: prefer the Daily Closing Balance Log for yesterday (= today's opening).
-  const yesterday = new Date(date); yesterday.setDate(yesterday.getDate() - 1);
-  const yesterdayLog = await getBalanceLogRow(yesterday);
-  const todayLog = await getBalanceLogRow(date);
-
-  let pdcOpening, bankOpening;
-  if (yesterdayLog) {
-    pdcOpening = yesterdayLog.pdcPool;
-    bankOpening = yesterdayLog.bankTotal;
-  } else {
-    // Fallback: sum Ledger transactions from history (less accurate, ignores TRANSFERs)
-    const beforeDay = all.filter(r => r.date < startOfDay(date));
-    pdcOpening = beforeDay.filter(isPdc).reduce((s, r) => {
-      if (r.inOut === 'IN') return s + r.amount;
-      if (r.inOut === 'OUT') return s - r.amount;
-      return s;
-    }, 0);
-    bankOpening = beforeDay.filter(r => !isPdc(r)).reduce((s, r) => {
-      if (r.inOut === 'IN') return s + r.amount;
-      if (r.inOut === 'OUT') return s - r.amount;
-      return s;
-    }, 0);
-  }
-
-  const cashWithdrawal = pdcRows
-    .filter(r => r.inOut === 'IN' && /cash/i.test(r.description))
-    .reduce((s, r) => s + r.amount, 0);
-
-  const pdcExpenseItems = pdcRows
-    .filter(r => r.inOut === 'OUT')
-    .map(r => ({ description: r.description, head: r.head, amount: r.amount }));
-
-  const pdcTotal = pdcExpenseItems.reduce((s, it) => s + it.amount, 0);
-  const pdcRunningTotal = pdcOpening + cashWithdrawal - pdcTotal;
-
-  // SM PDC closing comes from today's row (preferred) or Fund Position
-  let closingWithSM;
-  if (todayLog) {
-    closingWithSM = todayLog.smPdc;
-  } else {
-    const fp = await getFundPosition(date);
-    const smRow = fp.find(r => r.bankAcKey === 'SM PDC');
-    closingWithSM = smRow ? smRow.balUs : 0;
-  }
-  const closingWithOffice = pdcRunningTotal - closingWithSM;
-
-  const bankItems = bankRows.map(r => ({
-    description: r.description,
-    head: r.head,
-    inAmount: r.inOut === 'IN' ? r.amount : 0,
-    outAmount: r.inOut === 'OUT' ? r.amount : 0
-  }));
-
-  const bankTotalIn = bankItems.reduce((s, it) => s + it.inAmount, 0);
-  const bankTotalOut = bankItems.reduce((s, it) => s + it.outAmount, 0);
-
-  // Bank closing: prefer reading today's row from the Balance Log; otherwise compute.
-  const bankClosing = todayLog ? todayLog.bankTotal : (bankOpening + bankTotalIn - bankTotalOut);
-
-  return {
-    date,
-    pdc: {
-      openingBalance: pdcOpening,
-      cashWithdrawal,
-      items: pdcExpenseItems,
-      total: pdcTotal,
-      runningTotal: pdcRunningTotal,
-      closingWithOffice,
-      closingWithSM
-    },
-    bank: {
-      openingBalance: bankOpening,
-      items: bankItems,
-      totalIn: bankTotalIn,
-      totalOut: bankTotalOut,
-      closingBalance: bankClosing
-    }
-  };
-}
-
-async function buildAnalysis(weekEnding) {
-  const all = await getLedgerRows();
-  const end = startOfDay(weekEnding);
-  const sevenStart = new Date(end); sevenStart.setDate(end.getDate() - 6);
-  const fourteenStart = new Date(end); fourteenStart.setDate(end.getDate() - 13);
-
-  const inWindow = (d, start, endIncl) => d >= start && d <= new Date(endIncl.getTime() + 86400000 - 1);
-
-  const thisWeek = all.filter(r => inWindow(r.date, sevenStart, end));
-  const prevWeek = all.filter(r => inWindow(r.date, fourteenStart, new Date(sevenStart.getTime() - 1)));
-
-  const sumIn  = rows => rows.filter(r => r.inOut === 'IN').reduce((s, r) => s + r.amount, 0);
-  const sumOut = rows => rows.filter(r => r.inOut === 'OUT').reduce((s, r) => s + r.amount, 0);
-
-  const thisIn = sumIn(thisWeek), thisOut = sumOut(thisWeek);
-  const prevIn = sumIn(prevWeek), prevOut = sumOut(prevWeek);
-
-  const dailyData = [];
-  for (let i = 0; i < 7; i++) {
-    const d = new Date(sevenStart); d.setDate(sevenStart.getDate() + i);
-    const dayRows = thisWeek.filter(r => sameDate(r.date, d));
-    dailyData.push({ date: d, in: sumIn(dayRows), out: sumOut(dayRows) });
-  }
-
-  // CCM 60/40 rule
-  const ccmReceivableTags = /^FBD-(Plot|Floor)-/i;
-  const ccmConstructionTags = /^FBD-CCM-/i;
-  const collected = thisWeek
-    .filter(r => r.inOut === 'IN' && ccmReceivableTags.test(r.tag))
-    .reduce((s, r) => s + r.amount, 0);
-  const deployedConstruction = thisWeek
-    .filter(r => r.inOut === 'OUT' && ccmConstructionTags.test(r.tag))
-    .reduce((s, r) => s + r.amount, 0);
-  const required = Math.round(collected * 0.6);
-  const office = Math.max(0, collected - deployedConstruction);
-  const officePct = collected > 0 ? Math.round((office / collected) * 100) : 0;
-  const shortfall = Math.max(0, required - deployedConstruction);
-
-  const liquidity = await buildLiquidity(weekEnding);
-  const outliers = detectOutliers(all, thisWeek);
-
-  return {
-    weekEnding,
-    trend: {
-      thisIn, thisOut, thisNet: thisIn - thisOut,
-      prevIn, prevOut, prevNet: prevIn - prevOut,
-      dailyBurn: Math.round(thisOut / 7),
-      dailyData
-    },
-    ccm: { collected, required, deployed: deployedConstruction, office, shortfall, officePct },
-    liquidity,
-    outliers
-  };
-}
-
-async function buildLiquidity(asOfDate) {
-  const chqRows = await getRange('Cheque Register!A5:J500');
-  const fp = await getFundPosition(asOfDate);
-  const fifteenAhead = new Date(asOfDate.getTime() + 15 * 86400000);
-
-  const dueByAccount = {};
-  for (const r of chqRows) {
-    const status = r[7];
-    const chqDate = parseDate(r[6]);
-    const bankAc = r[2];
-    const amt = num(r[5]);
-    if (status !== 'Issued') continue;
-    if (!chqDate || chqDate > fifteenAhead) continue;
-    dueByAccount[bankAc] = (dueByAccount[bankAc] || 0) + amt;
-  }
-
-  const watch = [];
-  for (const [bankAc, due] of Object.entries(dueByAccount)) {
-    const fpRow = fp.find(r => r.bankAcKey === bankAc);
-    if (!fpRow) continue;
-    const balance = fpRow.balBank;
-    const gap = balance - due;
-    let status = 'ok';
-    if (gap < 0) status = 'critical';
-    else if (gap < due * 0.5) status = 'tight';
-    if (status === 'ok') continue;
-    watch.push({
-      account: fpRow.company.replace(/ Pvt Ltd$/i, ''),
-      balance, chequesDue: due, gap, status
-    });
-  }
-  watch.sort((a, b) => {
-    if (a.status === b.status) return a.gap - b.gap;
-    return a.status === 'critical' ? -1 : 1;
-  });
-  return watch;
-}
-
-// §4 ===================================================================
-//    OUTLIER DETECTION
-// =====================================================================
-
-function detectOutliers(allRows, thisWeekRows) {
-  const outliers = [];
-
-  // 1. Same-day reversals
-  const grouped = {};
-  for (const r of thisWeekRows) {
-    const key = `${r.date.toDateString()}|${r.amount}|${r.head}`;
-    if (!grouped[key]) grouped[key] = [];
-    grouped[key].push(r);
-  }
-  for (const [, rows] of Object.entries(grouped)) {
-    if (rows.length >= 2) {
-      const hasIn = rows.some(r => r.inOut === 'IN');
-      const hasOut = rows.some(r => r.inOut === 'OUT');
-      if (hasIn && hasOut) {
-        for (const r of rows) {
-          outliers.push({
-            date: r.date, description: r.description,
-            amount: r.amount, reason: 'Same-day reversal'
-          });
-        }
-      }
-    }
-  }
-
-  // 2. Single transactions ≥ 3× the head's prior 30-day average
-  const thirtyAgo = new Date(thisWeekRows[0]?.date || new Date());
-  thirtyAgo.setDate(thirtyAgo.getDate() - 37);
-  const recentByHead = {};
-  for (const r of allRows.filter(r => r.date >= thirtyAgo && !thisWeekRows.includes(r))) {
-    if (!recentByHead[r.head]) recentByHead[r.head] = [];
-    recentByHead[r.head].push(r.amount);
-  }
-  for (const r of thisWeekRows) {
-    const past = recentByHead[r.head];
-    if (!past || past.length < 3) continue;
-    const avg = past.reduce((s, x) => s + x, 0) / past.length;
-    if (r.amount >= avg * 3 && r.amount >= 100000) {
-      const already = outliers.find(o => o.date === r.date && o.description === r.description);
-      if (!already) {
-        outliers.push({
-          date: r.date, description: r.description, amount: r.amount,
-          reason: `${(r.amount / avg).toFixed(1)}× average for ${r.head}`
-        });
-      }
-    }
-  }
-
-  // 3. Large drawing entries (>5L)
-  for (const r of thisWeekRows) {
-    if (/director|drawing/i.test(r.head) && r.amount >= 500000) {
-      const already = outliers.find(o => o.date === r.date && o.description === r.description);
-      if (!already) {
-        outliers.push({
-          date: r.date, description: r.description, amount: r.amount,
-          reason: 'Single largest drawing entry'
-        });
-      }
-    }
-  }
-
-  outliers.sort((a, b) => b.amount - a.amount);
-  return outliers.slice(0, 6);
-}
-
-// §5 ===================================================================
-//    FORMATTING HELPERS
-// =====================================================================
-
-function fmtINR(n, opts = {}) {
-  if (n === null || n === undefined || n === '' || isNaN(n)) {
-    return opts.dash ? '—' : (opts.prefix || '') + '0';
-  }
-  const numVal = Math.round(Number(n));
-  if (numVal === 0 && opts.dash) return '—';
-  const negative = numVal < 0;
-  const abs = Math.abs(numVal).toString();
-  const lastThree = abs.slice(-3);
-  const rest = abs.slice(0, -3);
-  const formatted = rest
-    ? rest.replace(/\B(?=(\d{2})+(?!\d))/g, ',') + ',' + lastThree
-    : lastThree;
-  const prefix = opts.prefix !== undefined ? opts.prefix : '';
-  if (negative) return '– ' + prefix.replace('– ', '') + formatted;
-  return prefix + formatted;
-}
-
-function fmtDate(d) {
-  const dt = (d instanceof Date) ? d : new Date(d);
-  if (isNaN(dt)) return '';
-  const dd = String(dt.getDate()).padStart(2, '0');
-  const mm = String(dt.getMonth() + 1).padStart(2, '0');
-  const yy = String(dt.getFullYear()).slice(-2);
-  return `${dd}.${mm}.${yy}`;
-}
-
-function fmtDateLong(d) {
-  const dt = (d instanceof Date) ? d : new Date(d);
-  if (isNaN(dt)) return '';
-  const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-  return `${dt.getDate()} ${months[dt.getMonth()]} ${dt.getFullYear()}`;
-}
-
-function fmtTimestamp(d) {
-  const dt = (d instanceof Date) ? d : new Date(d);
-  const dd = String(dt.getDate()).padStart(2, '0');
-  const mm = String(dt.getMonth() + 1).padStart(2, '0');
-  const yyyy = dt.getFullYear();
-  const hh = String(dt.getHours()).padStart(2, '0');
-  const min = String(dt.getMinutes()).padStart(2, '0');
-  return `${dd}.${mm}.${yyyy} · ${hh}:${min} IST`;
-}
-
-function bankPill(bank) {
-  if (!bank) return '';
-  const b = bank.toUpperCase();
-  let bg = '#f4f1e8', fg = '#5a4a1a';
-  if (b.includes('AXIS')) { bg = '#f0e8f2'; fg = '#5a2a5e'; }
-  else if (b.includes('HDFC')) { bg = '#e8eef8'; fg = '#1a3a6e'; }
-  else if (b.includes('ICICI')) { bg = '#fdebe6'; fg = '#7a2a1a'; }
-  else if (b.includes('PDC')) { bg = '#eee'; fg = '#555'; }
-  return `<span style="display:inline-block;padding:2px 9px;background:${bg};color:${fg};border-radius:3px;font-size:12px;font-weight:600;letter-spacing:0.3px;">${bank}</span>`;
-}
-
-function headPill(head) {
-  if (!head) return '';
-  const h = head.toLowerCase();
-  let bg = '#f0eef6', fg = '#3a2d5a';
-  if (h.includes('capital site') || h.includes('ccm')) { bg = '#e6f3ec'; fg = '#1a5a3a'; }
-  else if (h.includes('director') || h.includes('drawing')) { bg = '#fdebe6'; fg = '#7a2a1a'; }
-  else if (h.includes('vrindavan') || h.includes('vrn')) { bg = '#e0f2ee'; fg = '#0d4d3e'; }
-  else if (h.includes('sec 70') || h.includes('land')) { bg = '#fef4e6'; fg = '#7a4a0a'; }
-  else if (h.includes('legal') || h.includes('misc') || h.includes('adv')) { bg = '#f4f1e8'; fg = '#5a4a1a'; }
-  else if (h.includes('noida')) { bg = '#e8eef8'; fg = '#1a3a6e'; }
-  else if (h.includes('fidato 88')) { bg = '#eee'; fg = '#555'; }
-  return `<span style="display:inline-block;padding:2px 9px;background:${bg};color:${fg};border-radius:3px;font-size:12px;font-weight:600;">${head}</span>`;
-}
-
-const baseStyles = `
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{font-family:'Calibri','Segoe UI','Helvetica Neue',Arial,sans-serif;color:#1a1a1a;background:#fff;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased;}
-  .page{padding:32px 28px;background:#fff;}
-  .header{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:18px;padding-bottom:12px;border-bottom:2px solid #1a1a1a;}
-  .eyebrow{font-size:11px;letter-spacing:2px;color:#666;text-transform:uppercase;margin-bottom:4px;}
-  .title{font-size:20px;font-weight:700;letter-spacing:-0.2px;}
-  .date-label{font-size:11px;letter-spacing:1.5px;color:#666;text-transform:uppercase;}
-  .date-value{font-size:18px;font-weight:600;}
-  .section-head{display:flex;align-items:center;gap:10px;margin:18px 0 12px 0;}
-  .section-bar{width:6px;height:22px;background:#1a1a1a;}
-  .section-title{font-size:16px;font-weight:700;letter-spacing:0.3px;}
-  .section-sub{font-size:13px;color:#888;margin-left:6px;}
-  table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;}
-  th{font-weight:600;font-size:12px;letter-spacing:0.8px;text-transform:uppercase;color:#555;}
-  .num{text-align:right;}
-  .muted{color:#aaa;}
-  .footer{margin-top:18px;padding-top:12px;border-top:1px solid #e0ddd2;display:flex;justify-content:space-between;font-size:11px;color:#888;letter-spacing:0.5px;}
-  .hero{padding:18px 22px;background:linear-gradient(135deg,#1a4480,#2a5fa8);border-radius:4px;display:flex;justify-content:space-between;align-items:center;margin-top:14px;}
-  .hero-label{font-size:11px;letter-spacing:2px;color:rgba(255,255,255,0.7);text-transform:uppercase;margin-bottom:2px;}
-  .hero-sub{font-size:14px;color:rgba(255,255,255,0.9);font-weight:500;}
-  .hero-amt{font-size:26px;font-weight:700;color:#fff;font-variant-numeric:tabular-nums;letter-spacing:-0.5px;}
-`;
-
-function wrapPage(bodyContent, generatedAt) {
-  return `<!doctype html><html><head><meta charset="utf-8"><style>${baseStyles}</style></head><body>
-<div class="page">${bodyContent}
-<div class="footer"><div>Generated ${fmtTimestamp(generatedAt || new Date())}</div><div>All amounts in ₹</div></div>
-</div></body></html>`;
-}
-
-// §6 ===================================================================
-//    HTML TEMPLATES
-// =====================================================================
-
-function renderFundPosition({ asOfDate, rows, totals, deductions, netUseable }) {
-  const trs = rows.map((r, i) => {
-    const zebra = i % 2 === 1 ? 'background:#fbfaf6;' : '';
-    const isLast = i === rows.length - 1;
-    const borderBottom = isLast ? 'border-bottom:1.5px solid #1a1a1a;' : 'border-bottom:1px solid #f0eee7;';
-    const companyLabel = r.notUsable
-      ? `${r.company} <span style="color:#999;font-size:12px;margin-left:4px;">(Not Usable)</span>`
-      : r.company;
-    const lessChqCell = r.lessChq > 0
-      ? `<td class="num" style="padding:11px 12px;color:#a02828;">${fmtINR(r.lessChq)}</td>`
-      : `<td class="num muted" style="padding:11px 12px;">—</td>`;
-    return `<tr style="${zebra}${borderBottom}">
-      <td style="padding:11px 12px 11px 4px;">${companyLabel}</td>
-      <td style="padding:11px 12px;">${bankPill(r.bank)}</td>
-      <td class="num" style="padding:11px 12px;">${fmtINR(r.balBank, {dash:true})}</td>
-      ${lessChqCell}
-      <td class="num" style="padding:11px 4px 11px 12px;font-weight:500;">${fmtINR(r.balUs, {dash:true})}</td>
-    </tr>`;
-  }).join('');
-
-  const dedRows = (deductions || []).map(d => `<tr>
-    <td style="padding:5px 0;color:#555;">${d.label}</td>
-    <td class="num" style="padding:5px 0;font-weight:500;">${fmtINR(d.amount)}</td>
-  </tr>`).join('');
-
-  const body = `
-<div class="header">
-  <div><div class="eyebrow">Fidato Group</div><div class="title">Fund Position</div></div>
-  <div style="text-align:right;"><div class="date-label">As on</div><div class="date-value">${fmtDateLong(asOfDate)}</div></div>
-</div>
-<table style="font-size:14.5px;">
-<thead><tr style="border-bottom:1.5px solid #1a1a1a;">
-  <th style="padding:12px 12px 10px 4px;text-align:left;width:36%;">Company</th>
-  <th style="padding:12px;text-align:left;width:10%;">Bank</th>
-  <th class="num" style="padding:12px;width:18%;">Bal as per Bank</th>
-  <th class="num" style="padding:12px;width:18%;">Less : Chq Issued</th>
-  <th class="num" style="padding:12px 4px 10px 12px;width:18%;">Balance as per Us</th>
-</tr></thead>
-<tbody>
-${trs}
-<tr style="background:#fbfaf6;">
-  <td style="padding:14px 12px 14px 4px;font-weight:700;font-size:15px;letter-spacing:1px;">TOTAL</td>
-  <td></td>
-  <td class="num" style="padding:14px 12px;font-weight:700;font-size:16px;">${fmtINR(totals.balBank)}</td>
-  <td class="num" style="padding:14px 12px;font-weight:700;font-size:16px;color:#a02828;">${fmtINR(totals.lessChq)}</td>
-  <td class="num" style="padding:14px 4px 14px 12px;font-weight:700;font-size:16px;">${fmtINR(totals.balUs)}</td>
-</tr>
-</tbody>
-</table>
-<div style="margin-top:20px;padding:16px 18px;background:#fbfaf6;border-radius:4px;">
-<table style="font-size:14.5px;">${dedRows}</table>
-</div>
-<div class="hero">
-  <div><div class="hero-label">Net Bank Balance</div><div class="hero-sub">Useable</div></div>
-  <div class="hero-amt">${fmtINR(netUseable, {prefix:'₹ '})}</div>
-</div>`;
-  return wrapPage(body);
-}
-
-function renderExpenditure({ date, pdc, bank }) {
-  const pdcOpening = `<tr style="background:#fbfaf6;border-bottom:1px solid #f0eee7;">
-    <td style="padding:11px 12px 11px 4px;font-weight:500;">Opening Balance <span style="color:#888;font-size:12.5px;">(Incl. Dasti with SM &amp; Locker)</span></td>
-    <td></td>
-    <td class="num muted" style="padding:11px 12px;">—</td>
-    <td class="num" style="padding:11px 4px 11px 12px;font-weight:600;">${fmtINR(pdc.openingBalance)}</td>
-  </tr>`;
-
-  const pdcCashWd = (pdc.cashWithdrawal && pdc.cashWithdrawal > 0)
-    ? `<tr style="background:#fbfaf6;border-bottom:1px solid #f0eee7;">
-        <td style="padding:11px 12px 11px 4px;">Cash Withdrawal for Exp.</td>
-        <td></td>
-        <td class="num muted" style="padding:11px 12px;">—</td>
-        <td class="num" style="padding:11px 4px 11px 12px;font-weight:500;color:#1a7a4a;">+ ${fmtINR(pdc.cashWithdrawal)}</td>
-      </tr>` : '';
-
-  const pdcItemRows = (pdc.items || []).map((it, i) => {
-    const isLast = i === pdc.items.length - 1;
-    const borderBottom = isLast ? 'border-bottom:1.5px solid #1a1a1a;' : 'border-bottom:1px solid #f0eee7;';
-    return `<tr style="${borderBottom}">
-      <td style="padding:11px 12px 11px 4px;">${it.description}</td>
-      <td style="padding:11px 12px;">${headPill(it.head)}</td>
-      <td class="num" style="padding:11px 12px;">${fmtINR(it.amount)}</td>
-      <td class="num muted" style="padding:11px 4px 11px 12px;">—</td>
-    </tr>`;
-  }).join('');
-
-  const pdcTotalRow = `<tr style="background:#fff8b8;">
-    <td style="padding:14px 12px 14px 4px;font-weight:700;font-size:15px;letter-spacing:1px;">TOTAL</td>
-    <td></td>
-    <td class="num" style="padding:14px 12px;font-weight:700;font-size:16px;">${fmtINR(pdc.total)}</td>
-    <td class="num" style="padding:14px 4px 14px 12px;font-weight:700;font-size:16px;">${fmtINR(pdc.runningTotal)}</td>
-  </tr>`;
-
-  const pdcClose1 = `<tr style="background:#fdebe6;">
-    <td style="padding:12px;color:#7a2a1a;font-weight:600;">Closing balance PDC### (with office)</td>
-    <td></td>
-    <td class="num" style="padding:12px;color:#7a2a1a;font-weight:700;font-size:15px;">${fmtINR(pdc.closingWithOffice)}</td>
-    <td></td>
-  </tr>`;
-  const pdcClose2 = `<tr style="background:#fdebe6;">
-    <td style="padding:12px;color:#7a2a1a;font-weight:600;">Closing balance PDC### (with SM)</td>
-    <td></td>
-    <td class="num" style="padding:12px;color:#7a2a1a;font-weight:700;font-size:15px;">${fmtINR(pdc.closingWithSM)}</td>
-    <td></td>
-  </tr>`;
-
-  const bankOpening = `<tr style="background:#fbfaf6;border-bottom:1px solid #f0eee7;">
-    <td style="padding:11px 12px 11px 4px;font-weight:500;">Opening Balance</td>
-    <td></td>
-    <td class="num" style="padding:11px 12px;font-weight:600;">${fmtINR(bank.openingBalance)}</td>
-    <td class="num muted" style="padding:11px 4px 11px 12px;">—</td>
-  </tr>`;
-
-  const bankItemRows = (bank.items || []).map(it => {
-    const inCell = (it.inAmount && it.inAmount > 0)
-      ? `<td class="num" style="padding:11px 12px;color:#1a7a4a;font-weight:500;">${fmtINR(it.inAmount)}</td>`
-      : `<td class="num muted" style="padding:11px 12px;">—</td>`;
-    const outCell = (it.outAmount && it.outAmount > 0)
-      ? `<td class="num" style="padding:11px 4px 11px 12px;color:#a02828;">${fmtINR(it.outAmount)}</td>`
-      : `<td class="num muted" style="padding:11px 4px 11px 12px;">—</td>`;
-    return `<tr style="border-bottom:1px solid #f0eee7;">
-      <td style="padding:11px 12px 11px 4px;">${it.description}</td>
-      <td style="padding:11px 12px;">${headPill(it.head)}</td>
-      ${inCell}${outCell}
-    </tr>`;
-  }).join('');
-
-  const bankTotalRow = `<tr style="border-bottom:1.5px solid #1a1a1a;background:#fbfaf6;">
-    <td style="padding:14px 12px 14px 4px;font-weight:700;font-size:15px;letter-spacing:1px;">TOTAL</td>
-    <td></td>
-    <td class="num" style="padding:14px 12px;font-weight:700;font-size:16px;color:#1a7a4a;">${fmtINR(bank.totalIn)}</td>
-    <td class="num" style="padding:14px 4px 14px 12px;font-weight:700;font-size:16px;color:#a02828;">${fmtINR(bank.totalOut)}</td>
-  </tr>`;
-
-  const body = `
-<div class="header">
-  <div><div class="eyebrow">Fidato Group</div><div class="title">Daily Expenditure</div></div>
-  <div style="text-align:right;"><div class="date-label">Dated</div><div class="date-value">${fmtDateLong(date)}</div></div>
-</div>
-<div class="section-head" style="margin-top:8px;"><div class="section-bar"></div><div class="section-title">PDC <span style="color:#999;">###</span></div></div>
-<table style="font-size:14.5px;margin-bottom:18px;">
-<thead><tr style="border-bottom:1.5px solid #1a1a1a;">
-  <th style="padding:10px 12px 10px 4px;text-align:left;width:50%;">Particulars</th>
-  <th style="padding:10px 12px;text-align:left;width:22%;">Head</th>
-  <th class="num" style="padding:10px 12px;width:14%;">Amount</th>
-  <th class="num" style="padding:10px 4px 10px 12px;width:14%;">Balance</th>
-</tr></thead>
-<tbody>${pdcOpening}${pdcCashWd}${pdcItemRows}${pdcTotalRow}${pdcClose1}${pdcClose2}</tbody>
-</table>
-<div class="section-head"><div class="section-bar"></div><div class="section-title">Bank Movement</div></div>
-<table style="font-size:14.5px;">
-<thead><tr style="border-bottom:1.5px solid #1a1a1a;">
-  <th style="padding:10px 12px 10px 4px;text-align:left;width:50%;">Particulars</th>
-  <th style="padding:10px 12px;text-align:left;width:22%;">Head</th>
-  <th class="num" style="padding:10px 12px;width:14%;">In</th>
-  <th class="num" style="padding:10px 4px 10px 12px;width:14%;">Out</th>
-</tr></thead>
-<tbody>${bankOpening}${bankItemRows}${bankTotalRow}</tbody>
-</table>
-<div class="hero">
-  <div><div class="hero-label">Closing Balance</div><div class="hero-sub">After today's bank movement</div></div>
-  <div class="hero-amt">${fmtINR(bank.closingBalance, {prefix:'₹ '})}</div>
-</div>`;
-  return wrapPage(body);
-}
-
-function renderAnalysis({ weekEnding, trend, ccm, liquidity, outliers }) {
-  const inDeltaPct = trend.prevIn > 0 ? Math.round(((trend.thisIn - trend.prevIn) / trend.prevIn) * 100) : 0;
-  const outDeltaPct = trend.prevOut > 0 ? Math.round(((trend.thisOut - trend.prevOut) / trend.prevOut) * 100) : 0;
-  const netDelta = trend.thisNet - trend.prevNet;
-  const inArrow = trend.thisIn >= trend.prevIn ? '▲' : '▼';
-  const outArrow = trend.thisOut >= trend.prevOut ? '▲' : '▼';
-  const netArrow = netDelta >= 0 ? '▲' : '▼';
-  const netCardBg = trend.thisNet < 0 ? '#fdebe6' : '#fbfaf6';
-  const netCardColor = trend.thisNet < 0 ? '#7a2a1a' : '#1a1a1a';
-  const netBorderColor = trend.thisNet < 0 ? '#7a2a1a' : '#1a7a4a';
-
-  const maxDay = Math.max(1, ...(trend.dailyData || []).map(d => Math.max(d.in || 0, d.out || 0)));
-  const barChart = (trend.dailyData || []).slice(0, 7).map((d, i) => {
-    const x = 20 + i * 100;
-    const inHeight = Math.round(((d.in || 0) / maxDay) * 60);
-    const outHeight = Math.round(((d.out || 0) / maxDay) * 60);
-    const dt = new Date(d.date);
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const label = `${dt.getDate()} ${months[dt.getMonth()]}`;
-    return `<g>
-      <rect x="${x}" y="${70 - inHeight}" width="40" height="${inHeight}" fill="#1a7a4a"/>
-      <rect x="${x}" y="70" width="40" height="${outHeight}" fill="#a02828"/>
-      <text x="${x + 20}" y="125" text-anchor="middle" font-size="11" fill="#666">${label}</text>
-    </g>`;
-  }).join('');
-
-  const fillPct = ccm.collected > 0 ? Math.round((ccm.deployed / ccm.collected) * 100) : 0;
-
-  const ccmShortfall = ccm.shortfall && ccm.shortfall > 0 ? `
-<div style="padding:14px 18px;background:#fdebe6;border-left:4px solid #7a2a1a;border-radius:3px;margin-bottom:32px;">
-  <div style="font-size:13px;color:#7a2a1a;font-weight:600;margin-bottom:2px;">Shortfall</div>
-  <div style="font-size:13px;color:#7a2a1a;">Need <span style="font-weight:700;">${fmtINR(ccm.shortfall, {prefix:'₹ '})}</span> more in CCM construction this week to meet the 60% rule.${ccm.officePct > 40 ? ` Office spending is at ${ccm.officePct}% of collections (${fmtINR(ccm.office, {prefix:'₹ '})}) — over the 40% ceiling.` : ''}</div>
-</div>` : `
-<div style="padding:14px 18px;background:#e6f3ec;border-left:4px solid #1a5a3a;border-radius:3px;margin-bottom:32px;">
-  <div style="font-size:13px;color:#1a5a3a;font-weight:600;">On track</div>
-  <div style="font-size:13px;color:#1a5a3a;">CCM 60/40 rule satisfied this week.</div>
-</div>`;
-
-  const liquidityRows = (liquidity || []).map(l => {
-    let bg, borderColor, statusColor, statusLabel, gapColor;
-    if (l.status === 'critical') {
-      bg = '#fdebe6'; borderColor = '#a02828'; statusColor = '#7a2a1a'; statusLabel = 'Critical'; gapColor = '#7a2a1a';
-    } else if (l.status === 'tight') {
-      bg = '#fff8b8'; borderColor = '#b08810'; statusColor = '#5a4410'; statusLabel = 'Tight'; gapColor = '#5a4410';
-    } else {
-      bg = '#e6f3ec'; borderColor = '#1a5a3a'; statusColor = '#1a5a3a'; statusLabel = 'OK'; gapColor = '#1a5a3a';
-    }
-    const gapPrefix = l.gap >= 0 ? '+ ₹ ' : '– ₹ ';
-    const gapValue = fmtINR(Math.abs(l.gap));
-    return `<div style="padding:16px 20px;background:${bg};border-left:4px solid ${borderColor};border-radius:3px;margin-bottom:8px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <div>
-          <div style="font-size:14px;font-weight:600;color:#1a1a1a;margin-bottom:2px;">${l.account}</div>
-          <div style="font-size:12px;color:#666;">Balance ${fmtINR(l.balance, {prefix:'₹ '})} · Cheques due ${fmtINR(l.chequesDue, {prefix:'₹ '})}</div>
-        </div>
-        <div style="text-align:right;">
-          <div style="font-size:11px;letter-spacing:1.5px;color:${statusColor};text-transform:uppercase;font-weight:600;">${statusLabel}</div>
-          <div style="font-size:18px;font-weight:700;color:${gapColor};font-variant-numeric:tabular-nums;">${gapPrefix}${gapValue}</div>
-        </div>
-      </div>
-    </div>`;
-  }).join('');
-
-  const outlierRows = (outliers && outliers.length > 0) ? outliers.map((o, i) => {
-    const zebra = i % 2 === 1 ? 'background:#fbfaf6;' : '';
-    return `<tr style="${zebra}border-bottom:1px solid #f0eee7;">
-      <td style="padding:11px 12px 11px 4px;">${fmtDate(o.date)}</td>
-      <td style="padding:11px 12px;">${o.description}</td>
-      <td class="num" style="padding:11px 12px;font-weight:500;">${fmtINR(o.amount, {prefix:'₹ '})}</td>
-      <td style="padding:11px 4px 11px 12px;color:#666;">${o.reason}</td>
-    </tr>`;
-  }).join('') : `<tr><td colspan="4" style="padding:18px;text-align:center;color:#888;font-style:italic;">No significant outliers this week</td></tr>`;
-
-  const body = `
-<div class="header">
-  <div><div class="eyebrow">Fidato Group</div><div class="title">Weekly Analysis</div></div>
-  <div style="text-align:right;"><div class="date-label">Week ending</div><div class="date-value">${fmtDateLong(weekEnding)}</div></div>
-</div>
-<div class="section-head" style="margin-top:24px;"><div class="section-bar"></div><div class="section-title">7-Day Movement</div><div class="section-sub">vs prior 7 days</div></div>
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px;">
-  <div style="padding:18px 20px;background:#fbfaf6;border-radius:4px;border-left:4px solid #1a7a4a;">
-    <div style="font-size:11px;letter-spacing:1.5px;color:#666;text-transform:uppercase;margin-bottom:6px;">Inflows</div>
-    <div style="font-size:24px;font-weight:700;letter-spacing:-0.3px;font-variant-numeric:tabular-nums;margin-bottom:4px;">${fmtINR(trend.thisIn, {prefix:'₹ '})}</div>
-    <div style="font-size:13px;color:#1a7a4a;font-weight:600;">${inArrow} ${Math.abs(inDeltaPct)}% vs ${fmtINR(trend.prevIn, {prefix:'₹ '})}</div>
-  </div>
-  <div style="padding:18px 20px;background:#fbfaf6;border-radius:4px;border-left:4px solid #a02828;">
-    <div style="font-size:11px;letter-spacing:1.5px;color:#666;text-transform:uppercase;margin-bottom:6px;">Outflows</div>
-    <div style="font-size:24px;font-weight:700;letter-spacing:-0.3px;font-variant-numeric:tabular-nums;margin-bottom:4px;">${fmtINR(trend.thisOut, {prefix:'₹ '})}</div>
-    <div style="font-size:13px;color:#a02828;font-weight:600;">${outArrow} ${Math.abs(outDeltaPct)}% vs ${fmtINR(trend.prevOut, {prefix:'₹ '})}</div>
-  </div>
-  <div style="padding:18px 20px;background:${netCardBg};border-radius:4px;border-left:4px solid ${netBorderColor};">
-    <div style="font-size:11px;letter-spacing:1.5px;color:${netCardColor};text-transform:uppercase;margin-bottom:6px;">Net Movement</div>
-    <div style="font-size:24px;font-weight:700;letter-spacing:-0.3px;font-variant-numeric:tabular-nums;color:${netCardColor};margin-bottom:4px;">${fmtINR(trend.thisNet, {prefix:'₹ '})}</div>
-    <div style="font-size:13px;color:${netCardColor};font-weight:600;">${netArrow} ${fmtINR(Math.abs(netDelta), {prefix:'₹ '})} vs prev</div>
-  </div>
-</div>
-<div style="margin-bottom:32px;padding:16px 20px;background:#fbfaf6;border-radius:4px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-    <div style="font-size:13px;color:#555;font-weight:500;">Daily flow this week</div>
-    <div style="font-size:11px;color:#888;">Burn rate: ${fmtINR(trend.dailyBurn, {prefix:'₹ '})} / day</div>
-  </div>
-  <svg viewBox="0 0 720 140" style="width:100%;height:auto;">
-    <line x1="0" y1="70" x2="720" y2="70" stroke="#d0ccbc" stroke-width="0.5" stroke-dasharray="3 3"/>
-    ${barChart}
-    <text x="0" y="35" font-size="10" fill="#888">In</text>
-    <text x="0" y="105" font-size="10" fill="#888">Out</text>
-  </svg>
-</div>
-<div class="section-head"><div class="section-bar"></div><div class="section-title">Capital Central Market — 60 / 40 Rule</div></div>
-<div style="font-size:13px;color:#666;margin-bottom:14px;padding-left:16px;">Of every ₹100 collected from CCM customers, ₹60 must be deployed to FBD-CCM construction within the same week.</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
-  <div style="padding:16px 18px;background:#fbfaf6;border-radius:4px;">
-    <div style="font-size:11px;letter-spacing:1.5px;color:#666;text-transform:uppercase;margin-bottom:6px;">Collected from CCM (7d)</div>
-    <div style="font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;">${fmtINR(ccm.collected, {prefix:'₹ '})}</div>
-  </div>
-  <div style="padding:16px 18px;background:#fbfaf6;border-radius:4px;">
-    <div style="font-size:11px;letter-spacing:1.5px;color:#666;text-transform:uppercase;margin-bottom:6px;">Required (60%)</div>
-    <div style="font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;">${fmtINR(ccm.required, {prefix:'₹ '})}</div>
-  </div>
-</div>
-<div style="margin-bottom:14px;">
-  <div style="display:flex;justify-content:space-between;font-size:12px;color:#666;margin-bottom:18px;">
-    <div>Deployed to construction</div>
-    <div><span style="color:#1a1a1a;font-weight:600;">${fmtINR(ccm.deployed, {prefix:'₹ '})}</span> <span style="color:#888;">/ ${fmtINR(ccm.required, {prefix:'₹ '})} needed</span></div>
-  </div>
-  <div style="height:14px;background:#f0eee7;border-radius:3px;overflow:hidden;position:relative;">
-    <div style="height:100%;width:${Math.min(100, fillPct)}%;background:${fillPct >= 60 ? '#1a7a4a' : '#a02828'};"></div>
-    <div style="position:absolute;left:60%;top:-2px;bottom:-2px;width:1px;background:#1a1a1a;"></div>
-    <div style="position:absolute;left:60%;top:-16px;font-size:10px;font-weight:600;color:#1a1a1a;transform:translateX(-50%);">60%</div>
-  </div>
-</div>
-${ccmShortfall}
-<div class="section-head"><div class="section-bar"></div><div class="section-title">Liquidity Watch</div><div class="section-sub">Cheques due in next 15 days</div></div>
-<div style="margin-bottom:32px;">
-${liquidityRows || '<div style="padding:18px;text-align:center;color:#888;font-style:italic;background:#fbfaf6;border-radius:3px;">All accounts comfortable</div>'}
-</div>
-<div class="section-head"><div class="section-bar"></div><div class="section-title">Outliers</div><div class="section-sub">last 7 days</div></div>
-<table style="font-size:14px;">
-<thead><tr style="border-bottom:1.5px solid #1a1a1a;">
-  <th style="padding:10px 12px 10px 4px;text-align:left;font-size:11px;width:13%;">Date</th>
-  <th style="padding:10px 12px;text-align:left;font-size:11px;width:38%;">Particulars</th>
-  <th style="padding:10px 12px;text-align:right;font-size:11px;width:18%;">Amount</th>
-  <th style="padding:10px 4px 10px 12px;text-align:left;font-size:11px;width:31%;">Why flagged</th>
-</tr></thead>
-<tbody>${outlierRows}</tbody>
-</table>`;
-  return wrapPage(body);
-}
-
-// §7 ===================================================================
-//    PUPPETEER RENDERER
-// =====================================================================
-
-let browserInstance = null;
-let browserLaunching = null;
-
-// Probe common Chromium binary locations as fallbacks
-function findChromiumPath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
-  const candidates = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable'
-  ];
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) {
-        console.log('[Puppeteer] Found system Chromium at', p);
-        return p;
-      }
-    } catch {}
-  }
-  return null; // Let Puppeteer use its own bundled Chrome
-}
-
-async function getBrowser() {
-  if (browserInstance && browserInstance.isConnected()) return browserInstance;
-  if (browserLaunching) return browserLaunching;
-
-  browserLaunching = (async () => {
-    const launchOpts = {
-      headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-zygote',
-        '--font-render-hinting=none'
-      ]
-    };
-    const execPath = findChromiumPath();
-    if (execPath) {
-      launchOpts.executablePath = execPath;
-      console.log('[Puppeteer] Using executable:', execPath);
-    } else {
-      console.log('[Puppeteer] Using bundled Chromium (no system path found)');
-    }
-    try {
-      const b = await puppeteer.launch(launchOpts);
-      b.on('disconnected', () => {
-        console.warn('[Puppeteer] Browser disconnected');
-        browserInstance = null;
-      });
-      browserInstance = b;
-      return b;
-    } catch (e) {
-      console.error('[Puppeteer] Launch failed:', e.message);
-      throw new Error('Puppeteer launch failed — Chromium may not be installed: ' + e.message);
-    } finally {
-      browserLaunching = null;
-    }
-  })();
-  return browserLaunching;
-}
-
-async function htmlToPng(html, viewportWidth = 900) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  // Hard outer timeout so a hung page never blocks the request forever
-  const HARD_TIMEOUT_MS = 25000;
-  let hardTimer;
-  const hardTimeout = new Promise((_, rej) => {
-    hardTimer = setTimeout(() => rej(new Error('htmlToPng exceeded ' + HARD_TIMEOUT_MS + 'ms')), HARD_TIMEOUT_MS);
-  });
-  try {
-    await page.setViewport({ width: viewportWidth, height: 800, deviceScaleFactor: 2 });
-    // domcontentloaded = HTML parsed; we don't need network requests since the page is self-contained
-    await Promise.race([
-      page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 15000 }),
-      hardTimeout
-    ]);
-    // Font wait with its own timeout, never blocks
-    try {
-      await Promise.race([
-        page.evaluate(() => document.fonts && document.fonts.ready),
-        new Promise(res => setTimeout(res, 500))
-      ]);
-    } catch {}
-    const buffer = await Promise.race([
-      page.screenshot({ fullPage: true, type: 'png' }),
-      hardTimeout
-    ]);
-    // Puppeteer 23+ may return Uint8Array; force Node Buffer for downstream consumers
-    return Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-  } finally {
-    clearTimeout(hardTimer);
-    try { await page.close(); } catch {}
-  }
-}
-
-// §8 ===================================================================
-//    WHATSAPP CLIENT + SENDER
-// =====================================================================
-
-let waClient = null;
-let waReady = false;
-let lastQR = null;
-let botEnabled = true;
-let waInitAttempts = 0;
-
-function initWhatsApp() {
-  waInitAttempts += 1;
-  try {
-    const authStrategy = AUTH_PATH
-      ? new LocalAuth({ dataPath: AUTH_PATH })
-      : new LocalAuth();  // fallback to default in-memory-ish
-
-    waClient = new Client({
-      authStrategy,
-      puppeteer: {
-        headless: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        args: [
-          '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--disable-gpu'
-        ]
-      }
-    });
-
-    waClient.on('qr', (qr) => {
-      lastQR = qr;
-      console.log('[WA] QR generated. Visit /api/pair to view.');
-      try { qrcode.generate(qr, { small: true }); } catch {}
-    });
-    waClient.on('ready', () => {
-      waReady = true;
-      lastQR = null;
-      console.log('[WA] Client ready');
-    });
-    waClient.on('disconnected', (reason) => {
-      waReady = false;
-      console.log('[WA] Disconnected:', reason);
-      // Auto-retry init after 30s, but cap attempts
-      if (waInitAttempts < 5) {
-        setTimeout(() => {
-          console.log('[WA] Retrying init (attempt', waInitAttempts + 1, ')');
-          initWhatsApp();
-        }, 30000);
-      }
-    });
-    waClient.on('auth_failure', (msg) => {
-      console.error('[WA] Auth failed:', msg);
-      waReady = false;
-    });
-
-    waClient.initialize().catch(err => {
-      console.error('[WA] initialize() rejected:', err && err.message);
-    });
-  } catch (e) {
-    console.error('[WA] init threw:', e && e.message);
-    // Don't crash — leave waReady=false so endpoints can report it
-  }
-}
-
-initWhatsApp();
-
-function dateSlug(d) {
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-}
-
-async function generateThreeReports(date) {
-  const targetDate = date instanceof Date ? date : new Date(date);
-
-  const [fundData, expData, anaData] = await Promise.all([
-    buildFundPosition(targetDate),
-    buildExpenditure(targetDate),
-    buildAnalysis(targetDate)
-  ]);
-
-  const fundHtml = renderFundPosition(fundData);
-  const expHtml  = renderExpenditure(expData);
-  const anaHtml  = renderAnalysis(anaData);
-
-  const [fundPng, expPng, anaPng] = await Promise.all([
-    htmlToPng(fundHtml),
-    htmlToPng(expHtml),
-    htmlToPng(anaHtml)
-  ]);
-
-  return {
-    fundPosition: { html: fundHtml, png: fundPng, filename: `fund-position-${dateSlug(targetDate)}.png` },
-    expenditure:  { html: expHtml,  png: expPng,  filename: `expenditure-${dateSlug(targetDate)}.png` },
-    analysis:     { html: anaHtml,  png: anaPng,  filename: `analysis-${dateSlug(targetDate)}.png` }
-  };
-}
-
-async function sendReportsToGroup(date) {
-  if (!waReady) throw new Error('WhatsApp client not ready');
-  if (!botEnabled) {
-    console.log('[Report] Bot disabled, skipping send');
-    return { skipped: true };
-  }
-
-  const r = await generateThreeReports(date);
-
-  const sequence = [
-    { name: 'Fund Position', report: r.fundPosition },
-    { name: 'Daily Expenditure', report: r.expenditure },
-    { name: 'Weekly Analysis', report: r.analysis }
-  ];
-
-  for (const { name, report } of sequence) {
-    const buf = Buffer.isBuffer(report.png) ? report.png : Buffer.from(report.png);
-    const media = new MessageMedia('image/png', buf.toString('base64'), report.filename);
-    await waClient.sendMessage(GROUP_JID, media, { caption: name });
-    await new Promise(res => setTimeout(res, 1500));
-  }
-
-  return { sent: sequence.map(s => s.report.filename) };
-}
-
-// §9 ===================================================================
-//    EXPRESS ENDPOINTS + CRON
-// =====================================================================
-
 const app = express();
 app.use(express.json());
 
-app.get('/health', (_req, res) => res.json({
-  status: 'ok',
-  waReady,
-  hasQR: !!lastQR,
-  botEnabled,
-  authPath: AUTH_PATH,
-  startupIssues,
-  env: {
-    hasSheetId: !!SHEET_ID,
-    hasGoogleCreds: !!process.env.GOOGLE_CREDENTIALS,
-    groupJid: GROUP_JID,
-    puppeteerExecPath: process.env.PUPPETEER_EXECUTABLE_PATH || null
+// ============================================================
+// CONFIGURATION
+// ============================================================
+const CONFIG = {
+  SHEET_ID: process.env.SHEET_ID || '1JDoDEk2smAJu0S3RO1WLPZ4MzGZD-_Kn1pP9K8U0J5w',
+  GOOGLE_CREDENTIALS: process.env.GOOGLE_CREDENTIALS,
+  WHATSAPP_GROUP_JID: process.env.WHATSAPP_GROUP_JID || '120363425432126351@g.us',
+  APPROVAL_GROUP_JID: process.env.APPROVAL_GROUP_JID || '',
+  BOT_ENABLED: process.env.BOT_ENABLED !== 'false',
+  CLAUDE_API_KEY: process.env.CLAUDE_API_KEY,
+  PORT: process.env.PORT || 3000,
+  MM_PHONE: '919873095398',
+  SM_PHONE: '919873429794',
+};
+
+// ============================================================
+// GOOGLE SHEETS API
+// ============================================================
+let sheetsApi = null;
+
+function initGoogleSheets() {
+  if (!CONFIG.GOOGLE_CREDENTIALS) {
+    console.log('No GOOGLE_CREDENTIALS set. Sheet reading disabled.');
+    return;
   }
-}));
-
-app.get('/api/wa-status', (_req, res) => {
-  res.json({ ready: waReady, hasQR: !!lastQR, botEnabled });
-});
-
-app.get('/api/pair', (_req, res) => {
-  if (!lastQR) return res.send('<h2>No QR — already paired or initializing.</h2>');
-  res.send(`<h2>Scan with WhatsApp → Linked Devices</h2>
-<img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(lastQR)}"/>
-<p><small style="word-break:break-all;">${lastQR}</small></p>`);
-});
-
-app.post('/api/bot/on',  (_req, res) => { botEnabled = true;  res.json({ botEnabled }); });
-app.post('/api/bot/off', (_req, res) => { botEnabled = false; res.json({ botEnabled }); });
-
-app.get('/api/preview', async (req, res) => {
   try {
-    const date = req.query.date ? new Date(req.query.date) : new Date();
-    const which = req.query.report || 'fund';
-    const all = await generateThreeReports(date);
-    const map = { fund: 'fundPosition', expenditure: 'expenditure', analysis: 'analysis' };
-    const key = map[which] || 'fundPosition';
-    res.set('Content-Type', 'text/html');
-    res.send(all[key].html);
+    var creds = JSON.parse(CONFIG.GOOGLE_CREDENTIALS);
+    var auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+    });
+    sheetsApi = google.sheets({ version: 'v4', auth: auth });
+    console.log('Google Sheets API initialized.');
   } catch (e) {
-    res.status(500).send(`<pre>${e.stack}</pre>`);
+    console.error('Failed to init Google Sheets:', e.message);
   }
-});
-
-app.get('/api/preview-image', async (req, res) => {
-  try {
-    const date = req.query.date ? new Date(req.query.date) : new Date();
-    const which = req.query.report || 'fund';
-    const all = await generateThreeReports(date);
-    const map = { fund: 'fundPosition', expenditure: 'expenditure', analysis: 'analysis' };
-    const key = map[which] || 'fundPosition';
-    const buf = Buffer.isBuffer(all[key].png) ? all[key].png : Buffer.from(all[key].png);
-    res.set('Content-Type', 'image/png');
-    res.set('Content-Length', String(buf.length));
-    res.set('Cache-Control', 'no-store');
-    res.end(buf);
-  } catch (e) {
-    res.status(500).send(`<pre>${e.stack}</pre>`);
-  }
-});
-
-app.get('/api/daily-report', async (req, res) => {
-  try {
-    const date = req.query.date ? new Date(req.query.date) : new Date();
-    const result = await sendReportsToGroup(date);
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/test-send', async (_req, res) => {
-  try {
-    const result = await sendReportsToGroup(new Date());
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Daily at 06:30 IST → sends *yesterday's* reports
-try {
-  cron.schedule('30 6 * * *', async () => {
-    try {
-      console.log('[Cron] Sending daily reports');
-      const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
-      await sendReportsToGroup(yesterday);
-    } catch (e) {
-      console.error('[Cron] Failed:', e && e.message);
-    }
-  }, { timezone: 'Asia/Kolkata' });
-  console.log('[Cron] Scheduled: 06:30 IST daily');
-} catch (e) {
-  console.error('[Cron] Schedule failed:', e && e.message, '— server will still run, but no auto-send');
 }
 
-// Bind to 0.0.0.0 so Railway can reach the port
-app.listen(PORT, '0.0.0.0', () => console.log(`[Server] Listening on ${PORT}`));
+async function readSheet(range) {
+  if (!sheetsApi) throw new Error('Google Sheets not initialized');
+  var result = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: CONFIG.SHEET_ID,
+    range: range,
+  });
+  return result.data.values || [];
+}
+
+// ============================================================
+// WHATSAPP-WEB.JS CONNECTION
+// ============================================================
+let waClient = null;
+let waReady = false;
+let latestQR = null;
+let latestQRDataUrl = null;
+
+function createWhatsAppClient() {
+  waClient = new Client({
+    authStrategy: new LocalAuth({ dataPath: './wa_auth' }),
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
+        '--single-process', '--disable-gpu', '--disable-extensions',
+      ],
+    },
+  });
+
+  waClient.on('qr', function(qr) {
+    latestQR = qr;
+    qrcode.toDataURL(qr, function(err, url) {
+      if (!err) latestQRDataUrl = url;
+    });
+    console.log('New QR code generated. Visit /api/pair to scan.');
+  });
+
+  waClient.on('ready', function() {
+    waReady = true;
+    latestQR = null;
+    latestQRDataUrl = null;
+    console.log('WhatsApp Web client is ready!');
+  });
+
+  waClient.on('authenticated', function() {
+    console.log('WhatsApp authenticated.');
+  });
+
+  waClient.on('auth_failure', function(msg) {
+    console.error('WhatsApp auth failure:', msg);
+    waReady = false;
+  });
+
+  waClient.on('disconnected', function(reason) {
+    console.log('WhatsApp disconnected:', reason);
+    waReady = false;
+    setTimeout(function() {
+      console.log('Reconnecting WhatsApp...');
+      waClient.initialize().catch(function(e) { console.error('Reconnect failed:', e.message); });
+    }, 10000);
+  });
+
+  waClient.initialize().catch(function(e) {
+    console.error('WhatsApp init failed:', e.message);
+  });
+}
+
+// ============================================================
+// HTML TO IMAGE (Puppeteer)
+// ============================================================
+let browser = null;
+
+async function htmlToImage(html, width, height) {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+  }
+  var page = await browser.newPage();
+  await page.setViewport({ width: width || 800, height: height || 600 });
+  await page.setContent(html, { waitUntil: 'networkidle0' });
+  var bodyHandle = await page.$('body');
+  var boundingBox = await bodyHandle.boundingBox();
+  var screenshot = await page.screenshot({
+    clip: { x: 0, y: 0, width: boundingBox.width, height: boundingBox.height },
+    type: 'png',
+  });
+  await page.close();
+  return screenshot;
+}
+
+// ============================================================
+// LEDGER DATA PROCESSING
+// ============================================================
+async function getLedgerData(dateStr) {
+  var rows = await readSheet('Ledger!A:L');
+  var targetDate = dateStr || new Date().toISOString().split('T')[0];
+  var entries = [];
+
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row[0] || !row[5]) continue; // skip empty rows
+    var cellDate = parseSheetDate(row[0]);
+    if (!cellDate) continue;
+    var formatted = cellDate.toISOString().split('T')[0];
+    if (formatted === targetDate) {
+      entries.push({
+        date: cellDate,
+        entity: row[1] || '',
+        head: row[2] || '',
+        description: row[3] || '',
+        tag: row[4] || '',
+        inOut: row[5] || '',
+        amount: parseAmount(row[6]),
+        mode: row[7] || '',
+        person: row[8] || '',
+        bankAC: row[9] || '',
+        transferTo: row[10] || '',
+        notes: row[11] || '',
+      });
+    }
+  }
+  return entries;
+}
+
+function parseSheetDate(val) {
+  if (!val) return null;
+  if (val instanceof Date) return val;
+  var str = val.toString().trim();
+  // Handle DD/MM/YYYY or DD.MM.YY
+  var parts = str.split(/[\/\.\-]/);
+  if (parts.length === 3) {
+    var d = parseInt(parts[0]);
+    var m = parseInt(parts[1]);
+    var y = parseInt(parts[2]);
+    if (y < 100) y += 2000;
+    if (d > 0 && d <= 31 && m > 0 && m <= 12) return new Date(y, m - 1, d);
+  }
+  // Try native parse
+  var parsed = new Date(val);
+  if (!isNaN(parsed.getTime())) return parsed;
+  return null;
+}
+
+function parseAmount(val) {
+  if (typeof val === 'number') return val;
+  if (!val) return 0;
+  var num = parseFloat(String(val).replace(/,/g, '').replace(/[^0-9.\-]/g, ''));
+  return isNaN(num) ? 0 : num;
+}
+
+// ============================================================
+// FUND POSITION DATA
+// ============================================================
+async function getFundPosition() {
+  var rows = await readSheet('Fund Position!A4:J27');
+  var accounts = [];
+  for (var i = 1; i < rows.length; i++) {
+    var row = rows[i];
+    if (!row[1] || row[1] === 'TOTAL') continue;
+    accounts.push({
+      num: row[0] || '',
+      company: row[1] || '',
+      bankAC: row[2] || '',
+      opening: parseAmount(row[3]),
+      todayIn: parseAmount(row[4]),
+      todayOut: parseAmount(row[5]),
+      closing: parseAmount(row[6]),
+      cheques: parseAmount(row[7]),
+      netBal: parseAmount(row[8]),
+      status: row[9] || 'Usable',
+    });
+  }
+  return accounts;
+}
+
+// ============================================================
+// APPROVAL AUDIT SYSTEM
+// ============================================================
+function parseResponse(text) {
+  if (!text) return 'pending';
+  var lower = text.toLowerCase().trim();
+
+  // Yes patterns
+  if (lower === 'yes' || lower === 'ok' || lower === 'approved' || lower === 'done' ||
+      lower === 'go ahead' || lower === 'proceed' || lower === 'haan' || lower === 'ha' ||
+      lower === 'theek hai' || lower === 'thik hai' || lower === 'kar do' ||
+      lower === 'y' || lower === 'han' || lower === 'okay') return 'yes';
+
+  // Emoji patterns
+  if (lower.includes('\u{1F44D}') || lower.includes('\u2705')) return 'yes';
+  if (lower.includes('\u274C}') || lower.includes('\u{1F44E}')) return 'no';
+
+  // No patterns
+  if (lower === 'no' || lower === 'nahi' || lower === 'nah' || lower === 'rejected' ||
+      lower === 'cancel' || lower === 'mat karo' || lower === 'n' || lower === 'nope') return 'no';
+
+  // Hold patterns
+  if (lower === 'hold' || lower === 'wait' || lower === 'ruko' || lower === 'later' ||
+      lower === 'baad mein' || lower === 'not now' || lower === 'pending' ||
+      lower.includes('hold') || lower.includes('wait') || lower.includes('ruk')) return 'hold';
+
+  return 'other';
+}
+
+function parseExpenseMessage(body) {
+  if (!body) return { vendor: '', amount: 0 };
+
+  // Try to extract amount (look for numbers with L/Lac/Lakh/Cr/Rs patterns)
+  var amountMatch = body.match(/(?:rs\.?\s*|inr\s*|amount\s*:?\s*)?(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i);
+  var amount = 0;
+  if (amountMatch) {
+    amount = parseFloat(amountMatch[1].replace(/,/g, ''));
+    if (/cr|crore/i.test(amountMatch[0])) amount *= 10000000;
+    else if (/lac|lakh|lacs|l\b/i.test(amountMatch[0])) amount *= 100000;
+  } else {
+    // Try plain number with Rs
+    var rsMatch = body.match(/(?:rs\.?\s*|inr\s*)(\d[\d,]*\.?\d*)/i);
+    if (rsMatch) amount = parseFloat(rsMatch[1].replace(/,/g, ''));
+  }
+
+  // Vendor is harder — use the first line or the whole body
+  var lines = body.split('\n');
+  var vendor = lines[0].substring(0, 100);
+
+  return { vendor: vendor, amount: amount };
+}
+
+async function fetchApprovalMessages(days) {
+  if (!waReady || !waClient) throw new Error('WhatsApp not connected');
+  if (!CONFIG.APPROVAL_GROUP_JID) throw new Error('APPROVAL_GROUP_JID not set. Use /api/groups to find it.');
+
+  var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
+  var messages = await chat.fetchMessages({ limit: 500 });
+
+  var cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - (days || 15));
+
+  return messages.filter(function(msg) {
+    return new Date(msg.timestamp * 1000) >= cutoff;
+  });
+}
+
+async function buildApprovalAudit(days) {
+  var messages = await fetchApprovalMessages(days || 15);
+  var expenses = [];
+  var replyMap = {};
+
+  for (var i = 0; i < messages.length; i++) {
+    var msg = messages[i];
+    var sender = (msg.author || msg.from || '').replace('@c.us', '').replace('@s.whatsapp.net', '');
+    var msgDate = new Date(msg.timestamp * 1000);
+    var body = (msg.body || '').trim();
+
+    var quotedMsgId = null;
+    if (msg.hasQuotedMsg) {
+      try {
+        var quoted = await msg.getQuotedMessage();
+        quotedMsgId = quoted.id._serialized || quoted.id.id;
+      } catch (e) { /* ignore */ }
+    }
+
+    if (quotedMsgId) {
+      if (!replyMap[quotedMsgId]) replyMap[quotedMsgId] = { mm: null, sm: null };
+      var response = parseResponse(body);
+
+      if (sender === CONFIG.MM_PHONE || sender.endsWith(CONFIG.MM_PHONE.slice(-10))) {
+        replyMap[quotedMsgId].mm = { response: response, date: msgDate, raw: body };
+      }
+      if (sender === CONFIG.SM_PHONE || sender.endsWith(CONFIG.SM_PHONE.slice(-10))) {
+        replyMap[quotedMsgId].sm = { response: response, date: msgDate, raw: body };
+      }
+    } else {
+      var msgId = msg.id._serialized || msg.id.id;
+      var parsed = parseExpenseMessage(body);
+      expenses.push({
+        id: msgId,
+        date: msgDate,
+        body: body,
+        sender: sender,
+        vendor: parsed.vendor,
+        amount: parsed.amount,
+        mmApproval: null,
+        smApproval: null,
+        status: { mm: 'pending', sm: 'pending' },
+      });
+    }
+  }
+
+  // Match replies to expenses
+  for (var j = 0; j < expenses.length; j++) {
+    var replies = replyMap[expenses[j].id];
+    if (replies) {
+      expenses[j].mmApproval = replies.mm;
+      expenses[j].smApproval = replies.sm;
+      expenses[j].status.mm = replies.mm ? replies.mm.response : 'pending';
+      expenses[j].status.sm = replies.sm ? replies.sm.response : 'pending';
+    }
+  }
+
+  // Categorize
+  var result = {
+    fullyApproved: [],
+    partialApproval: [],
+    noApproval: [],
+    onHold: [],
+    rejected: [],
+    allExpenses: expenses,
+    totalExpenses: expenses.length,
+    fetchedDays: days || 15,
+  };
+
+  for (var k = 0; k < expenses.length; k++) {
+    var e = expenses[k];
+    var mm = e.status.mm;
+    var sm = e.status.sm;
+
+    if (mm === 'no' || sm === 'no') {
+      result.rejected.push(e);
+    } else if (mm === 'hold' || sm === 'hold') {
+      result.onHold.push(e);
+    } else if (mm === 'yes' && sm === 'yes') {
+      result.fullyApproved.push(e);
+    } else if (mm === 'yes' || sm === 'yes') {
+      result.partialApproval.push(e);
+    } else {
+      result.noApproval.push(e);
+    }
+  }
+
+  return result;
+}
+
+// ============================================================
+// API ENDPOINTS
+// ============================================================
+
+app.get('/health', function(req, res) {
+  res.json({
+    status: 'ok',
+    whatsapp: waReady ? 'connected' : 'disconnected',
+    sheets: sheetsApi ? 'initialized' : 'not configured',
+    botEnabled: CONFIG.BOT_ENABLED,
+    approvalGroup: CONFIG.APPROVAL_GROUP_JID ? 'configured' : 'not set',
+  });
+});
+
+app.get('/api/pair', function(req, res) {
+  if (waReady) return res.send('<h1>Already connected to WhatsApp</h1>');
+  if (!latestQRDataUrl) return res.send('<h1>No QR code yet. Wait a moment and refresh.</h1>');
+  res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111">' +
+    '<div style="text-align:center"><h1 style="color:white">Scan QR Code with WhatsApp</h1>' +
+    '<img src="' + latestQRDataUrl + '" style="width:300px;height:300px" />' +
+    '<p style="color:#888">Open WhatsApp > Settings > Linked Devices > Link a Device</p></div></body></html>');
+});
+
+app.get('/api/wa-status', function(req, res) {
+  res.json({ connected: waReady, hasQR: !!latestQR });
+});
+
+app.get('/api/groups', async function(req, res) {
+  if (!waReady) return res.json({ error: 'WhatsApp not connected' });
+  try {
+    var chats = await waClient.getChats();
+    var groups = chats.filter(function(c) { return c.isGroup; }).map(function(c) {
+      return { name: c.name, jid: c.id._serialized, participants: c.participants ? c.participants.length : 0 };
+    });
+    res.json({ groups: groups });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+app.get('/api/bot/on', function(req, res) {
+  CONFIG.BOT_ENABLED = true;
+  res.json({ botEnabled: true });
+});
+
+app.get('/api/bot/off', function(req, res) {
+  CONFIG.BOT_ENABLED = false;
+  res.json({ botEnabled: false });
+});
+
+app.get('/api/ledger', async function(req, res) {
+  try {
+    var date = req.query.date || new Date().toISOString().split('T')[0];
+    var entries = await getLedgerData(date);
+    var totalIn = 0, totalOut = 0;
+    entries.forEach(function(e) {
+      if (e.inOut === 'IN') totalIn += e.amount;
+      if (e.inOut === 'OUT') totalOut += e.amount;
+    });
+    res.json({ date: date, entries: entries, totalIn: totalIn, totalOut: totalOut, net: totalIn - totalOut });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+app.get('/api/fund-position', async function(req, res) {
+  try {
+    var accounts = await getFundPosition();
+    res.json({ accounts: accounts });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ============================================================
+// APPROVAL AUDIT ENDPOINT
+// ============================================================
+app.get('/api/approval-audit', async function(req, res) {
+  try {
+    var days = parseInt(req.query.days) || 15;
+    var audit = await buildApprovalAudit(days);
+
+    var summary = {
+      period: days + ' days',
+      totalExpenses: audit.totalExpenses,
+      fullyApproved: audit.fullyApproved.length,
+      partialApproval: audit.partialApproval.length,
+      noApproval: audit.noApproval.length,
+      onHold: audit.onHold.length,
+      rejected: audit.rejected.length,
+    };
+
+    var formatExpense = function(e) {
+      return {
+        date: e.date.toISOString().split('T')[0],
+        message: e.body.substring(0, 200),
+        vendor: e.vendor,
+        amount: e.amount,
+        mm: e.status.mm,
+        sm: e.status.sm,
+        mmRaw: e.mmApproval ? e.mmApproval.raw : null,
+        smRaw: e.smApproval ? e.smApproval.raw : null,
+      };
+    };
+
+    res.json({
+      summary: summary,
+      fullyApproved: audit.fullyApproved.map(formatExpense),
+      partialApproval: audit.partialApproval.map(formatExpense),
+      noApproval: audit.noApproval.map(formatExpense),
+      onHold: audit.onHold.map(formatExpense),
+      rejected: audit.rejected.map(formatExpense),
+    });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ============================================================
+// DAILY REPORT GENERATION
+// ============================================================
+async function generateDailyReport(dateStr) {
+  var entries = await getLedgerData(dateStr);
+  var fundPosition = await getFundPosition();
+
+  var totalIn = 0, totalOut = 0;
+  var inflows = [], outflows = [];
+
+  entries.forEach(function(e) {
+    if (e.inOut === 'IN') { totalIn += e.amount; inflows.push(e); }
+    if (e.inOut === 'OUT') { totalOut += e.amount; outflows.push(e); }
+  });
+
+  // Group outflows by tag
+  var byTag = {};
+  outflows.forEach(function(e) {
+    var tag = e.tag || 'Other';
+    if (!byTag[tag]) byTag[tag] = { total: 0, items: [] };
+    byTag[tag].total += e.amount;
+    byTag[tag].items.push(e);
+  });
+
+  return {
+    date: dateStr,
+    totalIn: totalIn,
+    totalOut: totalOut,
+    net: totalIn - totalOut,
+    inflows: inflows,
+    outflows: outflows,
+    byTag: byTag,
+    fundPosition: fundPosition,
+    entryCount: entries.length,
+  };
+}
+
+function formatINR(num) {
+  if (!num) return '0';
+  var isNeg = num < 0;
+  num = Math.abs(Math.round(num));
+  var str = num.toString();
+  var lastThree = str.substring(str.length - 3);
+  var otherNumbers = str.substring(0, str.length - 3);
+  if (otherNumbers !== '') lastThree = ',' + lastThree;
+  var formatted = otherNumbers.replace(/\B(?=(\d{2})+(?!\d))/g, ',') + lastThree;
+  return (isNeg ? '-' : '') + formatted;
+}
+
+function buildReportHTML(data) {
+  var html = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>';
+  html += 'body{font-family:Arial,sans-serif;background:#fff;padding:20px;max-width:800px;margin:0 auto;color:#222}';
+  html += '.hdr{text-align:center;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:15px}';
+  html += '.hdr h1{font-size:22px;margin:0}';
+  html += '.hdr p{color:#666;margin:4px 0 0}';
+  html += '.metrics{display:flex;gap:10px;margin:15px 0}';
+  html += '.mc{flex:1;background:#f5f5f5;border-radius:8px;padding:12px;text-align:center}';
+  html += '.mc .lbl{font-size:11px;color:#888}';
+  html += '.mc .val{font-size:20px;font-weight:bold;margin:4px 0 0}';
+  html += '.gn{color:#0a7}';
+  html += '.rd{color:#c33}';
+  html += '.bl{color:#36a}';
+  html += '.sec{font-size:14px;font-weight:bold;color:#555;border-bottom:1px solid #ddd;padding:8px 0 4px;margin:15px 0 8px}';
+  html += 'table{width:100%;border-collapse:collapse;font-size:12px}';
+  html += 'th{text-align:left;padding:5px;background:#f0f0f0;font-size:11px;color:#666}';
+  html += 'td{padding:5px;border-top:1px solid #eee}';
+  html += '.amt{text-align:right;font-family:monospace}';
+  html += '.tot{font-weight:bold;background:#f5f5f5}';
+  html += '</style></head><body>';
+
+  html += '<div class="hdr"><h1>Fidato Group - Daily MIS Report</h1>';
+  html += '<p>' + data.date + ' | ' + data.entryCount + ' transactions</p></div>';
+
+  html += '<div class="metrics">';
+  html += '<div class="mc"><div class="lbl">Total Inflows</div><div class="val gn">' + formatINR(data.totalIn) + '</div></div>';
+  html += '<div class="mc"><div class="lbl">Total Outflows</div><div class="val rd">' + formatINR(data.totalOut) + '</div></div>';
+  html += '<div class="mc"><div class="lbl">Net Movement</div><div class="val ' + (data.net >= 0 ? 'bl' : 'rd') + '">' + formatINR(data.net) + '</div></div>';
+  html += '</div>';
+
+  // Inflows table
+  if (data.inflows.length > 0) {
+    html += '<div class="sec">INFLOWS</div><table>';
+    html += '<tr><th>Description</th><th>Entity</th><th>Tag</th><th>Bank A/C</th><th style="text-align:right">Amount</th></tr>';
+    data.inflows.forEach(function(e) {
+      html += '<tr><td>' + e.description + '</td><td>' + e.entity + '</td><td>' + e.tag + '</td><td>' + e.bankAC + '</td><td class="amt gn">' + formatINR(e.amount) + '</td></tr>';
+    });
+    html += '</table>';
+  }
+
+  // Outflows by tag
+  html += '<div class="sec">OUTFLOWS BY CATEGORY</div><table>';
+  html += '<tr><th>Category</th><th>Items</th><th style="text-align:right">Amount</th></tr>';
+  var tags = Object.keys(data.byTag).sort(function(a, b) { return data.byTag[b].total - data.byTag[a].total; });
+  tags.forEach(function(tag) {
+    html += '<tr><td>' + tag + '</td><td>' + data.byTag[tag].items.length + '</td><td class="amt rd">' + formatINR(data.byTag[tag].total) + '</td></tr>';
+  });
+  html += '</table>';
+
+  // Fund Position
+  html += '<div class="sec">FUND POSITION</div><table>';
+  html += '<tr><th>Account</th><th style="text-align:right">Opening</th><th style="text-align:right">IN</th><th style="text-align:right">OUT</th><th style="text-align:right">Closing</th><th style="text-align:right">Cheques</th><th style="text-align:right">Net</th></tr>';
+  data.fundPosition.forEach(function(a) {
+    html += '<tr><td>' + a.bankAC + '</td>';
+    html += '<td class="amt">' + formatINR(a.opening) + '</td>';
+    html += '<td class="amt gn">' + formatINR(a.todayIn) + '</td>';
+    html += '<td class="amt rd">' + formatINR(a.todayOut) + '</td>';
+    html += '<td class="amt">' + formatINR(a.closing) + '</td>';
+    html += '<td class="amt rd">' + formatINR(a.cheques) + '</td>';
+    html += '<td class="amt ' + (a.netBal < 0 ? 'rd' : '') + '">' + formatINR(a.netBal) + '</td></tr>';
+  });
+  html += '</table>';
+
+  html += '</body></html>';
+  return html;
+}
+
+app.get('/api/preview', async function(req, res) {
+  try {
+    var date = req.query.date || new Date().toISOString().split('T')[0];
+    var data = await generateDailyReport(date);
+    var html = buildReportHTML(data);
+    res.send(html);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/preview-image', async function(req, res) {
+  try {
+    var date = req.query.date || new Date().toISOString().split('T')[0];
+    var data = await generateDailyReport(date);
+    var html = buildReportHTML(data);
+    var imgBuffer = await htmlToImage(html, 800, 1200);
+    res.set('Content-Type', 'image/png');
+    res.send(imgBuffer);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/daily-report', async function(req, res) {
+  try {
+    if (!waReady) return res.json({ error: 'WhatsApp not connected' });
+    if (!CONFIG.BOT_ENABLED) return res.json({ error: 'Bot is paused' });
+
+    var date = req.query.date || new Date().toISOString().split('T')[0];
+    var data = await generateDailyReport(date);
+    var html = buildReportHTML(data);
+    var imgBuffer = await htmlToImage(html, 800, 1200);
+
+    // Send to WhatsApp group
+    var media = new MessageMedia('image/png', imgBuffer.toString('base64'), 'MIS_Report_' + date + '.png');
+    await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID, media, {
+      caption: 'Fidato Group MIS Report - ' + date + '\nIN: ' + formatINR(data.totalIn) + ' | OUT: ' + formatINR(data.totalOut) + ' | NET: ' + formatINR(data.net),
+    });
+
+    res.json({ success: true, date: date, sentTo: CONFIG.WHATSAPP_GROUP_JID });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/test-send', async function(req, res) {
+  try {
+    if (!waReady) return res.json({ error: 'WhatsApp not connected' });
+    await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID, 'MIS Bot test - ' + new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
+    res.json({ success: true });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+app.get('/api/report-status', function(req, res) {
+  res.json({ botEnabled: CONFIG.BOT_ENABLED, whatsapp: waReady });
+});
+
+// ============================================================
+// CRON SCHEDULE (IST)
+// ============================================================
+// 7PM IST = 1:30 PM UTC
+cron.schedule('30 13 * * *', function() {
+  if (!CONFIG.BOT_ENABLED || !waReady) return;
+  var today = new Date().toISOString().split('T')[0];
+  generateDailyReport(today).then(function(data) {
+    if (data.entryCount > 0) {
+      var html = buildReportHTML(data);
+      htmlToImage(html, 800, 1200).then(function(img) {
+        var media = new MessageMedia('image/png', img.toString('base64'), 'MIS_Report.png');
+        waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID, media, {
+          caption: 'Evening MIS Report - ' + today + '\nIN: ' + formatINR(data.totalIn) + ' | OUT: ' + formatINR(data.totalOut),
+        });
+      });
+    }
+  }).catch(function(e) { console.error('Cron report error:', e.message); });
+}, { timezone: 'Asia/Kolkata' });
+
+// 9AM IST = 3:30 AM UTC (morning report for yesterday)
+cron.schedule('30 3 * * *', function() {
+  if (!CONFIG.BOT_ENABLED || !waReady) return;
+  var yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  var dateStr = yesterday.toISOString().split('T')[0];
+  generateDailyReport(dateStr).then(function(data) {
+    if (data.entryCount > 0) {
+      var html = buildReportHTML(data);
+      htmlToImage(html, 800, 1200).then(function(img) {
+        var media = new MessageMedia('image/png', img.toString('base64'), 'MIS_Report.png');
+        waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID, media, {
+          caption: 'Morning Summary (Yesterday) - ' + dateStr + '\nIN: ' + formatINR(data.totalIn) + ' | OUT: ' + formatINR(data.totalOut),
+        });
+      });
+    }
+  }).catch(function(e) { console.error('Cron morning error:', e.message); });
+}, { timezone: 'Asia/Kolkata' });
+
+// ============================================================
+// START SERVER
+// ============================================================
+initGoogleSheets();
+createWhatsAppClient();
+
+app.listen(CONFIG.PORT, function() {
+  console.log('\n========================================');
+  console.log('Fidato MIS Report Server v2.0');
+  console.log('========================================');
+  console.log('Port: ' + CONFIG.PORT);
+  console.log('Sheet: ' + CONFIG.SHEET_ID);
+  console.log('Day Book Group: ' + CONFIG.WHATSAPP_GROUP_JID);
+  console.log('Approval Group: ' + (CONFIG.APPROVAL_GROUP_JID || 'NOT SET'));
+  console.log('MM Phone: ' + CONFIG.MM_PHONE);
+  console.log('SM Phone: ' + CONFIG.SM_PHONE);
+  console.log('\nEndpoints:');
+  console.log('  GET /health');
+  console.log('  GET /api/pair');
+  console.log('  GET /api/groups');
+  console.log('  GET /api/wa-status');
+  console.log('  GET /api/bot/on | /api/bot/off');
+  console.log('  GET /api/ledger?date=2026-04-30');
+  console.log('  GET /api/fund-position');
+  console.log('  GET /api/preview?date=2026-04-30');
+  console.log('  GET /api/preview-image?date=2026-04-30');
+  console.log('  GET /api/daily-report?date=2026-04-30');
+  console.log('  GET /api/approval-audit?days=15');
+  console.log('  GET /api/test-send');
+  console.log('\nSchedule (IST): 7PM daily report, 9AM morning summary');
+  console.log('========================================\n');
+});
