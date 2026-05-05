@@ -1,21 +1,18 @@
 {
   "name": "fidato-mis-tracker",
-  "version": "3.0.0",
-  "description": "Fidato Group MIS Tracker — daily WhatsApp reports (single-file build)",
+  "version": "2.0.0",
+  "description": "Fidato Group MIS Daily Report + Approval Audit Server",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "node -e \"const {execSync}=require('child_process');try{execSync('npx puppeteer browsers install chrome',{stdio:'inherit'})}catch(e){console.warn('postinstall: chrome download skipped',e.message)}\""
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "googleapis": "^144.0.0",
-    "node-cron": "^3.0.3",
-    "puppeteer": "^23.5.0",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.26.0"
+    "express": "^4.18.2",
+    "googleapis": "^118.0.0",
+    "node-fetch": "^2.6.9",
+    "node-cron": "^3.0.2",
+    "whatsapp-web.js": "^1.26.1-alpha.1",
+    "qrcode": "^1.5.3",
+    "puppeteer": "^21.6.1"
   }
 }
