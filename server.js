@@ -134,30 +134,54 @@ function parseResponse(text) {
   return 'other';
 }
 
+// Extract amount from a single line of text. Returns 0 if none found.
+function extractLineAmount(line) {
+  var am=line.match(/(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i);
+  if(am){var a=parseFloat(am[1].replace(/,/g,'')); return /cr|crore/i.test(am[0])?a*10000000:a*100000;}
+  var pm=line.match(/(\d[\d,]{4,})\/?\-/);
+  if(pm) return parseFloat(pm[1].replace(/,/g,''));
+  var rm=line.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
+  if(rm) return parseFloat(rm[1].replace(/,/g,''));
+  var lm=line.match(/\b(\d{5,}(?:[,\d]*)?)\b/);
+  if(lm){var v=parseFloat(lm[1].replace(/,/g,'')); if(v>=10000&&v<1000000000)return v;}
+  return 0;
+}
+
+// Extract vendor name from a line once the amount is stripped out
+function extractLineVendor(line) {
+  return line
+    .replace(/(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i, '')
+    .replace(/(\d[\d,]{4,})\/?\-/, '')
+    .replace(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i, '')
+    .replace(/^\s*(please approve|kindly approve|approve|for|to|on account of|on account|payment to|pay to)\s*/i, '')
+    .replace(/\s+/g,' ').trim();
+}
+
+// Parse expense message — returns an ARRAY of {vendor, amount} objects.
+// Multi-line messages where each line has its own amount → multiple items.
+// Single-amount messages → array with one item.
 function parseExpenseMessage(body) {
-  if(!body)return {vendor:'',amount:0};
-  var amount=0, allAmounts=[];
-  var lines=body.split('\n');
-  // Scan every line for amounts — handles multi-line like "3 lac to Kackar\n3 lac to Innocept"
-  for(var li=0;li<lines.length;li++){
-    var line=lines[li];
-    // Pattern 1: lac/lakh/crore units
-    var am=line.match(/(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i);
-    if(am){var a=parseFloat(am[1].replace(/,/g,'')); if(/cr|crore/i.test(am[0]))a*=10000000; else a*=100000; allAmounts.push(a); continue;}
-    // Pattern 2: Rs./INR/₹ prefix
-    var rm=line.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
-    if(rm){allAmounts.push(parseFloat(rm[1].replace(/,/g,''))); continue;}
-    // Pattern 3: plain large number with /- suffix e.g. 708708/-
-    var pm=line.match(/(\d[\d,]{4,})\/\-/);
-    if(pm){allAmounts.push(parseFloat(pm[1].replace(/,/g,''))); continue;}
-    // Pattern 4: plain large number >=10000 standalone (avoid matching phone numbers)
-    var lm=line.match(/\b(\d{5,}(?:[,\d]*)?)\b/);
-    if(lm){var v=parseFloat(lm[1].replace(/,/g,'')); if(v>=10000&&v<1000000000)allAmounts.push(v);}
+  if(!body) return [{vendor:'',amount:0}];
+  var lines=body.split('\n').map(function(l){return l.trim();}).filter(Boolean);
+
+  // Check if multiple lines each carry their own amount + a named payee
+  var itemLines=[];
+  for(var i=0;i<lines.length;i++){
+    var a=extractLineAmount(lines[i]);
+    if(a>0){
+      var v=extractLineVendor(lines[i]);
+      // Only treat as a separate item if the vendor string has meaningful content
+      if(v && v.length>1) itemLines.push({vendor:v,amount:a});
+    }
   }
-  // Use sum if multi-line (e.g. 3L + 3L = 6L), else single value
-  if(allAmounts.length>1) amount=allAmounts.reduce(function(s,a){return s+a;},0);
-  else if(allAmounts.length===1) amount=allAmounts[0];
-  return {vendor:lines[0].substring(0,150),amount:amount};
+  // Multi-item: each line had its own amount+vendor
+  if(itemLines.length>1) return itemLines;
+
+  // Single item: aggregate all amounts found (or just the one)
+  var total=0;
+  for(var j=0;j<lines.length;j++) total+=extractLineAmount(lines[j]);
+  var vendor=extractLineVendor(lines[0])||lines[0].substring(0,150);
+  return [{vendor:vendor,amount:total}];
 }
 
 // ============================================================
@@ -182,13 +206,26 @@ async function extractFromImage(media, msgId) {
 
   if (!media || !media.data) return null;
 
-  // Whitelist common image types; skip PDFs/videos/audio for now
+  // Accept images and PDFs; skip videos/audio
   var mime = (media.mimetype || '').toLowerCase();
-  if (mime.indexOf('image/') !== 0) {
+  if (mime.indexOf('image/') !== 0 && mime !== 'application/pdf') {
     return null;
   }
 
   try {
+    // Build content block — images use 'image' type, PDFs use 'document' type
+    var isPDF = mime === 'application/pdf';
+    var mediaContentBlock;
+    if (isPDF) {
+      mediaContentBlock = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: media.data } };
+    } else {
+      mediaContentBlock = { type: 'image', source: { type: 'base64', media_type: mime, data: media.data } };
+    }
+
+    var extractPrompt = isPDF
+      ? 'This PDF is attached to an expense approval request in a WhatsApp group. It is likely an invoice, purchase order, bill, or payment challan. Extract: (1) vendor/payee name, (2) total amount in INR as a number, (3) brief purpose/description max 10 words. Set confidence to "high" if values are clearly printed. Reply with ONLY a JSON object on one line, no prose, no markdown. Format: {"vendor":"","amount":0,"purpose":"","imageType":"invoice","confidence":"high"}.'
+      : 'This image is attached to an expense approval request in a WhatsApp group. Classify it: imageType = "cheque" (any bank cheque, even cancelled), "invoice" (printed bill/invoice), "receipt" (payment receipt), "screenshot" (app screenshot), or "other". For CHEQUES: payee name is handwritten and unreliable — set vendor to "" and amount to 0 (cheques are shared as bank reference only). For INVOICES/RECEIPTS with PRINTED text: extract vendor name, total amount in INR, and purpose. Set confidence to "high" if clearly printed/typed, "low" if handwritten or blurry. Reply with ONLY a JSON object on one line, no prose, no markdown. Format: {"vendor":"","amount":0,"purpose":"","imageType":"cheque","confidence":"low"}.';
+
     var resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -201,10 +238,7 @@ async function extractFromImage(media, msgId) {
         max_tokens: 300,
         messages: [{
           role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mime, data: media.data } },
-            { type: 'text', text: 'This image is attached to an expense approval request in a WhatsApp group. Classify the image and extract data. First, identify the imageType: "cheque" (bank cheque, even cancelled), "invoice" (printed bill/invoice), "receipt" (payment receipt), "screenshot" (app/website screenshot), or "other". For CHEQUES: the payee name is handwritten and often illegible — do NOT guess it, set vendor to "". Set amount to 0 for cancelled cheques (they are shared only as bank account reference, not as expense amounts). For INVOICES and RECEIPTS with PRINTED text: extract vendor name, total amount in INR, and purpose. Set confidence to "high" if text is clearly printed/typed, "low" if handwritten or blurry. Reply with ONLY a JSON object on a single line, no prose, no markdown. Format: {"vendor":"","amount":0,"purpose":"","imageType":"cheque","confidence":"low"}. If you cannot identify a field set it to "" or 0.' }
-          ]
+          content: [ mediaContentBlock, { type: 'text', text: extractPrompt } ]
         }]
       })
     });
@@ -292,11 +326,13 @@ async function buildApprovalAudit(days) {
     } else {
       if(senderInfo.role !== 'mm' && senderInfo.role !== 'sm'){
         var msgId=msg.id._serialized||msg.id.id;
-        var parsed=parseExpenseMessage(body);
-        var vendor = parsed.vendor;
-        var amount = parsed.amount;
+        var parsedItems=parseExpenseMessage(body);
+        // parsedItems is now always an array — multi-line messages may have multiple items
+        var vendor = parsedItems[0].vendor;
+        var amount = parsedItems[0].amount;
         var purpose = '';
         var visionResult = null;
+        var subItems = parsedItems.length > 1 ? parsedItems : null; // null = single item
 
         // Always try vision when image is attached — image may confirm, correct, or supplement text body.
         // Text + image are the SAME request — merge whichever has better data per field.
@@ -330,6 +366,7 @@ async function buildApprovalAudit(days) {
           vendor:vendor||(hasMedia?'[See image]':''),
           amount:amount,
           purpose:purpose,
+          subItems:subItems, // non-null when message contains multiple line items
           hasMedia:hasMedia,
           visionParsed: visionResult ? true : false,
           mmApproval:null,
@@ -449,7 +486,7 @@ app.get('/api/approval-audit',async function(req,res){
   try{
     var days=parseInt(req.query.days)||15;
     var audit=await buildApprovalAudit(days);
-    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',purpose:e.purpose||'',hasMedia:e.hasMedia,visionParsed:e.visionParsed||false,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null};};
+    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',purpose:e.purpose||'',subItems:e.subItems||null,hasMedia:e.hasMedia,visionParsed:e.visionParsed||false,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null};};
     res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length,visionCacheSize:audit.visionCacheSize},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
   }catch(e){res.json({error:e.message});}
 });
@@ -494,4 +531,3 @@ cron.schedule('30 3 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;va
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.5 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');});
-                                                                                                                                               
