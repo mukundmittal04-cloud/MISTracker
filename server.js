@@ -25,8 +25,8 @@ const CONFIG = {
   SM_PHONE: '919873429794',
   ACCOUNTANT_PHONES: ['919873574112','919873574180','919873574192','919873574103','919773592304'],
   // Contact name patterns for MM and SM (used when LID prevents phone matching)
-  MM_NAMES: ['madhur', 'madhur mittal', 'mm', 'm'],
-  SM_NAMES: ['sumit', 'sumit mittal', 'sm', 's mittal'],
+  MM_NAMES: ['madhur', 'madhur mittal'],
+  SM_NAMES: ['sumit', 'sumit mittal'],
 };
 
 var sheetsApi = null;
