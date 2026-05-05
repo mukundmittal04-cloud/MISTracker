@@ -24,7 +24,6 @@ const CONFIG = {
   MM_PHONE: '919873095398',
   SM_PHONE: '919873429794',
   ACCOUNTANT_PHONES: ['919873574112','919873574180','919873574192','919873574103','919773592304'],
-  // Contact name patterns for MM and SM (used when LID prevents phone matching)
   MM_NAMES: ['madhur', 'madhur mittal'],
   SM_NAMES: ['sumit', 'sumit mittal'],
 };
@@ -85,7 +84,6 @@ function formatINR(num) {
   if(o!=='')l=','+l; return (neg?'-':'')+o.replace(/\B(?=(\d{2})+(?!\d))/g,',')+l;
 }
 
-// Identify sender role by resolving contact name
 async function identifySender(rawSender) {
   var role = 'unknown';
   var contactName = '';
@@ -93,10 +91,8 @@ async function identifySender(rawSender) {
     var contact = await waClient.getContactById(rawSender);
     if (contact) {
       contactName = (contact.pushname || contact.name || contact.shortName || '').toLowerCase().trim();
-      // Check if MM
       for (var i = 0; i < CONFIG.MM_NAMES.length; i++) {
         if (contactName === CONFIG.MM_NAMES[i] || contactName.indexOf(CONFIG.MM_NAMES[i]) >= 0) {
-          // Make sure it's not a partial match for SM names
           var isSM = false;
           for (var s = 0; s < CONFIG.SM_NAMES.length; s++) {
             if (contactName === CONFIG.SM_NAMES[s]) { isSM = true; break; }
@@ -104,7 +100,6 @@ async function identifySender(rawSender) {
           if (!isSM) { role = 'mm'; break; }
         }
       }
-      // Check if SM
       if (role === 'unknown') {
         for (var j = 0; j < CONFIG.SM_NAMES.length; j++) {
           if (contactName === CONFIG.SM_NAMES[j] || contactName.indexOf(CONFIG.SM_NAMES[j]) >= 0) {
@@ -138,6 +133,97 @@ function parseExpenseMessage(body) {
   return {vendor:body.split('\n')[0].substring(0,150),amount:amount};
 }
 
+// ============================================================
+// IMAGE VISION (NEW IN v2.5)
+// ============================================================
+// In-memory cache: msgId -> { vendor, amount, purpose }
+// Resets on every redeploy (acceptable since approval-audit is rebuilt from group on every run anyway)
+const visionCache = new Map();
+
+async function extractFromImage(media, msgId) {
+  // media: { mimetype, data (base64), filename }
+  // Returns: { vendor, amount, purpose } or null on failure
+
+  if (msgId && visionCache.has(msgId)) {
+    return visionCache.get(msgId);
+  }
+
+  if (!CONFIG.CLAUDE_API_KEY) {
+    console.error('[Vision] CLAUDE_API_KEY missing — cannot parse image');
+    return null;
+  }
+
+  if (!media || !media.data) return null;
+
+  // Whitelist common image types; skip PDFs/videos/audio for now
+  var mime = (media.mimetype || '').toLowerCase();
+  if (mime.indexOf('image/') !== 0) {
+    return null;
+  }
+
+  try {
+    var resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': CONFIG.CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 300,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mime, data: media.data } },
+            { type: 'text', text: 'Extract from this expense request screenshot or invoice/bill: vendor name, amount in INR (number only, no symbols/words), and brief purpose (max 10 words). If amount uses "lac/lakh" multiply by 100000. If "cr/crore" multiply by 10000000. Reply with ONLY a JSON object on a single line, no prose, no markdown, no code fences. Format: {"vendor":"...","amount":12345,"purpose":"..."}. If you cannot identify a field set it to "" or 0.' }
+          ]
+        }]
+      })
+    });
+
+    if (!resp.ok) {
+      var errText = await resp.text();
+      console.error('[Vision] API error', resp.status, errText.substring(0, 200));
+      return null;
+    }
+
+    var data = await resp.json();
+    var text = '';
+    if (data.content && data.content.length) {
+      for (var i = 0; i < data.content.length; i++) {
+        if (data.content[i].type === 'text') { text = data.content[i].text; break; }
+      }
+    }
+    if (!text) return null;
+
+    // Strip code fences if any
+    text = text.replace(/```json|```/g, '').trim();
+
+    var parsed;
+    try { parsed = JSON.parse(text); }
+    catch (e) {
+      // Try to find a JSON object substring
+      var m = text.match(/\{[^}]*\}/);
+      if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) { console.error('[Vision] JSON parse failed:', text.substring(0, 200)); return null; } }
+      else { console.error('[Vision] No JSON found in response:', text.substring(0, 200)); return null; }
+    }
+
+    var result = {
+      vendor: (parsed.vendor || '').toString().substring(0, 150),
+      amount: parseAmount(parsed.amount),
+      purpose: (parsed.purpose || '').toString().substring(0, 200)
+    };
+
+    if (msgId) visionCache.set(msgId, result);
+    console.log('[Vision] Parsed msg', msgId, '->', JSON.stringify(result));
+    return result;
+  } catch (e) {
+    console.error('[Vision] Exception:', e.message);
+    return null;
+  }
+}
+
 async function fetchApprovalMessages(days) {
   if(!waReady||!waClient)throw new Error('WhatsApp not connected');
   if(!CONFIG.APPROVAL_GROUP_JID)throw new Error('APPROVAL_GROUP_JID not set.');
@@ -163,36 +249,57 @@ async function buildApprovalAudit(days) {
     var body=(msg.body||'').trim();
     var hasMedia=msg.hasMedia||false;
 
-    // Identify who sent this message
     var senderInfo = await identifySender(rawSender);
 
     var quotedMsgId=null;
     if(msg.hasQuotedMsg){try{var q=await msg.getQuotedMessage();quotedMsgId=q.id._serialized||q.id.id;}catch(e){}}
 
     if(quotedMsgId){
-      // This is a swipe-reply
       if(!replyMap[quotedMsgId])replyMap[quotedMsgId]={mm:null,sm:null};
       var resp=parseResponse(body);
-
       if(senderInfo.role === 'mm'){
         replyMap[quotedMsgId].mm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName};
       } else if(senderInfo.role === 'sm'){
         replyMap[quotedMsgId].sm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName};
       }
-      // If role is unknown but it's a reply, ignore (could be accountant replying to each other)
     } else {
-      // Original message — if it's NOT from MM or SM, it's an expense request
       if(senderInfo.role !== 'mm' && senderInfo.role !== 'sm'){
         var msgId=msg.id._serialized||msg.id.id;
         var parsed=parseExpenseMessage(body);
+        var vendor = parsed.vendor;
+        var amount = parsed.amount;
+        var purpose = '';
+        var visionResult = null;
+
+        // Image vision: use when image present AND we don't have good text data
+        var bodyTooShort = (!body) || body.length < 20;
+        var amountMissing = amount === 0;
+        if (hasMedia && (bodyTooShort || amountMissing)) {
+          try {
+            var media = await msg.downloadMedia();
+            if (media && media.data) {
+              visionResult = await extractFromImage(media, msgId);
+              if (visionResult) {
+                if (!vendor || bodyTooShort) vendor = visionResult.vendor || vendor;
+                if (amount === 0) amount = visionResult.amount || 0;
+                purpose = visionResult.purpose || '';
+              }
+            }
+          } catch (e) {
+            console.error('[Vision] Download/parse failed for', msgId, e.message);
+          }
+        }
+
         expenses.push({
           id:msgId,
           date:msgDate,
           body:body||(hasMedia?'[Image/Media]':'[Empty]'),
           sender:senderInfo.contactName||rawSender,
-          vendor:parsed.vendor||(hasMedia?'[See image]':''),
-          amount:parsed.amount,
+          vendor:vendor||(hasMedia?'[See image]':''),
+          amount:amount,
+          purpose:purpose,
           hasMedia:hasMedia,
+          visionParsed: visionResult ? true : false,
           mmApproval:null,
           smApproval:null,
           status:{mm:'pending',sm:'pending'}
@@ -201,7 +308,6 @@ async function buildApprovalAudit(days) {
     }
   }
 
-  // Match replies to expenses
   for(var j=0;j<expenses.length;j++){
     var rep=replyMap[expenses[j].id];
     if(rep){
@@ -212,7 +318,7 @@ async function buildApprovalAudit(days) {
     }
   }
 
-  var result={fullyApproved:[],partialApproval:[],noApproval:[],onHold:[],rejected:[],allExpenses:expenses,totalExpenses:expenses.length,totalMessages:messages.length,fetchedDays:days||15};
+  var result={fullyApproved:[],partialApproval:[],noApproval:[],onHold:[],rejected:[],allExpenses:expenses,totalExpenses:expenses.length,totalMessages:messages.length,fetchedDays:days||15,visionCacheSize:visionCache.size};
   for(var k=0;k<expenses.length;k++){
     var e=expenses[k],mm=e.status.mm,sm=e.status.sm;
     if(mm==='no'||sm==='no')result.rejected.push(e);
@@ -273,7 +379,7 @@ function buildReportHTML(data){
 // ============================================================
 // ENDPOINTS
 // ============================================================
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.4',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.5',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size});});
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -301,7 +407,7 @@ app.get('/api/debug-messages',async function(req,res){
       var m=msgs[i];
       var rawSender=m.author||m.from||'';
       var info = await identifySender(rawSender);
-      result.push({rawSender:rawSender,contactName:info.contactName,role:info.role,isReply:m.hasQuotedMsg,body:(m.body||'').substring(0,100),time:new Date(m.timestamp*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})});
+      result.push({rawSender:rawSender,contactName:info.contactName,role:info.role,isReply:m.hasQuotedMsg,hasMedia:m.hasMedia,body:(m.body||'').substring(0,100),time:new Date(m.timestamp*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})});
     }
     res.json({totalMessages:result.length,mmNames:CONFIG.MM_NAMES,smNames:CONFIG.SM_NAMES,messages:result});
   }catch(e){res.json({error:e.message});}
@@ -311,25 +417,48 @@ app.get('/api/approval-audit',async function(req,res){
   try{
     var days=parseInt(req.query.days)||15;
     var audit=await buildApprovalAudit(days);
-    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',hasMedia:e.hasMedia,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null};};
-    res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
+    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',purpose:e.purpose||'',hasMedia:e.hasMedia,visionParsed:e.visionParsed||false,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null};};
+    res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length,visionCacheSize:audit.visionCacheSize},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
   }catch(e){res.json({error:e.message});}
 });
 
+// Test endpoint: parse a single image by message ID (useful for debugging vision)
+app.get('/api/vision-test',async function(req,res){
+  try{
+    if(!waReady)return res.json({error:'Not connected'});
+    var msgId = req.query.msgId;
+    if (!msgId) return res.json({error:'pass ?msgId=<full message ID>'});
+    var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
+    var msgs = await chat.fetchMessages({limit:200});
+    var target = null;
+    for (var i=0;i<msgs.length;i++) {
+      var sid = msgs[i].id._serialized || msgs[i].id.id;
+      if (sid === msgId) { target = msgs[i]; break; }
+    }
+    if (!target) return res.json({error:'message not found in last 200'});
+    if (!target.hasMedia) return res.json({error:'message has no media'});
+    var media = await target.downloadMedia();
+    if (!media) return res.json({error:'failed to download media'});
+    visionCache.delete(msgId); // force fresh parse
+    var result = await extractFromImage(media, msgId);
+    res.json({msgId:msgId, mimetype:media.mimetype, dataSize:media.data?media.data.length:0, parsed:result});
+  }catch(e){res.json({error:e.message,stack:e.stack});}
+});
+
 app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])));}catch(e){res.status(500).json({error:e.message});}});
-app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);res.set('Content-Type','image/png');res.send(img);}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){
   try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});
-  var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);
-  await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',img.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});
+  var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);
+  await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});
   res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}
 });
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.4'});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.5',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false});});
 
-cron.schedule('30 13 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var d=new Date().toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',img.toString('base64'),'MIS.png'),{caption:'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron:',e.message);});},{timezone:'Asia/Kolkata'});
-cron.schedule('30 3 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var y=new Date();y.setDate(y.getDate()-1);var d=y.toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',img.toString('base64'),'MIS.png'),{caption:'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron:',e.message);});},{timezone:'Asia/Kolkata'});
+cron.schedule('30 13 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var d=new Date().toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var buf=Buffer.isBuffer(img)?img:Buffer.from(img);waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron:',e.message);});},{timezone:'Asia/Kolkata'});
+cron.schedule('30 3 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var y=new Date();y.setDate(y.getDate()-1);var d=y.toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var buf=Buffer.isBuffer(img)?img:Buffer.from(img);waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron:',e.message);});},{timezone:'Asia/Kolkata'});
 
 initGoogleSheets();
 createWhatsAppClient();
-app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.4 | Port:',CONFIG.PORT);});
+app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.5 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');});
