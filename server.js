@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS DAILY REPORT + APPROVAL AUDIT SERVER v2.2
+// FIDATO MIS SERVER v2.3 — LID-aware approval audit
 // ============================================================
 
 const express = require('express');
@@ -23,14 +23,12 @@ const CONFIG = {
   PORT: process.env.PORT || 3000,
   MM_PHONE: '919873095398',
   SM_PHONE: '919873429794',
-  ACCOUNTANT_PHONES: [
-    '919873574112',
-    '919873574180',
-    '919873574192',
-    '919873574103',
-    '919773592304'
-  ],
+  ACCOUNTANT_PHONES: ['919873574112','919873574180','919873574192','919873574103','919773592304'],
 };
+
+// LID to Phone mapping — built at runtime from group participants
+var lidToPhone = {};
+var phoneToLid = {};
 
 var sheetsApi = null;
 function initGoogleSheets() {
@@ -55,12 +53,68 @@ function createWhatsAppClient() {
     puppeteer: { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-accelerated-2d-canvas','--no-first-run','--no-zygote','--single-process','--disable-gpu','--disable-extensions'] },
   });
   waClient.on('qr', function(qr) { latestQR = qr; qrcode.toDataURL(qr, function(err, url) { if (!err) latestQRDataUrl = url; }); console.log('QR generated. Visit /api/pair'); });
-  waClient.on('ready', function() { waReady = true; latestQR = null; latestQRDataUrl = null; console.log('WhatsApp ready!'); });
+  waClient.on('ready', function() {
+    waReady = true; latestQR = null; latestQRDataUrl = null;
+    console.log('WhatsApp ready!');
+    // Build LID mapping from approval group
+    buildLidMapping().then(function() { console.log('LID mapping built.'); }).catch(function(e) { console.error('LID mapping failed:', e.message); });
+  });
   waClient.on('authenticated', function() { console.log('WhatsApp authenticated.'); });
   waClient.on('auth_failure', function(msg) { console.error('Auth failure:', msg); waReady = false; });
   waClient.on('disconnected', function(reason) { console.log('Disconnected:', reason); waReady = false; setTimeout(function() { waClient.initialize().catch(function(e) { console.error('Reconnect failed:', e.message); }); }, 10000); });
   waClient.initialize().catch(function(e) { console.error('WA init failed:', e.message); });
 }
+
+// Build LID-to-phone mapping from group participants
+async function buildLidMapping() {
+  if (!waReady || !waClient || !CONFIG.APPROVAL_GROUP_JID) return;
+  try {
+    var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
+    if (chat.participants) {
+      for (var i = 0; i < chat.participants.length; i++) {
+        var p = chat.participants[i];
+        var userId = p.id._serialized || '';
+        var phone = userId.replace('@c.us', '').replace('@s.whatsapp.net', '');
+        // Try to get the contact to find LID
+        try {
+          var contact = await waClient.getContactById(userId);
+          if (contact) {
+            // Store mapping both ways
+            var contactId = contact.id._serialized || '';
+            if (contactId.includes('@lid')) {
+              lidToPhone[contactId.replace('@lid', '')] = phone;
+              phoneToLid[phone] = contactId.replace('@lid', '');
+            }
+            // Also map the user ID directly
+            lidToPhone[phone] = phone;
+          }
+        } catch (e) { /* skip */ }
+      }
+    }
+    console.log('LID mapping entries:', Object.keys(lidToPhone).length);
+  } catch (e) { console.error('buildLidMapping error:', e.message); }
+}
+
+// Resolve a sender ID (could be LID or phone) to a phone number
+function resolvePhone(senderId) {
+  // Remove suffixes
+  var clean = senderId.replace('@c.us', '').replace('@s.whatsapp.net', '').replace('@lid', '');
+  // Check LID map
+  if (lidToPhone[clean]) return lidToPhone[clean];
+  // If it looks like a phone number already (starts with 91 and is ~12 digits)
+  if (/^91\d{10}$/.test(clean)) return clean;
+  return clean; // return as-is
+}
+
+function phoneLast10(ph) { return ph.replace(/[^0-9]/g, '').slice(-10); }
+function isAccountant(ph) { var l = phoneLast10(resolvePhone(ph)); return CONFIG.ACCOUNTANT_PHONES.some(function(p) { return phoneLast10(p) === l; }); }
+function isMM(ph) { return phoneLast10(resolvePhone(ph)) === phoneLast10(CONFIG.MM_PHONE); }
+function isSM(ph) { return phoneLast10(resolvePhone(ph)) === phoneLast10(CONFIG.SM_PHONE); }
+
+// Since LID mapping might not work perfectly, also identify by role:
+// In the approval group, messages that are NOT replies are expense requests (from accountants)
+// Messages that ARE swipe-replies are approvals (from MM/SM)
+// We use a hybrid approach: try phone matching first, fall back to role-based logic
 
 var browserInstance = null;
 async function htmlToImage(html, width, height) {
@@ -76,8 +130,7 @@ async function htmlToImage(html, width, height) {
 }
 
 function parseSheetDate(val) {
-  if (!val) return null;
-  if (val instanceof Date) return val;
+  if (!val) return null; if (val instanceof Date) return val;
   var s = val.toString().trim(), p = s.split(/[\/\.\-]/);
   if (p.length === 3) { var d=parseInt(p[0]),m=parseInt(p[1]),y=parseInt(p[2]); if(y<100)y+=2000; if(d>0&&d<=31&&m>0&&m<=12) return new Date(y,m-1,d); }
   var x = new Date(val); return isNaN(x.getTime()) ? null : x;
@@ -88,18 +141,6 @@ function formatINR(num) {
   var l=s.substring(s.length-3), o=s.substring(0,s.length-3);
   if(o!=='')l=','+l; return (neg?'-':'')+o.replace(/\B(?=(\d{2})+(?!\d))/g,',')+l;
 }
-
-// Phone matching — extract last 10 digits and compare
-function phoneLast10(ph) {
-  var digits = ph.replace(/[^0-9]/g, '');
-  return digits.slice(-10);
-}
-function isAccountant(ph) {
-  var last10 = phoneLast10(ph);
-  return CONFIG.ACCOUNTANT_PHONES.some(function(p) { return phoneLast10(p) === last10; });
-}
-function isMM(ph) { return phoneLast10(ph) === phoneLast10(CONFIG.MM_PHONE); }
-function isSM(ph) { return phoneLast10(ph) === phoneLast10(CONFIG.SM_PHONE); }
 
 async function getLedgerData(dateStr) {
   var rows = await readSheet('Ledger!A:L');
@@ -155,18 +196,18 @@ async function fetchApprovalMessages(days) {
     catch(e){console.error('Fetch limit '+limits[i]+' failed:',e.message);break;}
   }
   var cutoff=new Date(); cutoff.setDate(cutoff.getDate()-(days||15));
-  var filtered=allMessages.filter(function(m){return new Date(m.timestamp*1000)>=cutoff;});
-  console.log('Filtered to '+filtered.length+' msgs in last '+days+' days');
-  return filtered;
+  return allMessages.filter(function(m){return new Date(m.timestamp*1000)>=cutoff;});
 }
 
 async function buildApprovalAudit(days) {
   var messages = await fetchApprovalMessages(days||15);
   var expenses = [], replyMap = {};
 
+  // First pass — identify all messages
   for(var i=0;i<messages.length;i++){
     var msg=messages[i];
-    var sender=(msg.author||msg.from||'').replace('@c.us','').replace('@s.whatsapp.net','');
+    var rawSender=(msg.author||msg.from||'');
+    var sender=rawSender.replace('@c.us','').replace('@s.whatsapp.net','').replace('@lid','');
     var msgDate=new Date(msg.timestamp*1000);
     var body=(msg.body||'').trim();
     var hasMedia=msg.hasMedia||false;
@@ -174,18 +215,64 @@ async function buildApprovalAudit(days) {
     var quotedMsgId=null;
     if(msg.hasQuotedMsg){try{var q=await msg.getQuotedMessage();quotedMsgId=q.id._serialized||q.id.id;}catch(e){}}
 
-    if(quotedMsgId&&(isMM(sender)||isSM(sender))){
+    if(quotedMsgId){
+      // This is a swipe-reply — treat as approval from MM or SM
       if(!replyMap[quotedMsgId])replyMap[quotedMsgId]={mm:null,sm:null};
       var resp=parseResponse(body);
-      if(isMM(sender))replyMap[quotedMsgId].mm={response:resp,date:msgDate,raw:body};
-      if(isSM(sender))replyMap[quotedMsgId].sm={response:resp,date:msgDate,raw:body};
-    } else if(isAccountant(sender)){
-      var msgId=msg.id._serialized||msg.id.id;
-      var parsed=parseExpenseMessage(body);
-      expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image/Media]':'[Empty]'),sender:sender,vendor:parsed.vendor||(hasMedia?'[See image]':''),amount:parsed.amount,hasMedia:hasMedia,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'}});
+
+      // Try phone-based matching first
+      var senderIsMM = isMM(sender);
+      var senderIsSM = isSM(sender);
+
+      // If LID matching didn't work, try to get contact number
+      if(!senderIsMM && !senderIsSM && rawSender.includes('@lid')){
+        try{
+          var contact = await waClient.getContactById(rawSender);
+          if(contact && contact.number){
+            senderIsMM = phoneLast10(contact.number) === phoneLast10(CONFIG.MM_PHONE);
+            senderIsSM = phoneLast10(contact.number) === phoneLast10(CONFIG.SM_PHONE);
+            // Update mapping for future use
+            lidToPhone[sender] = contact.number;
+          }
+        }catch(e){/* skip */}
+      }
+
+      if(senderIsMM) replyMap[quotedMsgId].mm={response:resp,date:msgDate,raw:body};
+      if(senderIsSM) replyMap[quotedMsgId].sm={response:resp,date:msgDate,raw:body};
+    } else {
+      // Original message — check if from accountant
+      var senderIsAccountant = isAccountant(sender);
+
+      // If LID matching didn't work, try contact lookup
+      if(!senderIsAccountant && !isMM(sender) && !isSM(sender) && rawSender.includes('@lid')){
+        try{
+          var contact2 = await waClient.getContactById(rawSender);
+          if(contact2 && contact2.number){
+            senderIsAccountant = CONFIG.ACCOUNTANT_PHONES.some(function(p){return phoneLast10(p)===phoneLast10(contact2.number);});
+            // Also check it's not MM or SM
+            if(phoneLast10(contact2.number)===phoneLast10(CONFIG.MM_PHONE)) senderIsAccountant=false;
+            if(phoneLast10(contact2.number)===phoneLast10(CONFIG.SM_PHONE)) senderIsAccountant=false;
+            lidToPhone[sender] = contact2.number;
+          }
+        }catch(e){/* skip */}
+      }
+
+      // Fallback: if we still can't identify and it's NOT a reply, treat as expense
+      // (In this group, only accountants post original messages asking for approval)
+      if(!senderIsAccountant && !isMM(sender) && !isSM(sender)){
+        // Unknown sender posting original message — likely an accountant we couldn't resolve
+        senderIsAccountant = true;
+      }
+
+      if(senderIsAccountant){
+        var msgId=msg.id._serialized||msg.id.id;
+        var parsed=parseExpenseMessage(body);
+        expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image/Media]':'[Empty]'),sender:sender,vendor:parsed.vendor||(hasMedia?'[See image]':''),amount:parsed.amount,hasMedia:hasMedia,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'}});
+      }
     }
   }
 
+  // Match replies to expenses
   for(var j=0;j<expenses.length;j++){
     var rep=replyMap[expenses[j].id];
     if(rep){expenses[j].mmApproval=rep.mm;expenses[j].smApproval=rep.sm;expenses[j].status.mm=rep.mm?rep.mm.response:'pending';expenses[j].status.sm=rep.sm?rep.sm.response:'pending';}
@@ -206,67 +293,60 @@ async function buildApprovalAudit(days) {
 // ============================================================
 // ENDPOINTS
 // ============================================================
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.2',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,approvalGroup:CONFIG.APPROVAL_GROUP_JID||'not set',accountants:CONFIG.ACCOUNTANT_PHONES.length});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.3',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,lidMappings:Object.keys(lidToPhone).length});});
 
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR... refresh in a few seconds</h1></body></html>');
-  res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Scan QR with WhatsApp</h1><img src="'+latestQRDataUrl+'" style="width:300px"/><p style="color:#888">WhatsApp > Settings > Linked Devices > Link</p></div></body></html>');
+  res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Scan QR with WhatsApp</h1><img src="'+latestQRDataUrl+'" style="width:300px"/></div></body></html>');
 });
 
 app.get('/api/wa-status',function(req,res){res.json({connected:waReady,hasQR:!!latestQR});});
-
 app.get('/api/groups',async function(req,res){
   if(!waReady)return res.json({error:'WhatsApp not connected'});
-  try{var chats=await waClient.getChats();var groups=chats.filter(function(c){return c.isGroup;}).map(function(c){return{name:c.name,jid:c.id._serialized,participants:c.participants?c.participants.length:0};});res.json({groups:groups});}
-  catch(e){res.json({error:e.message});}
+  try{var chats=await waClient.getChats();res.json({groups:chats.filter(function(c){return c.isGroup;}).map(function(c){return{name:c.name,jid:c.id._serialized};})});}catch(e){res.json({error:e.message});}
 });
-
 app.get('/api/bot/on',function(req,res){CONFIG.BOT_ENABLED=true;res.json({botEnabled:true});});
 app.get('/api/bot/off',function(req,res){CONFIG.BOT_ENABLED=false;res.json({botEnabled:false});});
 
 app.get('/api/ledger',async function(req,res){
-  try{var date=req.query.date||new Date().toISOString().split('T')[0];var entries=await getLedgerData(date);var tIn=0,tOut=0;entries.forEach(function(e){if(e.inOut==='IN')tIn+=e.amount;if(e.inOut==='OUT')tOut+=e.amount;});res.json({date:date,entries:entries,totalIn:tIn,totalOut:tOut,net:tIn-tOut,count:entries.length});}
-  catch(e){res.json({error:e.message});}
+  try{var date=req.query.date||new Date().toISOString().split('T')[0];var entries=await getLedgerData(date);var tIn=0,tOut=0;entries.forEach(function(e){if(e.inOut==='IN')tIn+=e.amount;if(e.inOut==='OUT')tOut+=e.amount;});res.json({date:date,entries:entries,totalIn:tIn,totalOut:tOut,net:tIn-tOut,count:entries.length});}catch(e){res.json({error:e.message});}
 });
-
 app.get('/api/fund-position',async function(req,res){try{res.json({accounts:await getFundPosition()});}catch(e){res.json({error:e.message});}});
 
-// DEBUG: Show raw messages from approval group with sender numbers
+// Debug: show raw messages with resolved identities
 app.get('/api/debug-messages',async function(req,res){
   try{
     if(!waReady)return res.json({error:'WhatsApp not connected'});
     var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
     var msgs = await chat.fetchMessages({limit:50});
-    var result = msgs.map(function(m){
-      var sender = (m.author||m.from||'').replace('@c.us','').replace('@s.whatsapp.net','');
-      return {
-        sender: sender,
-        senderLast10: phoneLast10(sender),
-        isAccountant: isAccountant(sender),
-        isMM: isMM(sender),
-        isSM: isSM(sender),
-        isReply: m.hasQuotedMsg,
-        hasMedia: m.hasMedia,
-        body: (m.body||'').substring(0,100),
-        timestamp: new Date(m.timestamp*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}),
-      };
-    });
-    res.json({
-      totalMessages: result.length,
-      knownAccountants: CONFIG.ACCOUNTANT_PHONES.map(function(p){return {phone:p,last10:phoneLast10(p)};}),
-      mm: {phone:CONFIG.MM_PHONE,last10:phoneLast10(CONFIG.MM_PHONE)},
-      sm: {phone:CONFIG.SM_PHONE,last10:phoneLast10(CONFIG.SM_PHONE)},
-      messages: result
-    });
+    var result = [];
+    for(var i=0;i<msgs.length;i++){
+      var m=msgs[i];
+      var rawSender=m.author||m.from||'';
+      var sender=rawSender.replace('@c.us','').replace('@s.whatsapp.net','').replace('@lid','');
+      var resolvedPhone='unknown';
+      var contactName='unknown';
+      try{
+        var c=await waClient.getContactById(rawSender);
+        if(c){resolvedPhone=c.number||'no number';contactName=c.pushname||c.name||'no name';}
+      }catch(e){resolvedPhone='lookup failed';}
+      result.push({rawSender:rawSender,sender:sender,resolvedPhone:resolvedPhone,contactName:contactName,isAccountant:isAccountant(sender)||isAccountant(resolvedPhone),isMM:isMM(sender)||isMM(resolvedPhone),isSM:isSM(sender)||isSM(resolvedPhone),isReply:m.hasQuotedMsg,body:(m.body||'').substring(0,100),time:new Date(m.timestamp*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})});
+    }
+    res.json({totalMessages:result.length,lidMappings:lidToPhone,messages:result});
   }catch(e){res.json({error:e.message});}
+});
+
+// Rebuild LID mapping manually
+app.get('/api/rebuild-lid',async function(req,res){
+  try{await buildLidMapping();res.json({success:true,mappings:lidToPhone});}catch(e){res.json({error:e.message});}
 });
 
 app.get('/api/approval-audit',async function(req,res){
   try{
     var days=parseInt(req.query.days)||15;
     var audit=await buildApprovalAudit(days);
-    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',hasMedia:e.hasMedia,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmDate:e.mmApproval?e.mmApproval.date.toISOString().split('T')[0]:null,smDate:e.smApproval?e.smApproval.date.toISOString().split('T')[0]:null};};
+    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',hasMedia:e.hasMedia,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null};};
     res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
   }catch(e){res.json({error:e.message});}
 });
@@ -280,53 +360,32 @@ async function generateDailyReport(dateStr){
 }
 
 function buildReportHTML(data){
-  var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>';
-  h+='body{font-family:Arial,sans-serif;background:#fff;padding:20px;max-width:800px;margin:0 auto;color:#222}';
-  h+='.hdr{text-align:center;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:15px}.hdr h1{font-size:22px;margin:0}.hdr p{color:#666;margin:4px 0 0}';
-  h+='.metrics{display:flex;gap:10px;margin:15px 0}.mc{flex:1;background:#f5f5f5;border-radius:8px;padding:12px;text-align:center}.mc .lbl{font-size:11px;color:#888}.mc .val{font-size:20px;font-weight:bold;margin:4px 0 0}';
-  h+='.gn{color:#0a7}.rd{color:#c33}.bl{color:#36a}.sec{font-size:14px;font-weight:bold;color:#555;border-bottom:1px solid #ddd;padding:8px 0 4px;margin:15px 0 8px}';
-  h+='table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;padding:5px;background:#f0f0f0;font-size:11px;color:#666}td{padding:5px;border-top:1px solid #eee}.amt{text-align:right;font-family:monospace}';
-  h+='</style></head><body>';
+  var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:Arial,sans-serif;background:#fff;padding:20px;max-width:800px;margin:0 auto;color:#222}.hdr{text-align:center;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:15px}.hdr h1{font-size:22px;margin:0}.hdr p{color:#666;margin:4px 0 0}.metrics{display:flex;gap:10px;margin:15px 0}.mc{flex:1;background:#f5f5f5;border-radius:8px;padding:12px;text-align:center}.mc .lbl{font-size:11px;color:#888}.mc .val{font-size:20px;font-weight:bold;margin:4px 0 0}.gn{color:#0a7}.rd{color:#c33}.bl{color:#36a}.sec{font-size:14px;font-weight:bold;color:#555;border-bottom:1px solid #ddd;padding:8px 0 4px;margin:15px 0 8px}table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;padding:5px;background:#f0f0f0;font-size:11px;color:#666}td{padding:5px;border-top:1px solid #eee}.amt{text-align:right;font-family:monospace}</style></head><body>';
   h+='<div class="hdr"><h1>Fidato Group - Daily MIS Report</h1><p>'+data.date+' | '+data.entryCount+' transactions</p></div>';
-  h+='<div class="metrics"><div class="mc"><div class="lbl">Total Inflows</div><div class="val gn">'+formatINR(data.totalIn)+'</div></div>';
-  h+='<div class="mc"><div class="lbl">Total Outflows</div><div class="val rd">'+formatINR(data.totalOut)+'</div></div>';
-  h+='<div class="mc"><div class="lbl">Net</div><div class="val '+(data.net>=0?'bl':'rd')+'">'+formatINR(data.net)+'</div></div></div>';
+  h+='<div class="metrics"><div class="mc"><div class="lbl">Total Inflows</div><div class="val gn">'+formatINR(data.totalIn)+'</div></div><div class="mc"><div class="lbl">Total Outflows</div><div class="val rd">'+formatINR(data.totalOut)+'</div></div><div class="mc"><div class="lbl">Net</div><div class="val '+(data.net>=0?'bl':'rd')+'">'+formatINR(data.net)+'</div></div></div>';
   if(data.inflows.length>0){h+='<div class="sec">INFLOWS</div><table><tr><th>Description</th><th>Entity</th><th>Tag</th><th>Bank A/C</th><th style="text-align:right">Amount</th></tr>';data.inflows.forEach(function(e){h+='<tr><td>'+e.description+'</td><td>'+e.entity+'</td><td>'+e.tag+'</td><td>'+e.bankAC+'</td><td class="amt gn">'+formatINR(e.amount)+'</td></tr>';});h+='</table>';}
   h+='<div class="sec">OUTFLOWS BY CATEGORY</div><table><tr><th>Category</th><th>Items</th><th style="text-align:right">Amount</th></tr>';
   Object.keys(data.byTag).sort(function(a,b){return data.byTag[b].total-data.byTag[a].total;}).forEach(function(t){h+='<tr><td>'+t+'</td><td>'+data.byTag[t].items.length+'</td><td class="amt rd">'+formatINR(data.byTag[t].total)+'</td></tr>';});h+='</table>';
   h+='<div class="sec">FUND POSITION</div><table><tr><th>Account</th><th style="text-align:right">Opening</th><th style="text-align:right">IN</th><th style="text-align:right">OUT</th><th style="text-align:right">Closing</th><th style="text-align:right">Cheques</th><th style="text-align:right">Net</th></tr>';
-  data.fundPosition.forEach(function(a){h+='<tr><td>'+a.bankAC+'</td><td class="amt">'+formatINR(a.opening)+'</td><td class="amt gn">'+formatINR(a.todayIn)+'</td><td class="amt rd">'+formatINR(a.todayOut)+'</td><td class="amt">'+formatINR(a.closing)+'</td><td class="amt rd">'+formatINR(a.cheques)+'</td><td class="amt '+(a.netBal<0?'rd':'')+'">'+formatINR(a.netBal)+'</td></tr>';});h+='</table>';
-  h+='</body></html>';return h;
+  data.fundPosition.forEach(function(a){h+='<tr><td>'+a.bankAC+'</td><td class="amt">'+formatINR(a.opening)+'</td><td class="amt gn">'+formatINR(a.todayIn)+'</td><td class="amt rd">'+formatINR(a.todayOut)+'</td><td class="amt">'+formatINR(a.closing)+'</td><td class="amt rd">'+formatINR(a.cheques)+'</td><td class="amt '+(a.netBal<0?'rd':'')+'">'+formatINR(a.netBal)+'</td></tr>';});h+='</table></body></html>';
+  return h;
 }
 
-app.get('/api/preview',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];res.send(buildReportHTML(await generateDailyReport(d)));}catch(e){res.status(500).json({error:e.message});}});
-app.get('/api/preview-image',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var img=await htmlToImage(buildReportHTML(await generateDailyReport(d)),800,1200);res.set('Content-Type','image/png');res.send(img);}catch(e){res.status(500).json({error:e.message});}});
-
+app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])));}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);res.set('Content-Type','image/png');res.send(img);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){
-  try{if(!waReady)return res.json({error:'WhatsApp not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});
+  try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});
   var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);
   var media=new MessageMedia('image/png',img.toString('base64'),'MIS_'+d+'.png');
   await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,media,{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});
   res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}
 });
-
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.2'});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.3'});});
 
-cron.schedule('30 13 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var d=new Date().toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var m=new MessageMedia('image/png',img.toString('base64'),'MIS.png');waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,m,{caption:'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron error:',e.message);});},{timezone:'Asia/Kolkata'});
-cron.schedule('30 3 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var y=new Date();y.setDate(y.getDate()-1);var d=y.toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var m=new MessageMedia('image/png',img.toString('base64'),'MIS.png');waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,m,{caption:'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron error:',e.message);});},{timezone:'Asia/Kolkata'});
+cron.schedule('30 13 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var d=new Date().toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',img.toString('base64'),'MIS.png'),{caption:'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron:',e.message);});},{timezone:'Asia/Kolkata'});
+cron.schedule('30 3 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var y=new Date();y.setDate(y.getDate()-1);var d=y.toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',img.toString('base64'),'MIS.png'),{caption:'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron:',e.message);});},{timezone:'Asia/Kolkata'});
 
 initGoogleSheets();
 createWhatsAppClient();
-app.listen(CONFIG.PORT,function(){
-  console.log('\n========================================');
-  console.log('Fidato MIS Server v2.2');
-  console.log('========================================');
-  console.log('Port:',CONFIG.PORT);
-  console.log('Accountants:',CONFIG.ACCOUNTANT_PHONES.join(', '));
-  console.log('MM:',CONFIG.MM_PHONE,'SM:',CONFIG.SM_PHONE);
-  console.log('\nEndpoints: /health /api/pair /api/groups /api/ledger');
-  console.log('/api/fund-position /api/preview /api/daily-report');
-  console.log('/api/approval-audit?days=15 /api/debug-messages');
-  console.log('========================================\n');
-});
+app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.3 | Port:',CONFIG.PORT,'\nEndpoints: /health /api/pair /api/groups /api/ledger /api/fund-position\n/api/preview /api/daily-report /api/approval-audit?days=15\n/api/debug-messages /api/rebuild-lid\n');});
