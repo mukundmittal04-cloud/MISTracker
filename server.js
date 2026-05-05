@@ -114,23 +114,50 @@ async function identifySender(rawSender) {
 
 function parseResponse(text) {
   if(!text)return 'pending'; var l=text.toLowerCase().trim();
-  var yes=['yes','ok','okay','approved','done','go ahead','proceed','haan','ha','han','theek hai','thik hai','kar do','karo','y','yep','yea','yeah','sure','fine','agreed','confirmed'];
-  for(var i=0;i<yes.length;i++){if(l===yes[i])return 'yes';}
+  // Question — check before yes/no so "ok?" doesn't get misread
+  var qWords=['advance to','for whom','kis ke liye','kya','kab','kaun','kitna','which vendor','which account'];
+  for(var q=0;q<qWords.length;q++){if(l.indexOf(qWords[q])>=0)return 'question';}
+  if((l.indexOf('?')>=0)&&l.length<40)return 'question'; // short question like "Advance to whom??"
+  // Yes — exact matches first, then contains (catches "ok for sunil payment", "ok kar do")
+  var yesExact=['yes','ok','okay','o','approved','done','go ahead','proceed','haan','ha','han','theek hai','thik hai','kar do','karo','y','yep','yea','yeah','sure','fine','agreed','confirmed','sahi hai','bilkul'];
+  for(var i=0;i<yesExact.length;i++){if(l===yesExact[i])return 'yes';}
   if(l.indexOf('\u{1F44D}')>=0||l.indexOf('\u2705')>=0||l.indexOf('\u{1F44C}')>=0)return 'yes';
-  var no=['no','nahi','nah','rejected','cancel','mat karo','n','nope','deny','denied','reject','nhi'];
-  for(var j=0;j<no.length;j++){if(l===no[j])return 'no';}
+  var yesContains=['ok','okay','approved','haan','theek','kar do','go ahead','proceed','done'];
+  for(var ic=0;ic<yesContains.length;ic++){if(l.indexOf(yesContains[ic])>=0)return 'yes';}
+  // No
+  var no=['no','nahi','nah','rejected','cancel','mat karo','nope','deny','denied','reject','nhi','mat','band karo'];
+  for(var j=0;j<no.length;j++){if(l===no[j]||l.indexOf(no[j])>=0)return 'no';}
   if(l.indexOf('\u274C')>=0||l.indexOf('\u{1F44E}')>=0)return 'no';
-  var hold=['hold','wait','ruko','later','baad mein','not now','pending','rukko','abhi nahi','bad me'];
+  // Hold
+  var hold=['hold','wait','ruko','later','baad mein','not now','pending','rukko','abhi nahi','bad me','kal'];
   for(var k=0;k<hold.length;k++){if(l===hold[k]||l.indexOf(hold[k])>=0)return 'hold';}
   return 'other';
 }
 
 function parseExpenseMessage(body) {
   if(!body)return {vendor:'',amount:0};
-  var am=body.match(/(?:rs\.?\s*|inr\s*|amount\s*:?\s*)?(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i), amount=0;
-  if(am){amount=parseFloat(am[1].replace(/,/g,'')); if(/cr|crore/i.test(am[0]))amount*=10000000; else if(/lac|lakh|lacs|l\b/i.test(am[0]))amount*=100000;}
-  else{var rm=body.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i); if(rm)amount=parseFloat(rm[1].replace(/,/g,''));}
-  return {vendor:body.split('\n')[0].substring(0,150),amount:amount};
+  var amount=0, allAmounts=[];
+  var lines=body.split('\n');
+  // Scan every line for amounts — handles multi-line like "3 lac to Kackar\n3 lac to Innocept"
+  for(var li=0;li<lines.length;li++){
+    var line=lines[li];
+    // Pattern 1: lac/lakh/crore units
+    var am=line.match(/(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i);
+    if(am){var a=parseFloat(am[1].replace(/,/g,'')); if(/cr|crore/i.test(am[0]))a*=10000000; else a*=100000; allAmounts.push(a); continue;}
+    // Pattern 2: Rs./INR/₹ prefix
+    var rm=line.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
+    if(rm){allAmounts.push(parseFloat(rm[1].replace(/,/g,''))); continue;}
+    // Pattern 3: plain large number with /- suffix e.g. 708708/-
+    var pm=line.match(/(\d[\d,]{4,})\/\-/);
+    if(pm){allAmounts.push(parseFloat(pm[1].replace(/,/g,''))); continue;}
+    // Pattern 4: plain large number >=10000 standalone (avoid matching phone numbers)
+    var lm=line.match(/\b(\d{5,}(?:[,\d]*)?)\b/);
+    if(lm){var v=parseFloat(lm[1].replace(/,/g,'')); if(v>=10000&&v<1000000000)allAmounts.push(v);}
+  }
+  // Use sum if multi-line (e.g. 3L + 3L = 6L), else single value
+  if(allAmounts.length>1) amount=allAmounts.reduce(function(s,a){return s+a;},0);
+  else if(allAmounts.length===1) amount=allAmounts[0];
+  return {vendor:lines[0].substring(0,150),amount:amount};
 }
 
 // ============================================================
@@ -271,18 +298,20 @@ async function buildApprovalAudit(days) {
         var purpose = '';
         var visionResult = null;
 
-        // Image vision: use when image present AND we don't have good text data
-        var bodyTooShort = (!body) || body.length < 20;
-        var amountMissing = amount === 0;
-        if (hasMedia && (bodyTooShort || amountMissing)) {
+        // Always try vision when image is attached — image may confirm, correct, or supplement text body.
+        // Text + image are the SAME request — merge whichever has better data per field.
+        if (hasMedia) {
           try {
             var media = await msg.downloadMedia();
             if (media && media.data) {
               visionResult = await extractFromImage(media, msgId);
               if (visionResult) {
-                if (!vendor || bodyTooShort) vendor = visionResult.vendor || vendor;
-                if (amount === 0) amount = visionResult.amount || 0;
-                purpose = visionResult.purpose || '';
+                // Vision wins on amount if text gave 0 or vision amount is more precise
+                if (amount === 0 && visionResult.amount > 0) amount = visionResult.amount;
+                // Vision wins on vendor if text body was empty/very short
+                if ((!vendor || body.length < 15) && visionResult.vendor) vendor = visionResult.vendor;
+                // Always take vision purpose if it adds context
+                if (visionResult.purpose) purpose = visionResult.purpose;
               }
             }
           } catch (e) {
@@ -293,7 +322,7 @@ async function buildApprovalAudit(days) {
         expenses.push({
           id:msgId,
           date:msgDate,
-          body:body||(hasMedia?'[Image/Media]':'[Empty]'),
+          body:body||(hasMedia?'[Image attached]':'[Empty]'),
           sender:senderInfo.contactName||rawSender,
           vendor:vendor||(hasMedia?'[See image]':''),
           amount:amount,
