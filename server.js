@@ -1,7 +1,5 @@
 // ============================================================
-// FIDATO MIS DAILY REPORT + APPROVAL AUDIT SERVER v2.0
-// Reads Google Sheet, generates reports, sends via WhatsApp
-// Reads approval group chat, tracks MM/SM responses
+// FIDATO MIS DAILY REPORT + APPROVAL AUDIT SERVER v2.1
 // ============================================================
 
 const express = require('express');
@@ -22,18 +20,24 @@ const CONFIG = {
   SHEET_ID: process.env.SHEET_ID || '1JDoDEk2smAJu0S3RO1WLPZ4MzGZD-_Kn1pP9K8U0J5w',
   GOOGLE_CREDENTIALS: process.env.GOOGLE_CREDENTIALS,
   WHATSAPP_GROUP_JID: process.env.WHATSAPP_GROUP_JID || '120363425432126351@g.us',
-  APPROVAL_GROUP_JID: process.env.APPROVAL_GROUP_JID || '',
+  APPROVAL_GROUP_JID: process.env.APPROVAL_GROUP_JID || '120363408304471879@g.us',
   BOT_ENABLED: process.env.BOT_ENABLED !== 'false',
   CLAUDE_API_KEY: process.env.CLAUDE_API_KEY,
   PORT: process.env.PORT || 3000,
   MM_PHONE: '919873095398',
   SM_PHONE: '919873429794',
+  ACCOUNTANT_PHONES: [
+    '919873574112',
+    '919873574180',
+    '919873574192',
+    '919873574103'
+  ],
 };
 
 // ============================================================
 // GOOGLE SHEETS API
 // ============================================================
-let sheetsApi = null;
+var sheetsApi = null;
 
 function initGoogleSheets() {
   if (!CONFIG.GOOGLE_CREDENTIALS) {
@@ -65,10 +69,10 @@ async function readSheet(range) {
 // ============================================================
 // WHATSAPP-WEB.JS CONNECTION
 // ============================================================
-let waClient = null;
-let waReady = false;
-let latestQR = null;
-let latestQRDataUrl = null;
+var waClient = null;
+var waReady = false;
+var latestQR = null;
+var latestQRDataUrl = null;
 
 function createWhatsAppClient() {
   waClient = new Client({
@@ -124,16 +128,16 @@ function createWhatsAppClient() {
 // ============================================================
 // HTML TO IMAGE (Puppeteer)
 // ============================================================
-let browser = null;
+var browserInstance = null;
 
 async function htmlToImage(html, width, height) {
-  if (!browser) {
-    browser = await puppeteer.launch({
+  if (!browserInstance) {
+    browserInstance = await puppeteer.launch({
       headless: 'new',
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
   }
-  var page = await browser.newPage();
+  var page = await browserInstance.newPage();
   await page.setViewport({ width: width || 800, height: height || 600 });
   await page.setContent(html, { waitUntil: 'networkidle0' });
   var bodyHandle = await page.$('body');
@@ -147,7 +151,60 @@ async function htmlToImage(html, width, height) {
 }
 
 // ============================================================
-// LEDGER DATA PROCESSING
+// HELPER FUNCTIONS
+// ============================================================
+function parseSheetDate(val) {
+  if (!val) return null;
+  if (val instanceof Date) return val;
+  var str = val.toString().trim();
+  var parts = str.split(/[\/\.\-]/);
+  if (parts.length === 3) {
+    var d = parseInt(parts[0]);
+    var m = parseInt(parts[1]);
+    var y = parseInt(parts[2]);
+    if (y < 100) y += 2000;
+    if (d > 0 && d <= 31 && m > 0 && m <= 12) return new Date(y, m - 1, d);
+  }
+  var parsed = new Date(val);
+  if (!isNaN(parsed.getTime())) return parsed;
+  return null;
+}
+
+function parseAmount(val) {
+  if (typeof val === 'number') return val;
+  if (!val) return 0;
+  var num = parseFloat(String(val).replace(/,/g, '').replace(/[^0-9.\-]/g, ''));
+  return isNaN(num) ? 0 : num;
+}
+
+function formatINR(num) {
+  if (!num) return '0';
+  var isNeg = num < 0;
+  num = Math.abs(Math.round(num));
+  var str = num.toString();
+  var lastThree = str.substring(str.length - 3);
+  var otherNumbers = str.substring(0, str.length - 3);
+  if (otherNumbers !== '') lastThree = ',' + lastThree;
+  var formatted = otherNumbers.replace(/\B(?=(\d{2})+(?!\d))/g, ',') + lastThree;
+  return (isNeg ? '-' : '') + formatted;
+}
+
+function isAccountant(phone) {
+  return CONFIG.ACCOUNTANT_PHONES.some(function(ph) {
+    return phone === ph || phone.endsWith(ph.slice(-10));
+  });
+}
+
+function isMM(phone) {
+  return phone === CONFIG.MM_PHONE || phone.endsWith(CONFIG.MM_PHONE.slice(-10));
+}
+
+function isSM(phone) {
+  return phone === CONFIG.SM_PHONE || phone.endsWith(CONFIG.SM_PHONE.slice(-10));
+}
+
+// ============================================================
+// LEDGER DATA
 // ============================================================
 async function getLedgerData(dateStr) {
   var rows = await readSheet('Ledger!A:L');
@@ -156,7 +213,7 @@ async function getLedgerData(dateStr) {
 
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i];
-    if (!row[0] || !row[5]) continue; // skip empty rows
+    if (!row[0] || !row[5]) continue;
     var cellDate = parseSheetDate(row[0]);
     if (!cellDate) continue;
     var formatted = cellDate.toISOString().split('T')[0];
@@ -178,32 +235,6 @@ async function getLedgerData(dateStr) {
     }
   }
   return entries;
-}
-
-function parseSheetDate(val) {
-  if (!val) return null;
-  if (val instanceof Date) return val;
-  var str = val.toString().trim();
-  // Handle DD/MM/YYYY or DD.MM.YY
-  var parts = str.split(/[\/\.\-]/);
-  if (parts.length === 3) {
-    var d = parseInt(parts[0]);
-    var m = parseInt(parts[1]);
-    var y = parseInt(parts[2]);
-    if (y < 100) y += 2000;
-    if (d > 0 && d <= 31 && m > 0 && m <= 12) return new Date(y, m - 1, d);
-  }
-  // Try native parse
-  var parsed = new Date(val);
-  if (!isNaN(parsed.getTime())) return parsed;
-  return null;
-}
-
-function parseAmount(val) {
-  if (typeof val === 'number') return val;
-  if (!val) return 0;
-  var num = parseFloat(String(val).replace(/,/g, '').replace(/[^0-9.\-]/g, ''));
-  return isNaN(num) ? 0 : num;
 }
 
 // ============================================================
@@ -238,24 +269,34 @@ function parseResponse(text) {
   if (!text) return 'pending';
   var lower = text.toLowerCase().trim();
 
-  // Yes patterns
-  if (lower === 'yes' || lower === 'ok' || lower === 'approved' || lower === 'done' ||
-      lower === 'go ahead' || lower === 'proceed' || lower === 'haan' || lower === 'ha' ||
-      lower === 'theek hai' || lower === 'thik hai' || lower === 'kar do' ||
-      lower === 'y' || lower === 'han' || lower === 'okay') return 'yes';
+  // Yes patterns (English + Hindi)
+  var yesPatterns = ['yes', 'ok', 'okay', 'approved', 'done', 'go ahead', 'proceed',
+    'haan', 'ha', 'han', 'theek hai', 'thik hai', 'kar do', 'karo',
+    'y', 'yep', 'yea', 'yeah', 'sure', 'fine', 'agreed', 'confirmed'];
+  for (var i = 0; i < yesPatterns.length; i++) {
+    if (lower === yesPatterns[i]) return 'yes';
+  }
 
-  // Emoji patterns
-  if (lower.includes('\u{1F44D}') || lower.includes('\u2705')) return 'yes';
-  if (lower.includes('\u274C}') || lower.includes('\u{1F44E}')) return 'no';
+  // Emoji yes
+  if (lower.indexOf('\u{1F44D}') >= 0 || lower.indexOf('\u2705') >= 0 ||
+      lower.indexOf('\u{1F44C}') >= 0) return 'yes';
 
   // No patterns
-  if (lower === 'no' || lower === 'nahi' || lower === 'nah' || lower === 'rejected' ||
-      lower === 'cancel' || lower === 'mat karo' || lower === 'n' || lower === 'nope') return 'no';
+  var noPatterns = ['no', 'nahi', 'nah', 'rejected', 'cancel', 'mat karo',
+    'n', 'nope', 'deny', 'denied', 'reject', 'nhi'];
+  for (var j = 0; j < noPatterns.length; j++) {
+    if (lower === noPatterns[j]) return 'no';
+  }
+
+  // Emoji no
+  if (lower.indexOf('\u274C') >= 0 || lower.indexOf('\u{1F44E}') >= 0) return 'no';
 
   // Hold patterns
-  if (lower === 'hold' || lower === 'wait' || lower === 'ruko' || lower === 'later' ||
-      lower === 'baad mein' || lower === 'not now' || lower === 'pending' ||
-      lower.includes('hold') || lower.includes('wait') || lower.includes('ruk')) return 'hold';
+  var holdPatterns = ['hold', 'wait', 'ruko', 'later', 'baad mein', 'not now',
+    'pending', 'rukko', 'abhi nahi', 'bad me'];
+  for (var k = 0; k < holdPatterns.length; k++) {
+    if (lower === holdPatterns[k] || lower.indexOf(holdPatterns[k]) >= 0) return 'hold';
+  }
 
   return 'other';
 }
@@ -263,7 +304,6 @@ function parseResponse(text) {
 function parseExpenseMessage(body) {
   if (!body) return { vendor: '', amount: 0 };
 
-  // Try to extract amount (look for numbers with L/Lac/Lakh/Cr/Rs patterns)
   var amountMatch = body.match(/(?:rs\.?\s*|inr\s*|amount\s*:?\s*)?(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i);
   var amount = 0;
   if (amountMatch) {
@@ -271,14 +311,12 @@ function parseExpenseMessage(body) {
     if (/cr|crore/i.test(amountMatch[0])) amount *= 10000000;
     else if (/lac|lakh|lacs|l\b/i.test(amountMatch[0])) amount *= 100000;
   } else {
-    // Try plain number with Rs
-    var rsMatch = body.match(/(?:rs\.?\s*|inr\s*)(\d[\d,]*\.?\d*)/i);
+    var rsMatch = body.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
     if (rsMatch) amount = parseFloat(rsMatch[1].replace(/,/g, ''));
   }
 
-  // Vendor is harder — use the first line or the whole body
   var lines = body.split('\n');
-  var vendor = lines[0].substring(0, 100);
+  var vendor = lines[0].substring(0, 150);
 
   return { vendor: vendor, amount: amount };
 }
@@ -288,14 +326,31 @@ async function fetchApprovalMessages(days) {
   if (!CONFIG.APPROVAL_GROUP_JID) throw new Error('APPROVAL_GROUP_JID not set. Use /api/groups to find it.');
 
   var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
-  var messages = await chat.fetchMessages({ limit: 500 });
+
+  // Load more history by fetching with increasing limits
+  var allMessages = [];
+  var limits = [100, 200, 500, 1000];
+
+  for (var i = 0; i < limits.length; i++) {
+    try {
+      allMessages = await chat.fetchMessages({ limit: limits[i] });
+      console.log('Fetched ' + allMessages.length + ' messages with limit ' + limits[i]);
+      if (allMessages.length < limits[i]) break;
+    } catch (e) {
+      console.error('Fetch with limit ' + limits[i] + ' failed:', e.message);
+      break;
+    }
+  }
 
   var cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - (days || 15));
 
-  return messages.filter(function(msg) {
+  var filtered = allMessages.filter(function(msg) {
     return new Date(msg.timestamp * 1000) >= cutoff;
   });
+
+  console.log('Filtered to ' + filtered.length + ' messages in last ' + days + ' days');
+  return filtered;
 }
 
 async function buildApprovalAudit(days) {
@@ -303,48 +358,59 @@ async function buildApprovalAudit(days) {
   var expenses = [];
   var replyMap = {};
 
+  // First pass: identify all messages and replies
   for (var i = 0; i < messages.length; i++) {
     var msg = messages[i];
     var sender = (msg.author || msg.from || '').replace('@c.us', '').replace('@s.whatsapp.net', '');
     var msgDate = new Date(msg.timestamp * 1000);
     var body = (msg.body || '').trim();
+    var hasMedia = msg.hasMedia || false;
 
+    // Check if this is a reply (swipe reply)
     var quotedMsgId = null;
     if (msg.hasQuotedMsg) {
       try {
         var quoted = await msg.getQuotedMessage();
         quotedMsgId = quoted.id._serialized || quoted.id.id;
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        // Could not fetch quoted message — skip
+      }
     }
 
-    if (quotedMsgId) {
+    if (quotedMsgId && (isMM(sender) || isSM(sender))) {
+      // This is a reply from MM or SM — track it as approval
       if (!replyMap[quotedMsgId]) replyMap[quotedMsgId] = { mm: null, sm: null };
       var response = parseResponse(body);
 
-      if (sender === CONFIG.MM_PHONE || sender.endsWith(CONFIG.MM_PHONE.slice(-10))) {
+      if (isMM(sender)) {
         replyMap[quotedMsgId].mm = { response: response, date: msgDate, raw: body };
       }
-      if (sender === CONFIG.SM_PHONE || sender.endsWith(CONFIG.SM_PHONE.slice(-10))) {
+      if (isSM(sender)) {
         replyMap[quotedMsgId].sm = { response: response, date: msgDate, raw: body };
       }
-    } else {
+    } else if (isAccountant(sender)) {
+      // This is a message from an accountant — treat as expense request
       var msgId = msg.id._serialized || msg.id.id;
       var parsed = parseExpenseMessage(body);
+
       expenses.push({
         id: msgId,
         date: msgDate,
-        body: body,
+        body: body || (hasMedia ? '[Image/Media attached]' : '[Empty message]'),
         sender: sender,
-        vendor: parsed.vendor,
+        senderLabel: 'Accountant',
+        vendor: parsed.vendor || (hasMedia ? '[See image]' : ''),
         amount: parsed.amount,
+        hasMedia: hasMedia,
         mmApproval: null,
         smApproval: null,
         status: { mm: 'pending', sm: 'pending' },
       });
     }
+    // All other messages (from other group members) are ignored
   }
 
-  // Match replies to expenses
+  // Second pass: match replies to expenses
   for (var j = 0; j < expenses.length; j++) {
     var replies = replyMap[expenses[j].id];
     if (replies) {
@@ -364,6 +430,7 @@ async function buildApprovalAudit(days) {
     rejected: [],
     allExpenses: expenses,
     totalExpenses: expenses.length,
+    totalMessages: messages.length,
     fetchedDays: days || 15,
   };
 
@@ -391,20 +458,22 @@ async function buildApprovalAudit(days) {
 // ============================================================
 // API ENDPOINTS
 // ============================================================
-
 app.get('/health', function(req, res) {
   res.json({
     status: 'ok',
+    version: '2.1',
     whatsapp: waReady ? 'connected' : 'disconnected',
     sheets: sheetsApi ? 'initialized' : 'not configured',
     botEnabled: CONFIG.BOT_ENABLED,
-    approvalGroup: CONFIG.APPROVAL_GROUP_JID ? 'configured' : 'not set',
+    dayBookGroup: CONFIG.WHATSAPP_GROUP_JID,
+    approvalGroup: CONFIG.APPROVAL_GROUP_JID || 'not set',
+    accountants: CONFIG.ACCOUNTANT_PHONES.length,
   });
 });
 
 app.get('/api/pair', function(req, res) {
-  if (waReady) return res.send('<h1>Already connected to WhatsApp</h1>');
-  if (!latestQRDataUrl) return res.send('<h1>No QR code yet. Wait a moment and refresh.</h1>');
+  if (waReady) return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:#0f0">WhatsApp Connected</h1><p style="color:#888">Bot is already paired and ready.</p></div></body></html>');
+  if (!latestQRDataUrl) return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Waiting for QR Code...</h1><p style="color:#888">Refresh in a few seconds.</p></div></body></html>');
   res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111">' +
     '<div style="text-align:center"><h1 style="color:white">Scan QR Code with WhatsApp</h1>' +
     '<img src="' + latestQRDataUrl + '" style="width:300px;height:300px" />' +
@@ -430,12 +499,12 @@ app.get('/api/groups', async function(req, res) {
 
 app.get('/api/bot/on', function(req, res) {
   CONFIG.BOT_ENABLED = true;
-  res.json({ botEnabled: true });
+  res.json({ botEnabled: true, message: 'Bot resumed' });
 });
 
 app.get('/api/bot/off', function(req, res) {
   CONFIG.BOT_ENABLED = false;
-  res.json({ botEnabled: false });
+  res.json({ botEnabled: false, message: 'Bot paused' });
 });
 
 app.get('/api/ledger', async function(req, res) {
@@ -447,7 +516,7 @@ app.get('/api/ledger', async function(req, res) {
       if (e.inOut === 'IN') totalIn += e.amount;
       if (e.inOut === 'OUT') totalOut += e.amount;
     });
-    res.json({ date: date, entries: entries, totalIn: totalIn, totalOut: totalOut, net: totalIn - totalOut });
+    res.json({ date: date, entries: entries, totalIn: totalIn, totalOut: totalOut, net: totalIn - totalOut, count: entries.length });
   } catch (e) {
     res.json({ error: e.message });
   }
@@ -470,31 +539,35 @@ app.get('/api/approval-audit', async function(req, res) {
     var days = parseInt(req.query.days) || 15;
     var audit = await buildApprovalAudit(days);
 
-    var summary = {
-      period: days + ' days',
-      totalExpenses: audit.totalExpenses,
-      fullyApproved: audit.fullyApproved.length,
-      partialApproval: audit.partialApproval.length,
-      noApproval: audit.noApproval.length,
-      onHold: audit.onHold.length,
-      rejected: audit.rejected.length,
-    };
-
     var formatExpense = function(e) {
       return {
         date: e.date.toISOString().split('T')[0],
-        message: e.body.substring(0, 200),
+        time: e.date.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }),
+        message: e.body.substring(0, 300),
         vendor: e.vendor,
         amount: e.amount,
+        amountFormatted: e.amount > 0 ? formatINR(e.amount) : '',
+        hasMedia: e.hasMedia,
         mm: e.status.mm,
         sm: e.status.sm,
-        mmRaw: e.mmApproval ? e.mmApproval.raw : null,
-        smRaw: e.smApproval ? e.smApproval.raw : null,
+        mmReply: e.mmApproval ? e.mmApproval.raw : null,
+        smReply: e.smApproval ? e.smApproval.raw : null,
+        mmDate: e.mmApproval ? e.mmApproval.date.toISOString().split('T')[0] : null,
+        smDate: e.smApproval ? e.smApproval.date.toISOString().split('T')[0] : null,
       };
     };
 
     res.json({
-      summary: summary,
+      summary: {
+        period: days + ' days',
+        totalMessages: audit.totalMessages,
+        totalExpenseRequests: audit.totalExpenses,
+        fullyApproved: audit.fullyApproved.length,
+        partialApproval: audit.partialApproval.length,
+        noApproval: audit.noApproval.length,
+        onHold: audit.onHold.length,
+        rejected: audit.rejected.length,
+      },
       fullyApproved: audit.fullyApproved.map(formatExpense),
       partialApproval: audit.partialApproval.map(formatExpense),
       noApproval: audit.noApproval.map(formatExpense),
@@ -521,7 +594,6 @@ async function generateDailyReport(dateStr) {
     if (e.inOut === 'OUT') { totalOut += e.amount; outflows.push(e); }
   });
 
-  // Group outflows by tag
   var byTag = {};
   outflows.forEach(function(e) {
     var tag = e.tag || 'Other';
@@ -543,18 +615,6 @@ async function generateDailyReport(dateStr) {
   };
 }
 
-function formatINR(num) {
-  if (!num) return '0';
-  var isNeg = num < 0;
-  num = Math.abs(Math.round(num));
-  var str = num.toString();
-  var lastThree = str.substring(str.length - 3);
-  var otherNumbers = str.substring(0, str.length - 3);
-  if (otherNumbers !== '') lastThree = ',' + lastThree;
-  var formatted = otherNumbers.replace(/\B(?=(\d{2})+(?!\d))/g, ',') + lastThree;
-  return (isNeg ? '-' : '') + formatted;
-}
-
 function buildReportHTML(data) {
   var html = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>';
   html += 'body{font-family:Arial,sans-serif;background:#fff;padding:20px;max-width:800px;margin:0 auto;color:#222}';
@@ -565,9 +625,7 @@ function buildReportHTML(data) {
   html += '.mc{flex:1;background:#f5f5f5;border-radius:8px;padding:12px;text-align:center}';
   html += '.mc .lbl{font-size:11px;color:#888}';
   html += '.mc .val{font-size:20px;font-weight:bold;margin:4px 0 0}';
-  html += '.gn{color:#0a7}';
-  html += '.rd{color:#c33}';
-  html += '.bl{color:#36a}';
+  html += '.gn{color:#0a7}.rd{color:#c33}.bl{color:#36a}';
   html += '.sec{font-size:14px;font-weight:bold;color:#555;border-bottom:1px solid #ddd;padding:8px 0 4px;margin:15px 0 8px}';
   html += 'table{width:100%;border-collapse:collapse;font-size:12px}';
   html += 'th{text-align:left;padding:5px;background:#f0f0f0;font-size:11px;color:#666}';
@@ -585,7 +643,6 @@ function buildReportHTML(data) {
   html += '<div class="mc"><div class="lbl">Net Movement</div><div class="val ' + (data.net >= 0 ? 'bl' : 'rd') + '">' + formatINR(data.net) + '</div></div>';
   html += '</div>';
 
-  // Inflows table
   if (data.inflows.length > 0) {
     html += '<div class="sec">INFLOWS</div><table>';
     html += '<tr><th>Description</th><th>Entity</th><th>Tag</th><th>Bank A/C</th><th style="text-align:right">Amount</th></tr>';
@@ -595,7 +652,6 @@ function buildReportHTML(data) {
     html += '</table>';
   }
 
-  // Outflows by tag
   html += '<div class="sec">OUTFLOWS BY CATEGORY</div><table>';
   html += '<tr><th>Category</th><th>Items</th><th style="text-align:right">Amount</th></tr>';
   var tags = Object.keys(data.byTag).sort(function(a, b) { return data.byTag[b].total - data.byTag[a].total; });
@@ -604,7 +660,6 @@ function buildReportHTML(data) {
   });
   html += '</table>';
 
-  // Fund Position
   html += '<div class="sec">FUND POSITION</div><table>';
   html += '<tr><th>Account</th><th style="text-align:right">Opening</th><th style="text-align:right">IN</th><th style="text-align:right">OUT</th><th style="text-align:right">Closing</th><th style="text-align:right">Cheques</th><th style="text-align:right">Net</th></tr>';
   data.fundPosition.forEach(function(a) {
@@ -656,7 +711,6 @@ app.get('/api/daily-report', async function(req, res) {
     var html = buildReportHTML(data);
     var imgBuffer = await htmlToImage(html, 800, 1200);
 
-    // Send to WhatsApp group
     var media = new MessageMedia('image/png', imgBuffer.toString('base64'), 'MIS_Report_' + date + '.png');
     await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID, media, {
       caption: 'Fidato Group MIS Report - ' + date + '\nIN: ' + formatINR(data.totalIn) + ' | OUT: ' + formatINR(data.totalOut) + ' | NET: ' + formatINR(data.net),
@@ -679,13 +733,13 @@ app.get('/api/test-send', async function(req, res) {
 });
 
 app.get('/api/report-status', function(req, res) {
-  res.json({ botEnabled: CONFIG.BOT_ENABLED, whatsapp: waReady });
+  res.json({ botEnabled: CONFIG.BOT_ENABLED, whatsapp: waReady, version: '2.1' });
 });
 
 // ============================================================
-// CRON SCHEDULE (IST)
+// CRON SCHEDULE
 // ============================================================
-// 7PM IST = 1:30 PM UTC
+// 7PM IST daily report
 cron.schedule('30 13 * * *', function() {
   if (!CONFIG.BOT_ENABLED || !waReady) return;
   var today = new Date().toISOString().split('T')[0];
@@ -702,7 +756,7 @@ cron.schedule('30 13 * * *', function() {
   }).catch(function(e) { console.error('Cron report error:', e.message); });
 }, { timezone: 'Asia/Kolkata' });
 
-// 9AM IST = 3:30 AM UTC (morning report for yesterday)
+// 9AM IST morning summary for yesterday
 cron.schedule('30 3 * * *', function() {
   if (!CONFIG.BOT_ENABLED || !waReady) return;
   var yesterday = new Date();
@@ -729,27 +783,28 @@ createWhatsAppClient();
 
 app.listen(CONFIG.PORT, function() {
   console.log('\n========================================');
-  console.log('Fidato MIS Report Server v2.0');
+  console.log('Fidato MIS Report Server v2.1');
   console.log('========================================');
   console.log('Port: ' + CONFIG.PORT);
   console.log('Sheet: ' + CONFIG.SHEET_ID);
   console.log('Day Book Group: ' + CONFIG.WHATSAPP_GROUP_JID);
-  console.log('Approval Group: ' + (CONFIG.APPROVAL_GROUP_JID || 'NOT SET'));
-  console.log('MM Phone: ' + CONFIG.MM_PHONE);
-  console.log('SM Phone: ' + CONFIG.SM_PHONE);
+  console.log('Approval Group: ' + CONFIG.APPROVAL_GROUP_JID);
+  console.log('MM: ' + CONFIG.MM_PHONE);
+  console.log('SM: ' + CONFIG.SM_PHONE);
+  console.log('Accountants: ' + CONFIG.ACCOUNTANT_PHONES.join(', '));
   console.log('\nEndpoints:');
-  console.log('  GET /health');
-  console.log('  GET /api/pair');
-  console.log('  GET /api/groups');
-  console.log('  GET /api/wa-status');
-  console.log('  GET /api/bot/on | /api/bot/off');
-  console.log('  GET /api/ledger?date=2026-04-30');
-  console.log('  GET /api/fund-position');
-  console.log('  GET /api/preview?date=2026-04-30');
-  console.log('  GET /api/preview-image?date=2026-04-30');
-  console.log('  GET /api/daily-report?date=2026-04-30');
-  console.log('  GET /api/approval-audit?days=15');
-  console.log('  GET /api/test-send');
-  console.log('\nSchedule (IST): 7PM daily report, 9AM morning summary');
+  console.log('  /health');
+  console.log('  /api/pair');
+  console.log('  /api/groups');
+  console.log('  /api/wa-status');
+  console.log('  /api/bot/on | /api/bot/off');
+  console.log('  /api/ledger?date=YYYY-MM-DD');
+  console.log('  /api/fund-position');
+  console.log('  /api/preview?date=YYYY-MM-DD');
+  console.log('  /api/preview-image?date=YYYY-MM-DD');
+  console.log('  /api/daily-report?date=YYYY-MM-DD');
+  console.log('  /api/approval-audit?days=15');
+  console.log('  /api/test-send');
+  console.log('\nSchedule: 7PM report, 9AM morning summary');
   console.log('========================================\n');
 });
