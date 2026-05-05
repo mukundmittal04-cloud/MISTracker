@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.3 — LID-aware approval audit
+// FIDATO MIS SERVER v2.4 — Name-based MM/SM identification
 // ============================================================
 
 const express = require('express');
@@ -24,11 +24,10 @@ const CONFIG = {
   MM_PHONE: '919873095398',
   SM_PHONE: '919873429794',
   ACCOUNTANT_PHONES: ['919873574112','919873574180','919873574192','919873574103','919773592304'],
+  // Contact name patterns for MM and SM (used when LID prevents phone matching)
+  MM_NAMES: ['madhur', 'madhur mittal', 'mm', 'm'],
+  SM_NAMES: ['sumit', 'sumit mittal', 'sm', 's mittal'],
 };
-
-// LID to Phone mapping — built at runtime from group participants
-var lidToPhone = {};
-var phoneToLid = {};
 
 var sheetsApi = null;
 function initGoogleSheets() {
@@ -52,69 +51,13 @@ function createWhatsAppClient() {
     authStrategy: new LocalAuth({ dataPath: './wa_auth' }),
     puppeteer: { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-accelerated-2d-canvas','--no-first-run','--no-zygote','--single-process','--disable-gpu','--disable-extensions'] },
   });
-  waClient.on('qr', function(qr) { latestQR = qr; qrcode.toDataURL(qr, function(err, url) { if (!err) latestQRDataUrl = url; }); console.log('QR generated. Visit /api/pair'); });
-  waClient.on('ready', function() {
-    waReady = true; latestQR = null; latestQRDataUrl = null;
-    console.log('WhatsApp ready!');
-    // Build LID mapping from approval group
-    buildLidMapping().then(function() { console.log('LID mapping built.'); }).catch(function(e) { console.error('LID mapping failed:', e.message); });
-  });
+  waClient.on('qr', function(qr) { latestQR = qr; qrcode.toDataURL(qr, function(err, url) { if (!err) latestQRDataUrl = url; }); console.log('QR generated.'); });
+  waClient.on('ready', function() { waReady = true; latestQR = null; latestQRDataUrl = null; console.log('WhatsApp ready!'); });
   waClient.on('authenticated', function() { console.log('WhatsApp authenticated.'); });
   waClient.on('auth_failure', function(msg) { console.error('Auth failure:', msg); waReady = false; });
-  waClient.on('disconnected', function(reason) { console.log('Disconnected:', reason); waReady = false; setTimeout(function() { waClient.initialize().catch(function(e) { console.error('Reconnect failed:', e.message); }); }, 10000); });
+  waClient.on('disconnected', function(reason) { console.log('Disconnected:', reason); waReady = false; setTimeout(function() { waClient.initialize().catch(function(e) {}); }, 10000); });
   waClient.initialize().catch(function(e) { console.error('WA init failed:', e.message); });
 }
-
-// Build LID-to-phone mapping from group participants
-async function buildLidMapping() {
-  if (!waReady || !waClient || !CONFIG.APPROVAL_GROUP_JID) return;
-  try {
-    var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
-    if (chat.participants) {
-      for (var i = 0; i < chat.participants.length; i++) {
-        var p = chat.participants[i];
-        var userId = p.id._serialized || '';
-        var phone = userId.replace('@c.us', '').replace('@s.whatsapp.net', '');
-        // Try to get the contact to find LID
-        try {
-          var contact = await waClient.getContactById(userId);
-          if (contact) {
-            // Store mapping both ways
-            var contactId = contact.id._serialized || '';
-            if (contactId.includes('@lid')) {
-              lidToPhone[contactId.replace('@lid', '')] = phone;
-              phoneToLid[phone] = contactId.replace('@lid', '');
-            }
-            // Also map the user ID directly
-            lidToPhone[phone] = phone;
-          }
-        } catch (e) { /* skip */ }
-      }
-    }
-    console.log('LID mapping entries:', Object.keys(lidToPhone).length);
-  } catch (e) { console.error('buildLidMapping error:', e.message); }
-}
-
-// Resolve a sender ID (could be LID or phone) to a phone number
-function resolvePhone(senderId) {
-  // Remove suffixes
-  var clean = senderId.replace('@c.us', '').replace('@s.whatsapp.net', '').replace('@lid', '');
-  // Check LID map
-  if (lidToPhone[clean]) return lidToPhone[clean];
-  // If it looks like a phone number already (starts with 91 and is ~12 digits)
-  if (/^91\d{10}$/.test(clean)) return clean;
-  return clean; // return as-is
-}
-
-function phoneLast10(ph) { return ph.replace(/[^0-9]/g, '').slice(-10); }
-function isAccountant(ph) { var l = phoneLast10(resolvePhone(ph)); return CONFIG.ACCOUNTANT_PHONES.some(function(p) { return phoneLast10(p) === l; }); }
-function isMM(ph) { return phoneLast10(resolvePhone(ph)) === phoneLast10(CONFIG.MM_PHONE); }
-function isSM(ph) { return phoneLast10(resolvePhone(ph)) === phoneLast10(CONFIG.SM_PHONE); }
-
-// Since LID mapping might not work perfectly, also identify by role:
-// In the approval group, messages that are NOT replies are expense requests (from accountants)
-// Messages that ARE swipe-replies are approvals (from MM/SM)
-// We use a hybrid approach: try phone matching first, fall back to role-based logic
 
 var browserInstance = null;
 async function htmlToImage(html, width, height) {
@@ -142,26 +85,36 @@ function formatINR(num) {
   if(o!=='')l=','+l; return (neg?'-':'')+o.replace(/\B(?=(\d{2})+(?!\d))/g,',')+l;
 }
 
-async function getLedgerData(dateStr) {
-  var rows = await readSheet('Ledger!A:L');
-  var target = dateStr || new Date().toISOString().split('T')[0], entries = [];
-  for (var i=0;i<rows.length;i++) {
-    var row=rows[i]; if(!row[0]||!row[5])continue;
-    var cd=parseSheetDate(row[0]); if(!cd)continue;
-    if(cd.toISOString().split('T')[0]===target) {
-      entries.push({date:cd,entity:row[1]||'',head:row[2]||'',description:row[3]||'',tag:row[4]||'',inOut:row[5]||'',amount:parseAmount(row[6]),mode:row[7]||'',person:row[8]||'',bankAC:row[9]||'',transferTo:row[10]||'',notes:row[11]||''});
+// Identify sender role by resolving contact name
+async function identifySender(rawSender) {
+  var role = 'unknown';
+  var contactName = '';
+  try {
+    var contact = await waClient.getContactById(rawSender);
+    if (contact) {
+      contactName = (contact.pushname || contact.name || contact.shortName || '').toLowerCase().trim();
+      // Check if MM
+      for (var i = 0; i < CONFIG.MM_NAMES.length; i++) {
+        if (contactName === CONFIG.MM_NAMES[i] || contactName.indexOf(CONFIG.MM_NAMES[i]) >= 0) {
+          // Make sure it's not a partial match for SM names
+          var isSM = false;
+          for (var s = 0; s < CONFIG.SM_NAMES.length; s++) {
+            if (contactName === CONFIG.SM_NAMES[s]) { isSM = true; break; }
+          }
+          if (!isSM) { role = 'mm'; break; }
+        }
+      }
+      // Check if SM
+      if (role === 'unknown') {
+        for (var j = 0; j < CONFIG.SM_NAMES.length; j++) {
+          if (contactName === CONFIG.SM_NAMES[j] || contactName.indexOf(CONFIG.SM_NAMES[j]) >= 0) {
+            role = 'sm'; break;
+          }
+        }
+      }
     }
-  }
-  return entries;
-}
-
-async function getFundPosition() {
-  var rows = await readSheet('Fund Position!A4:J27'), accounts = [];
-  for (var i=1;i<rows.length;i++) {
-    var r=rows[i]; if(!r[1]||r[1]==='TOTAL')continue;
-    accounts.push({num:r[0]||'',company:r[1]||'',bankAC:r[2]||'',opening:parseAmount(r[3]),todayIn:parseAmount(r[4]),todayOut:parseAmount(r[5]),closing:parseAmount(r[6]),cheques:parseAmount(r[7]),netBal:parseAmount(r[8]),status:r[9]||'Usable'});
-  }
-  return accounts;
+  } catch (e) { /* skip */ }
+  return { role: role, contactName: contactName };
 }
 
 function parseResponse(text) {
@@ -192,8 +145,8 @@ async function fetchApprovalMessages(days) {
   var allMessages = [];
   var limits = [100,200,500,1000];
   for(var i=0;i<limits.length;i++){
-    try{allMessages=await chat.fetchMessages({limit:limits[i]}); console.log('Fetched '+allMessages.length+' msgs (limit '+limits[i]+')'); if(allMessages.length<limits[i])break;}
-    catch(e){console.error('Fetch limit '+limits[i]+' failed:',e.message);break;}
+    try{allMessages=await chat.fetchMessages({limit:limits[i]}); if(allMessages.length<limits[i])break;}
+    catch(e){break;}
   }
   var cutoff=new Date(); cutoff.setDate(cutoff.getDate()-(days||15));
   return allMessages.filter(function(m){return new Date(m.timestamp*1000)>=cutoff;});
@@ -203,71 +156,47 @@ async function buildApprovalAudit(days) {
   var messages = await fetchApprovalMessages(days||15);
   var expenses = [], replyMap = {};
 
-  // First pass — identify all messages
   for(var i=0;i<messages.length;i++){
     var msg=messages[i];
-    var rawSender=(msg.author||msg.from||'');
-    var sender=rawSender.replace('@c.us','').replace('@s.whatsapp.net','').replace('@lid','');
+    var rawSender=msg.author||msg.from||'';
     var msgDate=new Date(msg.timestamp*1000);
     var body=(msg.body||'').trim();
     var hasMedia=msg.hasMedia||false;
+
+    // Identify who sent this message
+    var senderInfo = await identifySender(rawSender);
 
     var quotedMsgId=null;
     if(msg.hasQuotedMsg){try{var q=await msg.getQuotedMessage();quotedMsgId=q.id._serialized||q.id.id;}catch(e){}}
 
     if(quotedMsgId){
-      // This is a swipe-reply — treat as approval from MM or SM
+      // This is a swipe-reply
       if(!replyMap[quotedMsgId])replyMap[quotedMsgId]={mm:null,sm:null};
       var resp=parseResponse(body);
 
-      // Try phone-based matching first
-      var senderIsMM = isMM(sender);
-      var senderIsSM = isSM(sender);
-
-      // If LID matching didn't work, try to get contact number
-      if(!senderIsMM && !senderIsSM && rawSender.includes('@lid')){
-        try{
-          var contact = await waClient.getContactById(rawSender);
-          if(contact && contact.number){
-            senderIsMM = phoneLast10(contact.number) === phoneLast10(CONFIG.MM_PHONE);
-            senderIsSM = phoneLast10(contact.number) === phoneLast10(CONFIG.SM_PHONE);
-            // Update mapping for future use
-            lidToPhone[sender] = contact.number;
-          }
-        }catch(e){/* skip */}
+      if(senderInfo.role === 'mm'){
+        replyMap[quotedMsgId].mm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName};
+      } else if(senderInfo.role === 'sm'){
+        replyMap[quotedMsgId].sm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName};
       }
-
-      if(senderIsMM) replyMap[quotedMsgId].mm={response:resp,date:msgDate,raw:body};
-      if(senderIsSM) replyMap[quotedMsgId].sm={response:resp,date:msgDate,raw:body};
+      // If role is unknown but it's a reply, ignore (could be accountant replying to each other)
     } else {
-      // Original message — check if from accountant
-      var senderIsAccountant = isAccountant(sender);
-
-      // If LID matching didn't work, try contact lookup
-      if(!senderIsAccountant && !isMM(sender) && !isSM(sender) && rawSender.includes('@lid')){
-        try{
-          var contact2 = await waClient.getContactById(rawSender);
-          if(contact2 && contact2.number){
-            senderIsAccountant = CONFIG.ACCOUNTANT_PHONES.some(function(p){return phoneLast10(p)===phoneLast10(contact2.number);});
-            // Also check it's not MM or SM
-            if(phoneLast10(contact2.number)===phoneLast10(CONFIG.MM_PHONE)) senderIsAccountant=false;
-            if(phoneLast10(contact2.number)===phoneLast10(CONFIG.SM_PHONE)) senderIsAccountant=false;
-            lidToPhone[sender] = contact2.number;
-          }
-        }catch(e){/* skip */}
-      }
-
-      // Fallback: if we still can't identify and it's NOT a reply, treat as expense
-      // (In this group, only accountants post original messages asking for approval)
-      if(!senderIsAccountant && !isMM(sender) && !isSM(sender)){
-        // Unknown sender posting original message — likely an accountant we couldn't resolve
-        senderIsAccountant = true;
-      }
-
-      if(senderIsAccountant){
+      // Original message — if it's NOT from MM or SM, it's an expense request
+      if(senderInfo.role !== 'mm' && senderInfo.role !== 'sm'){
         var msgId=msg.id._serialized||msg.id.id;
         var parsed=parseExpenseMessage(body);
-        expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image/Media]':'[Empty]'),sender:sender,vendor:parsed.vendor||(hasMedia?'[See image]':''),amount:parsed.amount,hasMedia:hasMedia,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'}});
+        expenses.push({
+          id:msgId,
+          date:msgDate,
+          body:body||(hasMedia?'[Image/Media]':'[Empty]'),
+          sender:senderInfo.contactName||rawSender,
+          vendor:parsed.vendor||(hasMedia?'[See image]':''),
+          amount:parsed.amount,
+          hasMedia:hasMedia,
+          mmApproval:null,
+          smApproval:null,
+          status:{mm:'pending',sm:'pending'}
+        });
       }
     }
   }
@@ -275,7 +204,12 @@ async function buildApprovalAudit(days) {
   // Match replies to expenses
   for(var j=0;j<expenses.length;j++){
     var rep=replyMap[expenses[j].id];
-    if(rep){expenses[j].mmApproval=rep.mm;expenses[j].smApproval=rep.sm;expenses[j].status.mm=rep.mm?rep.mm.response:'pending';expenses[j].status.sm=rep.sm?rep.sm.response:'pending';}
+    if(rep){
+      expenses[j].mmApproval=rep.mm;
+      expenses[j].smApproval=rep.sm;
+      expenses[j].status.mm=rep.mm?rep.mm.response:'pending';
+      expenses[j].status.sm=rep.sm?rep.sm.response:'pending';
+    }
   }
 
   var result={fullyApproved:[],partialApproval:[],noApproval:[],onHold:[],rejected:[],allExpenses:expenses,totalExpenses:expenses.length,totalMessages:messages.length,fetchedDays:days||15};
@@ -291,66 +225,32 @@ async function buildApprovalAudit(days) {
 }
 
 // ============================================================
-// ENDPOINTS
+// LEDGER + FUND POSITION
 // ============================================================
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.3',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,lidMappings:Object.keys(lidToPhone).length});});
-
-app.get('/api/pair',function(req,res){
-  if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
-  if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR... refresh in a few seconds</h1></body></html>');
-  res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Scan QR with WhatsApp</h1><img src="'+latestQRDataUrl+'" style="width:300px"/></div></body></html>');
-});
-
-app.get('/api/wa-status',function(req,res){res.json({connected:waReady,hasQR:!!latestQR});});
-app.get('/api/groups',async function(req,res){
-  if(!waReady)return res.json({error:'WhatsApp not connected'});
-  try{var chats=await waClient.getChats();res.json({groups:chats.filter(function(c){return c.isGroup;}).map(function(c){return{name:c.name,jid:c.id._serialized};})});}catch(e){res.json({error:e.message});}
-});
-app.get('/api/bot/on',function(req,res){CONFIG.BOT_ENABLED=true;res.json({botEnabled:true});});
-app.get('/api/bot/off',function(req,res){CONFIG.BOT_ENABLED=false;res.json({botEnabled:false});});
-
-app.get('/api/ledger',async function(req,res){
-  try{var date=req.query.date||new Date().toISOString().split('T')[0];var entries=await getLedgerData(date);var tIn=0,tOut=0;entries.forEach(function(e){if(e.inOut==='IN')tIn+=e.amount;if(e.inOut==='OUT')tOut+=e.amount;});res.json({date:date,entries:entries,totalIn:tIn,totalOut:tOut,net:tIn-tOut,count:entries.length});}catch(e){res.json({error:e.message});}
-});
-app.get('/api/fund-position',async function(req,res){try{res.json({accounts:await getFundPosition()});}catch(e){res.json({error:e.message});}});
-
-// Debug: show raw messages with resolved identities
-app.get('/api/debug-messages',async function(req,res){
-  try{
-    if(!waReady)return res.json({error:'WhatsApp not connected'});
-    var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
-    var msgs = await chat.fetchMessages({limit:50});
-    var result = [];
-    for(var i=0;i<msgs.length;i++){
-      var m=msgs[i];
-      var rawSender=m.author||m.from||'';
-      var sender=rawSender.replace('@c.us','').replace('@s.whatsapp.net','').replace('@lid','');
-      var resolvedPhone='unknown';
-      var contactName='unknown';
-      try{
-        var c=await waClient.getContactById(rawSender);
-        if(c){resolvedPhone=c.number||'no number';contactName=c.pushname||c.name||'no name';}
-      }catch(e){resolvedPhone='lookup failed';}
-      result.push({rawSender:rawSender,sender:sender,resolvedPhone:resolvedPhone,contactName:contactName,isAccountant:isAccountant(sender)||isAccountant(resolvedPhone),isMM:isMM(sender)||isMM(resolvedPhone),isSM:isSM(sender)||isSM(resolvedPhone),isReply:m.hasQuotedMsg,body:(m.body||'').substring(0,100),time:new Date(m.timestamp*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})});
+async function getLedgerData(dateStr) {
+  var rows = await readSheet('Ledger!A:L');
+  var target = dateStr || new Date().toISOString().split('T')[0], entries = [];
+  for (var i=0;i<rows.length;i++) {
+    var row=rows[i]; if(!row[0]||!row[5])continue;
+    var cd=parseSheetDate(row[0]); if(!cd)continue;
+    if(cd.toISOString().split('T')[0]===target) {
+      entries.push({date:cd,entity:row[1]||'',head:row[2]||'',description:row[3]||'',tag:row[4]||'',inOut:row[5]||'',amount:parseAmount(row[6]),mode:row[7]||'',person:row[8]||'',bankAC:row[9]||'',transferTo:row[10]||'',notes:row[11]||''});
     }
-    res.json({totalMessages:result.length,lidMappings:lidToPhone,messages:result});
-  }catch(e){res.json({error:e.message});}
-});
+  }
+  return entries;
+}
+async function getFundPosition() {
+  var rows = await readSheet('Fund Position!A4:J27'), accounts = [];
+  for (var i=1;i<rows.length;i++) {
+    var r=rows[i]; if(!r[1]||r[1]==='TOTAL')continue;
+    accounts.push({num:r[0]||'',company:r[1]||'',bankAC:r[2]||'',opening:parseAmount(r[3]),todayIn:parseAmount(r[4]),todayOut:parseAmount(r[5]),closing:parseAmount(r[6]),cheques:parseAmount(r[7]),netBal:parseAmount(r[8]),status:r[9]||'Usable'});
+  }
+  return accounts;
+}
 
-// Rebuild LID mapping manually
-app.get('/api/rebuild-lid',async function(req,res){
-  try{await buildLidMapping();res.json({success:true,mappings:lidToPhone});}catch(e){res.json({error:e.message});}
-});
-
-app.get('/api/approval-audit',async function(req,res){
-  try{
-    var days=parseInt(req.query.days)||15;
-    var audit=await buildApprovalAudit(days);
-    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',hasMedia:e.hasMedia,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null};};
-    res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
-  }catch(e){res.json({error:e.message});}
-});
-
+// ============================================================
+// REPORT GENERATION
+// ============================================================
 async function generateDailyReport(dateStr){
   var entries=await getLedgerData(dateStr);var fp=await getFundPosition();
   var tIn=0,tOut=0,inflows=[],outflows=[];
@@ -358,7 +258,6 @@ async function generateDailyReport(dateStr){
   var byTag={};outflows.forEach(function(e){var t=e.tag||'Other';if(!byTag[t])byTag[t]={total:0,items:[]};byTag[t].total+=e.amount;byTag[t].items.push(e);});
   return{date:dateStr,totalIn:tIn,totalOut:tOut,net:tIn-tOut,inflows:inflows,outflows:outflows,byTag:byTag,fundPosition:fp,entryCount:entries.length};
 }
-
 function buildReportHTML(data){
   var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:Arial,sans-serif;background:#fff;padding:20px;max-width:800px;margin:0 auto;color:#222}.hdr{text-align:center;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:15px}.hdr h1{font-size:22px;margin:0}.hdr p{color:#666;margin:4px 0 0}.metrics{display:flex;gap:10px;margin:15px 0}.mc{flex:1;background:#f5f5f5;border-radius:8px;padding:12px;text-align:center}.mc .lbl{font-size:11px;color:#888}.mc .val{font-size:20px;font-weight:bold;margin:4px 0 0}.gn{color:#0a7}.rd{color:#c33}.bl{color:#36a}.sec{font-size:14px;font-weight:bold;color:#555;border-bottom:1px solid #ddd;padding:8px 0 4px;margin:15px 0 8px}table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;padding:5px;background:#f0f0f0;font-size:11px;color:#666}td{padding:5px;border-top:1px solid #eee}.amt{text-align:right;font-family:monospace}</style></head><body>';
   h+='<div class="hdr"><h1>Fidato Group - Daily MIS Report</h1><p>'+data.date+' | '+data.entryCount+' transactions</p></div>';
@@ -371,21 +270,66 @@ function buildReportHTML(data){
   return h;
 }
 
+// ============================================================
+// ENDPOINTS
+// ============================================================
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.4',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED});});
+app.get('/api/pair',function(req,res){
+  if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
+  if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
+  res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Scan QR with WhatsApp</h1><img src="'+latestQRDataUrl+'" style="width:300px"/></div></body></html>');
+});
+app.get('/api/wa-status',function(req,res){res.json({connected:waReady});});
+app.get('/api/groups',async function(req,res){
+  if(!waReady)return res.json({error:'Not connected'});
+  try{var chats=await waClient.getChats();res.json({groups:chats.filter(function(c){return c.isGroup;}).map(function(c){return{name:c.name,jid:c.id._serialized};})});}catch(e){res.json({error:e.message});}
+});
+app.get('/api/bot/on',function(req,res){CONFIG.BOT_ENABLED=true;res.json({botEnabled:true});});
+app.get('/api/bot/off',function(req,res){CONFIG.BOT_ENABLED=false;res.json({botEnabled:false});});
+app.get('/api/ledger',async function(req,res){
+  try{var date=req.query.date||new Date().toISOString().split('T')[0];var entries=await getLedgerData(date);var tIn=0,tOut=0;entries.forEach(function(e){if(e.inOut==='IN')tIn+=e.amount;if(e.inOut==='OUT')tOut+=e.amount;});res.json({date:date,entries:entries,totalIn:tIn,totalOut:tOut,net:tIn-tOut,count:entries.length});}catch(e){res.json({error:e.message});}
+});
+app.get('/api/fund-position',async function(req,res){try{res.json({accounts:await getFundPosition()});}catch(e){res.json({error:e.message});}});
+
+app.get('/api/debug-messages',async function(req,res){
+  try{
+    if(!waReady)return res.json({error:'Not connected'});
+    var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
+    var msgs = await chat.fetchMessages({limit:50});
+    var result = [];
+    for(var i=0;i<msgs.length;i++){
+      var m=msgs[i];
+      var rawSender=m.author||m.from||'';
+      var info = await identifySender(rawSender);
+      result.push({rawSender:rawSender,contactName:info.contactName,role:info.role,isReply:m.hasQuotedMsg,body:(m.body||'').substring(0,100),time:new Date(m.timestamp*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})});
+    }
+    res.json({totalMessages:result.length,mmNames:CONFIG.MM_NAMES,smNames:CONFIG.SM_NAMES,messages:result});
+  }catch(e){res.json({error:e.message});}
+});
+
+app.get('/api/approval-audit',async function(req,res){
+  try{
+    var days=parseInt(req.query.days)||15;
+    var audit=await buildApprovalAudit(days);
+    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',hasMedia:e.hasMedia,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null};};
+    res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
+  }catch(e){res.json({error:e.message});}
+});
+
 app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])));}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);res.set('Content-Type','image/png');res.send(img);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){
   try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});
   var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);
-  var media=new MessageMedia('image/png',img.toString('base64'),'MIS_'+d+'.png');
-  await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,media,{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});
+  await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',img.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});
   res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}
 });
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.3'});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.4'});});
 
 cron.schedule('30 13 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var d=new Date().toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',img.toString('base64'),'MIS.png'),{caption:'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron:',e.message);});},{timezone:'Asia/Kolkata'});
 cron.schedule('30 3 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var y=new Date();y.setDate(y.getDate()-1);var d=y.toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',img.toString('base64'),'MIS.png'),{caption:'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron:',e.message);});},{timezone:'Asia/Kolkata'});
 
 initGoogleSheets();
 createWhatsAppClient();
-app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.3 | Port:',CONFIG.PORT,'\nEndpoints: /health /api/pair /api/groups /api/ledger /api/fund-position\n/api/preview /api/daily-report /api/approval-audit?days=15\n/api/debug-messages /api/rebuild-lid\n');});
+app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.4 | Port:',CONFIG.PORT);});
