@@ -203,7 +203,7 @@ async function extractFromImage(media, msgId) {
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: mime, data: media.data } },
-            { type: 'text', text: 'Extract from this expense request screenshot or invoice/bill: vendor name, amount in INR (number only, no symbols/words), and brief purpose (max 10 words). If amount uses "lac/lakh" multiply by 100000. If "cr/crore" multiply by 10000000. Reply with ONLY a JSON object on a single line, no prose, no markdown, no code fences. Format: {"vendor":"...","amount":12345,"purpose":"..."}. If you cannot identify a field set it to "" or 0.' }
+            { type: 'text', text: 'This image is attached to an expense approval request in a WhatsApp group. Classify the image and extract data. First, identify the imageType: "cheque" (bank cheque, even cancelled), "invoice" (printed bill/invoice), "receipt" (payment receipt), "screenshot" (app/website screenshot), or "other". For CHEQUES: the payee name is handwritten and often illegible — do NOT guess it, set vendor to "". Set amount to 0 for cancelled cheques (they are shared only as bank account reference, not as expense amounts). For INVOICES and RECEIPTS with PRINTED text: extract vendor name, total amount in INR, and purpose. Set confidence to "high" if text is clearly printed/typed, "low" if handwritten or blurry. Reply with ONLY a JSON object on a single line, no prose, no markdown. Format: {"vendor":"","amount":0,"purpose":"","imageType":"cheque","confidence":"low"}. If you cannot identify a field set it to "" or 0.' }
           ]
         }]
       })
@@ -306,12 +306,15 @@ async function buildApprovalAudit(days) {
             if (media && media.data) {
               visionResult = await extractFromImage(media, msgId);
               if (visionResult) {
-                // Vision wins on amount if text gave 0 or vision amount is more precise
-                if (amount === 0 && visionResult.amount > 0) amount = visionResult.amount;
-                // Vision wins on vendor if text body was empty/very short
-                if ((!vendor || body.length < 15) && visionResult.vendor) vendor = visionResult.vendor;
-                // Always take vision purpose if it adds context
-                if (visionResult.purpose) purpose = visionResult.purpose;
+                var isCheque = visionResult.imageType === 'cheque';
+                var isLowConf = visionResult.confidence === 'low';
+                // Cheques = bank reference only, handwriting = unreliable — skip vendor/amount
+                if (!isCheque && !isLowConf) {
+                  if (amount === 0 && visionResult.amount > 0) amount = visionResult.amount;
+                  if ((!vendor || body.length < 15) && visionResult.vendor) vendor = visionResult.vendor;
+                }
+                // Purpose only from high-confidence printed documents
+                if (!isCheque && !isLowConf && visionResult.purpose) purpose = visionResult.purpose;
               }
             }
           } catch (e) {
@@ -491,3 +494,4 @@ cron.schedule('30 3 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;va
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.5 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');});
+                                                                                                                                               
