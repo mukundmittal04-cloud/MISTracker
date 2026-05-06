@@ -567,24 +567,47 @@ function pruneStaleDMState(state) {
 }
 
 // Determine whether a sender is allowed to use the DM relay.
-// Phone-based whitelist ONLY — names are unreliable (anyone can rename a contact "Madhur Mittal").
+// Phone-based whitelist ONLY. For @lid JIDs (opaque WhatsApp IDs), we resolve
+// the real phone via WhatsApp's Contact API before checking the whitelist.
 // Allowed: ACCOUNTANT_PHONES, MM_PHONE, SM_PHONE, TEST_PHONES.
-// JIDs ending in @lid are opaque WhatsApp internal IDs (not phone numbers) and are REJECTED
-// unless we have a verified mapping. This prevents impersonation via LID-only contacts.
-function isAuthorisedAccountant(rawJid, contactName) {
+async function isAuthorisedAccountant(rawJid, contactName) {
   if(!rawJid) return false;
-  // Reject @lid JIDs — these are anonymous WhatsApp internal IDs, no phone verification possible
-  if(rawJid.indexOf('@lid') >= 0) {
-    console.log('[Auth] reject @lid sender:', rawJid, '(name:', contactName, ')');
+  if(rawJid.indexOf('@g.us') >= 0) return false; // group JID — DM relay is direct only
+
+  var phoneOnly = null;
+
+  if(rawJid.indexOf('@c.us') >= 0){
+    // Standard phone-based JID
+    phoneOnly = rawJid.split('@')[0].replace(/[^0-9]/g, '');
+  } else if(rawJid.indexOf('@lid') >= 0){
+    // LID-based JID — try to resolve real phone via WhatsApp Contact API
+    try {
+      var contact = await waClient.getContactById(rawJid);
+      if(contact){
+        // Try .number first (E.164 phone), then .id.user
+        if(contact.number){
+          phoneOnly = String(contact.number).replace(/[^0-9]/g, '');
+        } else if(contact.id && contact.id.user){
+          var u = String(contact.id.user);
+          // Skip if user is itself a LID-style numeric id (16+ digits typical for @lid)
+          if(u.length <= 15 && /^\d+$/.test(u)) phoneOnly = u;
+        }
+      }
+    } catch(e) {
+      console.log('[Auth] LID resolve failed for', rawJid, ':', e.message);
+    }
+    if(!phoneOnly){
+      console.log('[Auth] LID could not be resolved to a phone:', rawJid, '(name:', contactName, ')');
+      return false;
+    }
+    console.log('[Auth] LID', rawJid, 'resolved to phone', phoneOnly);
+  } else {
     return false;
   }
-  // Standard phone JID: phone@c.us
-  if(rawJid.indexOf('@c.us') < 0) return false;
-  var phoneOnly = rawJid.split('@')[0].replace(/[^0-9]/g, '');
+
   if(!phoneOnly) return false;
-  // Strict whitelist — phone number must be in one of the approved lists
   var whitelist = CONFIG.ACCOUNTANT_PHONES.concat([CONFIG.MM_PHONE, CONFIG.SM_PHONE]).concat(CONFIG.TEST_PHONES || []);
-  if(whitelist.indexOf(phoneOnly) >= 0) {
+  if(whitelist.indexOf(phoneOnly) >= 0){
     console.log('[Auth] allow:', phoneOnly, '(', contactName, ')');
     return true;
   }
@@ -622,7 +645,7 @@ async function handleAccountantDM(msg) {
   if(msg.fromMe) return false;
 
   var senderInfo = await identifySender(rawFrom);
-  if(!isAuthorisedAccountant(rawFrom, senderInfo.contactName)){
+  if(!(await isAuthorisedAccountant(rawFrom, senderInfo.contactName))){
     console.log('[DM] unauthorised sender:', rawFrom, senderInfo.contactName);
     // Send a polite reject message ONLY ONCE per sender per day to avoid spam loops
     if(!global._unauthorisedNotified) global._unauthorisedNotified = {};
@@ -1195,6 +1218,27 @@ cron.schedule('*/10 * * * *',function(){
   scanStalePendings().catch(function(e){console.error('[Cron stale]',e.message);});
 },{timezone:'Asia/Kolkata'});
 
+app.get('/api/whoami',async function(req,res){
+  // Returns the bot's view of recent direct chats so we can debug what JIDs come in
+  try {
+    if(!waReady) return res.json({error:'not connected'});
+    var chats = await waClient.getChats();
+    var dms = chats.filter(function(c){ return !c.isGroup; }).slice(0, 30);
+    var out = [];
+    for(var i=0;i<dms.length;i++){
+      var c = dms[i];
+      var contact = null;
+      try { contact = await waClient.getContactById(c.id._serialized); } catch(e){}
+      out.push({
+        jid: c.id._serialized,
+        name: c.name || (contact ? (contact.pushname || contact.name) : ''),
+        number: contact ? contact.number : null,
+        lastMsg: c.lastMessage ? (c.lastMessage.body || '').substring(0,80) : ''
+      });
+    }
+    res.json({recentDMs: out});
+  } catch(e) { res.json({error: e.message}); }
+});
 app.get('/api/auth-list',function(req,res){res.json({accountants:CONFIG.ACCOUNTANT_PHONES,testNumbers:CONFIG.TEST_PHONES||[],mm:CONFIG.MM_PHONE,sm:CONFIG.SM_PHONE,note:'Only these phone numbers can DM the bot for expense relay. @lid (anonymous) JIDs are always rejected.'});});
 app.get('/api/dm-state',function(req,res){try{res.json(loadDMState());}catch(e){res.json({error:e.message});}});
 app.get('/api/dm-clear',function(req,res){try{saveDMState({pending:{}});res.json({success:true});}catch(e){res.json({error:e.message});}});
