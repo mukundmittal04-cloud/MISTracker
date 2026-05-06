@@ -248,17 +248,27 @@ async function buildApprovalAudit(days) {
       var resp=parseResponse(body);
 
       // Case A: this is a swipe-reply to an MM/SM question message → it's an ANSWER
-      if(questionMessages[quotedMsgId] && senderInfo.role!=='mm' && senderInfo.role!=='sm'){
+      // Accept answers from: accountants, OR the OTHER promoter (e.g. SM clarifies MM's question)
+      if(questionMessages[quotedMsgId]){
         var qInfo = questionMessages[quotedMsgId];
-        answerMap[qInfo.expenseId] = {
-          role: qInfo.role,
-          question: qInfo.question,
-          questionDate: qInfo.date,
-          answer: body,
-          answerDate: msgDate,
-          answerBy: senderInfo.contactName || rawSender
-        };
-        continue; // don't process as a normal vote
+        var answerFromOtherPromoter = (qInfo.role==='mm' && senderInfo.role==='sm') || (qInfo.role==='sm' && senderInfo.role==='mm');
+        var answerFromAccountant = senderInfo.role!=='mm' && senderInfo.role!=='sm';
+        if(answerFromOtherPromoter || answerFromAccountant){
+          // Don't treat short Yes/No replies from the other promoter as the answer — those are votes
+          var promoterReplyShort = answerFromOtherPromoter && (parseResponse(body)==='yes' || parseResponse(body)==='no' || parseResponse(body)==='hold');
+          if(!promoterReplyShort){
+            answerMap[qInfo.expenseId] = {
+              role: qInfo.role,
+              question: qInfo.question,
+              questionDate: qInfo.date,
+              answer: body,
+              answerDate: msgDate,
+              answerBy: senderInfo.contactName || rawSender,
+              answerByRole: answerFromOtherPromoter ? (senderInfo.role==='mm' ? 'MM' : 'SM') : 'accountant'
+            };
+            continue; // don't process as a normal vote
+          }
+        }
       }
 
       // Case B: normal MM/SM swipe-reply to an expense
@@ -362,11 +372,12 @@ function buildReminderText(expense) {
   if((queryMM||querySM) && queryAnswered){
     var ans = expense.queryAnswer;
     var who = ans.role==='mm'?'MM':'SM';
+    var answerLabel = ans.answerByRole && ans.answerByRole !== 'accountant' ? (ans.answerByRole + ' (' + ans.answerBy + ')') : ans.answerBy;
     lines.push('');
     lines.push(who+' asked:');
     lines.push('"'+ans.question+'"');
     lines.push('');
-    lines.push(ans.answerBy+' answered:');
+    lines.push(answerLabel+' answered:');
     lines.push('"'+ans.answer+'"');
     lines.push('');
     lines.push(who==='MM'?'Madhur sir, please confirm to approve':'Sumit sir, please confirm to approve');
