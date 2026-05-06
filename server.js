@@ -226,6 +226,13 @@ async function fetchApprovalMessages(days) {
 async function buildApprovalAudit(days) {
   var messages = await fetchApprovalMessages(days||15);
   var expenses = [], replyMap = {};
+  // questionMessages: msgId -> { expenseId, role, question, date, name }
+  // tracks MM/SM messages that were classified as questions, so accountant
+  // replies to them can be linked back to the original expense
+  var questionMessages = {};
+  // answerMap: expenseId -> { role: 'mm'|'sm', question, answer, answerDate, answerBy }
+  var answerMap = {};
+
   for(var i=0;i<messages.length;i++){
     var msg=messages[i];
     var rawSender=msg.author||msg.from||'';
@@ -233,18 +240,46 @@ async function buildApprovalAudit(days) {
     var body=(msg.body||'').trim();
     var hasMedia=msg.hasMedia||false;
     var senderInfo = await identifySender(rawSender);
+    var thisMsgId = msg.id._serialized||msg.id.id;
     var quotedMsgId=null;
     if(msg.hasQuotedMsg){try{var q=await msg.getQuotedMessage();quotedMsgId=q.id._serialized||q.id.id;}catch(e){}}
+
     if(quotedMsgId){
-      if(!replyMap[quotedMsgId])replyMap[quotedMsgId]={mm:null,sm:null};
       var resp=parseResponse(body);
-      if(senderInfo.role==='mm'){replyMap[quotedMsgId].mm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName};}
-      else if(senderInfo.role==='sm'){replyMap[quotedMsgId].sm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName};}
+
+      // Case A: this is a swipe-reply to an MM/SM question message → it's an ANSWER
+      if(questionMessages[quotedMsgId] && senderInfo.role!=='mm' && senderInfo.role!=='sm'){
+        var qInfo = questionMessages[quotedMsgId];
+        answerMap[qInfo.expenseId] = {
+          role: qInfo.role,
+          question: qInfo.question,
+          questionDate: qInfo.date,
+          answer: body,
+          answerDate: msgDate,
+          answerBy: senderInfo.contactName || rawSender
+        };
+        continue; // don't process as a normal vote
+      }
+
+      // Case B: normal MM/SM swipe-reply to an expense
+      if(!replyMap[quotedMsgId])replyMap[quotedMsgId]={mm:null,sm:null};
+      if(senderInfo.role==='mm'){
+        replyMap[quotedMsgId].mm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName,msgId:thisMsgId};
+        // If MM raised a question, register this message ID so accountant replies link back
+        if(resp==='question'){
+          questionMessages[thisMsgId] = { expenseId: quotedMsgId, role: 'mm', question: body, date: msgDate, name: senderInfo.contactName };
+        }
+      } else if(senderInfo.role==='sm'){
+        replyMap[quotedMsgId].sm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName,msgId:thisMsgId};
+        if(resp==='question'){
+          questionMessages[thisMsgId] = { expenseId: quotedMsgId, role: 'sm', question: body, date: msgDate, name: senderInfo.contactName };
+        }
+      }
     } else {
       // Skip bot's own reminder messages — not expense requests
       if(body.indexOf('[BOT REMINDER]')===0){continue;}
       if(senderInfo.role!=='mm'&&senderInfo.role!=='sm'){
-        var msgId=msg.id._serialized||msg.id.id;
+        var msgId=thisMsgId;
         var parsedItems=parseExpenseMessage(body);
         var vendor=parsedItems[0].vendor, amount=parsedItems[0].amount, purpose='', visionResult=null;
         var subItems=parsedItems.length>1?parsedItems:null;
@@ -261,13 +296,20 @@ async function buildApprovalAudit(days) {
             }
           }catch(e){console.error('[Vision] Failed for',msgId,e.message);}
         }
-        expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image attached]':'[Empty]'),sender:senderInfo.contactName||rawSender,vendor:vendor||(hasMedia?'[See image]':''),amount:amount,purpose:purpose,subItems:subItems,hasMedia:hasMedia,visionParsed:visionResult?true:false,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'}});
+        expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image attached]':'[Empty]'),sender:senderInfo.contactName||rawSender,vendor:vendor||(hasMedia?'[See image]':''),amount:amount,purpose:purpose,subItems:subItems,hasMedia:hasMedia,visionParsed:visionResult?true:false,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'},queryAnswer:null});
       }
     }
   }
+
+  // Wire votes into expenses
   for(var j=0;j<expenses.length;j++){
     var rep=replyMap[expenses[j].id];
     if(rep){expenses[j].mmApproval=rep.mm;expenses[j].smApproval=rep.sm;expenses[j].status.mm=rep.mm?rep.mm.response:'pending';expenses[j].status.sm=rep.sm?rep.sm.response:'pending';}
+
+    // Wire query-answer pair if one exists for this expense
+    if(answerMap[expenses[j].id]){
+      expenses[j].queryAnswer = answerMap[expenses[j].id];
+    }
   }
   var result={fullyApproved:[],partialApproval:[],noApproval:[],onHold:[],rejected:[],allExpenses:expenses,totalExpenses:expenses.length,totalMessages:messages.length,fetchedDays:days||15,visionCacheSize:visionCache.size};
   for(var k=0;k<expenses.length;k++){
@@ -292,8 +334,10 @@ function buildReminderText(expense) {
   var mmOnly=mm==='pending'&&sm==='yes';
   var smOnly=sm==='pending'&&mm==='yes';
   var queryMM=mm==='question', querySM=sm==='question';
+  var queryAnswered = expense.queryAnswer ? true : false;
   var header;
-  if(queryMM||querySM) header='[BOT REMINDER] - Query unanswered - '+getDaysPending(expense.date)+' day(s) pending';
+  if((queryMM||querySM) && queryAnswered) header='[BOT REMINDER] - Query answered - awaiting MM+SM approval';
+  else if(queryMM||querySM) header='[BOT REMINDER] - Query unanswered - '+getDaysPending(expense.date)+' day(s) pending';
   else if(bothPending) header='[BOT REMINDER] - Approval needed';
   else if(mmOnly) header='[BOT REMINDER] - MM approval needed';
   else if(smOnly) header='[BOT REMINDER] - SM approval needed';
@@ -315,7 +359,19 @@ function buildReminderText(expense) {
   var mmLabel=mm==='yes'?'MM: Ok':mm==='question'?'MM: query raised':'MM: pending';
   var smLabel=sm==='yes'?'SM: Ok':sm==='question'?'SM: query raised':'SM: pending';
   lines.push(mmLabel+' | '+smLabel);
-  if(queryMM&&expense.mmApproval){lines.push('');lines.push('MM asked:');lines.push('"'+expense.mmApproval.raw+'"');lines.push('');lines.push('Please answer MM\'s query to proceed');}
+  if((queryMM||querySM) && queryAnswered){
+    var ans = expense.queryAnswer;
+    var who = ans.role==='mm'?'MM':'SM';
+    lines.push('');
+    lines.push(who+' asked:');
+    lines.push('"'+ans.question+'"');
+    lines.push('');
+    lines.push(ans.answerBy+' answered:');
+    lines.push('"'+ans.answer+'"');
+    lines.push('');
+    lines.push(who==='MM'?'Madhur sir, please confirm to approve':'Sumit sir, please confirm to approve');
+  }
+  else if(queryMM&&expense.mmApproval){lines.push('');lines.push('MM asked:');lines.push('"'+expense.mmApproval.raw+'"');lines.push('');lines.push('Please answer MM\'s query to proceed');}
   else if(querySM&&expense.smApproval){lines.push('');lines.push('SM asked:');lines.push('"'+expense.smApproval.raw+'"');lines.push('');lines.push('Please answer SM\'s query to proceed');}
   else if(mmOnly){lines.push('');lines.push('Madhur sir, please swipe-reply Ok to approve');}
   else if(smOnly){lines.push('');lines.push('Sumit sir, please swipe-reply Ok to approve');}
@@ -402,7 +458,7 @@ app.get('/api/approval-audit',async function(req,res){
   try{
     var days=parseInt(req.query.days)||15;
     var audit=await buildApprovalAudit(days);
-    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',purpose:e.purpose||'',subItems:e.subItems||null,hasMedia:e.hasMedia,visionParsed:e.visionParsed||false,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null};};
+    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',purpose:e.purpose||'',subItems:e.subItems||null,hasMedia:e.hasMedia,visionParsed:e.visionParsed||false,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null,queryAnswer:e.queryAnswer||null};};
     res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length,visionCacheSize:audit.visionCacheSize},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
   }catch(e){res.json({error:e.message});}
 });
