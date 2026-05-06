@@ -784,6 +784,79 @@ async function handleAccountantDM(msg) {
     await waClient.sendMessage(rawFrom, 'Silent mode is currently '+(s?'ON':'OFF')+'.');
     return true;
   }
+
+  // ── Manual intervention commands (only from SILENT_OBSERVER) ─────────────
+  // Patterns: "1 ok", "1 confirm", "1 reject", "1 flag", "1 ignore",
+  //           "2 chase", "2 paid 6-May", "2 paid 06/05/2026", "3 confirm"
+  if(phoneOfSender === SILENT_OBSERVER){
+    var cmdMatch = body.match(/^\s*(\d+)\s+(ok|confirm|reject|flag|ignore|chase|paid)(?:\s+(.+))?\s*$/i);
+    if(cmdMatch){
+      var idx = parseInt(cmdMatch[1]);
+      var verb = cmdMatch[2].toLowerCase();
+      var arg = cmdMatch[3] ? cmdMatch[3].trim() : '';
+      var dmState = loadDMState();
+      var lastOutliers = (dmState.lastOutliers && dmState.lastOutliers.items) || [];
+      var target = lastOutliers.find(function(o){ return o.id === idx; });
+      if(!target){
+        await waClient.sendMessage(rawFrom, 'No outlier #'+idx+' in the most recent report. Run /api/outliers to see current list.');
+        return true;
+      }
+      var cache = loadMatchCache();
+      if(!cache.matches) cache.matches = {};
+      if(!cache.rejected) cache.rejected = {};
+      if(!cache.manualPaid) cache.manualPaid = {};
+
+      if(verb === 'ok' || verb === 'confirm'){
+        if(target.ledgerHash){
+          cache.matches[target.expenseId] = Object.assign(cache.matches[target.expenseId] || {}, {
+            ledgerHash: target.ledgerHash, stage: 'manual', confidence: 'manual', manuallyConfirmed: true, ts: new Date().toISOString()
+          });
+        }
+        saveMatchCache(cache);
+        await waClient.sendMessage(rawFrom, '✓ Outlier #'+idx+' confirmed and learned. Future similar matches will auto-pass.');
+        return true;
+      }
+      if(verb === 'reject' || verb === 'flag'){
+        if(target.ledgerHash){
+          if(!cache.rejected[target.expenseId]) cache.rejected[target.expenseId] = [];
+          if(cache.rejected[target.expenseId].indexOf(target.ledgerHash) < 0) cache.rejected[target.expenseId].push(target.ledgerHash);
+          // Also flag the cached match if it exists
+          if(cache.matches[target.expenseId] && cache.matches[target.expenseId].ledgerHash === target.ledgerHash){
+            cache.matches[target.expenseId].manuallyRejected = true;
+          }
+        }
+        saveMatchCache(cache);
+        await waClient.sendMessage(rawFrom, '✗ Outlier #'+idx+' rejected. The matcher will not suggest this pairing again.');
+        return true;
+      }
+      if(verb === 'ignore'){
+        // Mark expense to skip outlier list permanently
+        if(!cache.ignored) cache.ignored = {};
+        cache.ignored[target.expenseId] = true;
+        saveMatchCache(cache);
+        await waClient.sendMessage(rawFrom, '⏭ Outlier #'+idx+' will be hidden from future reports.');
+        return true;
+      }
+      if(verb === 'paid'){
+        // Manual: this expense was paid. Optional arg = date.
+        cache.manualPaid[target.expenseId] = { paidDate: arg || new Date().toISOString().split('T')[0], ts: new Date().toISOString() };
+        saveMatchCache(cache);
+        await waClient.sendMessage(rawFrom, '✓ Outlier #'+idx+' marked as paid'+(arg?' on '+arg:'')+'. The matcher will reflect this in the next report.');
+        return true;
+      }
+      if(verb === 'chase'){
+        // Send a private nudge to the approval group's accountant audience (or just acknowledge)
+        try {
+          await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, '[BOT NUDGE] Reminder — please log Ledger entry for: ' + (target.expenseId || ''));
+          await waClient.sendMessage(rawFrom, '📣 Nudge posted in approval group for outlier #'+idx+'.');
+        } catch(e){
+          await waClient.sendMessage(rawFrom, 'Could not post nudge: '+e.message);
+        }
+        return true;
+      }
+    }
+  }
+
   if(/^\s*help\s*$/i.test(body)){
     await waClient.sendMessage(rawFrom, [
       'Send me an expense request and I will post it in the approval group.',
@@ -1064,7 +1137,11 @@ function loadSilentMode() {
       return s.enabled === true;
     }
   } catch(e) { console.error('[Silent] load failed:', e.message); }
-  return false;
+  // Default to SILENT mode on fresh install (no state file).
+  // Bot listens, audits, processes DMs, but does NOT post group reminders/MIS.
+  // Reports go privately to SILENT_OBSERVER instead.
+  // Toggle off via: DM "silent off" from observer phone, or hit /api/silent-off
+  return true;
 }
 
 function saveSilentMode(enabled) {
@@ -1273,6 +1350,906 @@ async function getFundPosition() {
   return accounts;
 }
 
+
+async function getLedgerRange(startDate, endDate) {
+  var rows = await readSheet('Ledger!A:L');
+  var entries = [];
+  var startMs = startDate ? startDate.getTime() : 0;
+  var endMs = endDate ? endDate.getTime() : Date.now() + 86400000;
+  for(var i=0; i<rows.length; i++){
+    var row = rows[i]; if(!row[0] || !row[5]) continue;
+    var cd = parseSheetDate(row[0]); if(!cd) continue;
+    var t = cd.getTime();
+    if(t < startMs || t > endMs) continue;
+    entries.push({
+      date: cd,
+      entity: row[1]||'', head: row[2]||'', description: row[3]||'',
+      tag: row[4]||'', inOut: row[5]||'', amount: parseAmount(row[6]),
+      mode: row[7]||'', person: row[8]||'', bankAC: row[9]||'',
+      transferTo: row[10]||'', notes: row[11]||''
+    });
+  }
+  return entries;
+}
+
+// ── Ledger Matcher ────────────────────────────────────────────────────────────
+// For each fully-approved expense, find the matching Ledger entry (the actual
+// payment). Categorise as paid / paid_with_tolerance / possible_match / awaiting_payment.
+//
+// Match criteria:
+//   1. STRICT: amount equal (±Rs 1), OUT entry, within 14 days of approval, vendor word overlap
+//   2. TOLERANCE: amount within ±5%, otherwise same as strict
+//   3. POSSIBLE: same week + word overlap, but amount differs >5%
+//   4. AWAITING: no match found
+
+// ── Stage 2: Fuzzy matching helpers ──────────────────────────────────────────
+// Levenshtein distance (edit distance). Returns # of single-char edits to convert a→b.
+// Catches "Kackar" ↔ "Kakkar" (distance 1), "Trinity" ↔ "Trnity" (distance 1).
+function levenshtein(a, b) {
+  if(!a) return b ? b.length : 0;
+  if(!b) return a.length;
+  a = a.toLowerCase(); b = b.toLowerCase();
+  if(a === b) return 0;
+  var m = a.length, n = b.length;
+  var prev = new Array(n+1), curr = new Array(n+1);
+  for(var i=0; i<=n; i++) prev[i] = i;
+  for(var i2=1; i2<=m; i2++){
+    curr[0] = i2;
+    for(var j=1; j<=n; j++){
+      var cost = a[i2-1] === b[j-1] ? 0 : 1;
+      curr[j] = Math.min(curr[j-1]+1, prev[j]+1, prev[j-1]+cost);
+    }
+    var tmp = prev; prev = curr; curr = tmp;
+  }
+  return prev[n];
+}
+
+// Soundex encoding — phonetic match for names. "Kackar", "Kakkar", "Kacker" all → K260.
+// Handles transliterated Indian names where spelling varies but sound is identical.
+function soundex(s) {
+  if(!s) return '';
+  s = s.toUpperCase().replace(/[^A-Z]/g, '');
+  if(!s) return '';
+  var first = s[0];
+  var map = { B:1,F:1,P:1,V:1, C:2,G:2,J:2,K:2,Q:2,S:2,X:2,Z:2, D:3,T:3, L:4, M:5,N:5, R:6 };
+  var code = '';
+  var prev = map[first] || '';
+  for(var i=1; i<s.length && code.length<3; i++){
+    var c = map[s[i]];
+    if(c && c !== prev) code += c;
+    if(s[i] !== 'H' && s[i] !== 'W') prev = c || '';
+  }
+  return (first + code + '000').substring(0,4);
+}
+
+// Check if two strings are "fuzzy similar":
+//   - Levenshtein distance ≤ 3 for short words (4-8 chars)
+//   - Levenshtein ≤ 4 for longer
+//   - OR phonetic match via Soundex
+function fuzzyMatch(a, b) {
+  if(!a || !b) return false;
+  a = a.toLowerCase(); b = b.toLowerCase();
+  if(a === b) return true;
+  if(a.indexOf(b) >= 0 || b.indexOf(a) >= 0) return true; // substring
+  var maxLen = Math.max(a.length, b.length);
+  var threshold = maxLen <= 8 ? 3 : 4;
+  var dist = levenshtein(a, b);
+  if(dist <= threshold) return true;
+  // Phonetic fallback for name-like strings (alphabetic only)
+  if(/^[a-z]+$/.test(a) && /^[a-z]+$/.test(b)){
+    if(soundex(a) === soundex(b)) return true;
+  }
+  return false;
+}
+
+// Stage 2 word overlap: word-by-word fuzzy match between expense and ledger
+function ledgerFuzzyWordOverlap(ledgerEntry, expense) {
+  if(!ledgerEntry || !expense) return null;
+  var ledgerText = ((ledgerEntry.description||'') + ' ' + (ledgerEntry.entity||'') + ' ' + (ledgerEntry.person||'')).toLowerCase();
+  var expenseTextRaw = (expense.vendor||'') + ' ' + (expense.body||'');
+  if(expense.supportingDocs && expense.supportingDocs.length){
+    expense.supportingDocs.forEach(function(d){ expenseTextRaw += ' ' + (d.vendor||'') + ' ' + (d.purpose||''); });
+  }
+  var expenseText = expenseTextRaw.toLowerCase();
+  var stopWords = ['the','and','for','with','from','this','that','please','approve','kindly','payment','amount','rs','inr','total','expense','expenses','final'];
+  var expWords = expenseText.split(/[^a-z0-9]+/).filter(function(w){
+    return w.length >= 4 && stopWords.indexOf(w) < 0; // 4+ chars to avoid noise like "for"
+  });
+  var ledgerWords = ledgerText.split(/[^a-z0-9]+/).filter(function(w){ return w.length >= 4; });
+  // Try each expense word against each ledger word
+  for(var i=0; i<expWords.length; i++){
+    for(var j=0; j<ledgerWords.length; j++){
+      if(fuzzyMatch(expWords[i], ledgerWords[j])){
+        return { matchedExpWord: expWords[i], matchedLedgerWord: ledgerWords[j] };
+      }
+    }
+  }
+  return null;
+}
+
+function ledgerWordOverlap(ledgerEntry, expense) {
+  if(!ledgerEntry || !expense) return false;
+  var ledgerText = ((ledgerEntry.description||'') + ' ' + (ledgerEntry.entity||'') + ' ' + (ledgerEntry.person||'')).toLowerCase();
+  var expenseTextRaw = (expense.vendor||'') + ' ' + (expense.body||'');
+  // Also include supportingDocs vendor/purpose if present (vision-extracted real vendor names)
+  if(expense.supportingDocs && expense.supportingDocs.length){
+    expense.supportingDocs.forEach(function(d){ expenseTextRaw += ' ' + (d.vendor||'') + ' ' + (d.purpose||''); });
+  }
+  var expenseText = expenseTextRaw.toLowerCase();
+  var stopWords = ['the','and','for','with','from','this','that','please','approve','kindly','payment','amount','rs','inr','total','expense','expenses','final'];
+  var expWords = expenseText.split(/[^a-z0-9]+/).filter(function(w){
+    return w.length >= 3 && stopWords.indexOf(w) < 0;
+  });
+  var ledgerWords = ledgerText.split(/[^a-z0-9]+/);
+  for(var w=0; w<expWords.length; w++){
+    if(ledgerWords.indexOf(expWords[w]) >= 0) return true;
+  }
+  return false;
+}
+
+// ── Match Cache ──────────────────────────────────────────────────────────────
+// Persists confirmed/learned matches across runs. Avoids re-billing Haiku for
+// the same (expense, ledger) pair. Also stores manual interventions (your
+// "1 ok" / "1 reject" replies) so the matcher learns over time.
+//
+// Shape:
+//   {
+//     matches: { <expenseId>: { ledgerHash, stage, confidence, manuallyConfirmed?, manuallyRejected?, ts } },
+//     rejected: { <expenseId>: [ledgerHash1, ledgerHash2, ...] },  // ledger entries explicitly NOT a match
+//     manualPaid: { <expenseId>: { paidDate, ts } }                // user-supplied "this was paid"
+//   }
+var MATCH_CACHE_FILE = './wa_auth/match_cache.json';
+
+function loadMatchCache() {
+  try {
+    if(fs.existsSync(MATCH_CACHE_FILE)){
+      return JSON.parse(fs.readFileSync(MATCH_CACHE_FILE, 'utf8'));
+    }
+  } catch(e) { console.error('[MatchCache] load failed:', e.message); }
+  return { matches: {}, rejected: {}, manualPaid: {} };
+}
+
+function saveMatchCache(cache) {
+  try {
+    if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
+    fs.writeFileSync(MATCH_CACHE_FILE, JSON.stringify(cache, null, 2));
+  } catch(e) { console.error('[MatchCache] save failed:', e.message); }
+}
+
+// Build a stable hash for a ledger entry so the cache survives re-fetches
+function ledgerEntryHash(le) {
+  if(!le) return null;
+  var d = le.date ? le.date.toISOString().split('T')[0] : '';
+  return d + '|' + le.amount + '|' + (le.bankAC||'') + '|' + (le.description||'').substring(0,50);
+}
+
+// ── Stage 3: Haiku semantic matcher ──────────────────────────────────────────
+// Asks Claude to pick the right Ledger entry from candidates that survived
+// amount + date filtering but failed strict/fuzzy word matching.
+async function haikuSemanticMatch(expense, candidates) {
+  if(!CONFIG.CLAUDE_API_KEY) return null;
+  if(!candidates || candidates.length === 0) return null;
+
+  // Trim to top 5 candidates by amount proximity to keep prompt short
+  var top5 = candidates.slice(0,5);
+  var expenseSummary = (expense.vendor || '') + (expense.body && expense.body !== expense.vendor ? ' · ' + expense.body : '');
+  if(expense.supportingDocs && expense.supportingDocs.length){
+    expense.supportingDocs.forEach(function(d){
+      if(d.vendor) expenseSummary += ' · doc vendor: ' + d.vendor;
+      if(d.purpose) expenseSummary += ' · doc purpose: ' + d.purpose;
+    });
+  }
+
+  var candidateLines = top5.map(function(c, i){
+    var dt = c.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'});
+    return (i) + '. ' + dt + ' · Rs.' + c.amount + ' · ' + (c.bankAC||'-') + ' · ' + (c.description||'') + (c.entity?' · '+c.entity:'') + (c.person?' · person:'+c.person:'');
+  }).join('\n');
+
+  var prompt = 'You are matching an approved expense request to its actual Ledger payment.\n\n' +
+    'APPROVED EXPENSE:\n' +
+    'Date: ' + expense.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'}) + '\n' +
+    'Amount: Rs.' + expense.amount + '\n' +
+    'Description: ' + expenseSummary + '\n\n' +
+    'CANDIDATE LEDGER ENTRIES:\n' + candidateLines + '\n\n' +
+    'Which candidate (if any) is the actual payment for this approval? ' +
+    'Consider synonyms (e.g. TMT bar = Steel rods), informal vs formal names, Hindi/English mix, abbreviations. ' +
+    'Reply ONLY with strict JSON: {"match": <index 0-' + (top5.length-1) + '|null>, "confidence": <0.0-1.0>, "reasoning": "<one sentence>"}';
+
+  try {
+    var resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': CONFIG.CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 200,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    if(!resp.ok){ console.error('[Haiku] HTTP', resp.status); return null; }
+    var data = await resp.json();
+    var text = data.content && data.content[0] && data.content[0].text || '';
+    var jsonMatch = text.match(/\{[\s\S]*\}/);
+    if(!jsonMatch) return null;
+    var parsed = JSON.parse(jsonMatch[0]);
+    if(parsed.match === null || parsed.match === undefined) return { match: null, confidence: 0, reasoning: parsed.reasoning };
+    var idx = parseInt(parsed.match);
+    if(isNaN(idx) || idx < 0 || idx >= top5.length) return null;
+    return {
+      match: top5[idx],
+      confidence: parseFloat(parsed.confidence) || 0,
+      reasoning: parsed.reasoning || '',
+      candidatesShown: top5.length
+    };
+  } catch(e) {
+    console.error('[Haiku] semantic match failed:', e.message);
+    return null;
+  }
+}
+
+// Stage 1 + Stage 2 matcher (sync, free). Returns a result OR a candidate list for Stage 3.
+function matchLedgerEntry(expense, ledgerEntries) {
+  if(!expense || !expense.amount || expense.amount <= 0) return null;
+  var approvalDate = expense.date.getTime();
+  var fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+  var sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+
+  var strictMatches = [];
+  var tolMatches = [];
+  var fuzzyMatches = [];      // Stage 2: fuzzy word + amount within tolerance
+  var possibleMatches = [];   // word overlap only, amount differs
+  var amountOnlyCandidates = []; // for Stage 3 escalation: amount fits but no word overlap
+
+  for(var i=0; i<ledgerEntries.length; i++){
+    var le = ledgerEntries[i];
+    if(le.inOut !== 'OUT') continue;
+    var ledgerMs = le.date.getTime();
+    var dateDiff = ledgerMs - approvalDate;
+    if(dateDiff < -86400000) continue;
+    if(dateDiff > fourteenDaysMs) continue; // bound the candidate window early
+
+    var amtDiff = Math.abs(le.amount - expense.amount);
+    var pctDiff = amtDiff / expense.amount;
+    var strictWords = ledgerWordOverlap(le, expense);
+    var fuzzyWordsRes = strictWords ? null : ledgerFuzzyWordOverlap(le, expense);
+    var fuzzyWords = fuzzyWordsRes ? true : false;
+
+    // STAGE 1 — STRICT: exact amount + word overlap
+    if(amtDiff <= 1 && strictWords){
+      strictMatches.push({ entry: le, dateDiffDays: Math.round(dateDiff/86400000) });
+      continue;
+    }
+    // STAGE 1 — TOLERANCE: ±5% + strict word overlap
+    if(pctDiff <= 0.05 && strictWords){
+      tolMatches.push({ entry: le, dateDiffDays: Math.round(dateDiff/86400000), pctDiff: pctDiff });
+      continue;
+    }
+    // STAGE 2 — FUZZY: ±5% amount + fuzzy/phonetic word match
+    if(pctDiff <= 0.05 && fuzzyWords){
+      fuzzyMatches.push({ entry: le, dateDiffDays: Math.round(dateDiff/86400000), pctDiff: pctDiff, fuzzyMatch: fuzzyWordsRes });
+      continue;
+    }
+    // POSSIBLE: same week + word/fuzzy overlap (regardless of amount)
+    if(Math.abs(dateDiff) <= sevenDaysMs && (strictWords || fuzzyWords)){
+      possibleMatches.push({ entry: le, dateDiffDays: Math.round(dateDiff/86400000), pctDiff: pctDiff, amtDiff: amtDiff });
+      continue;
+    }
+    // STAGE 3 ESCALATION CANDIDATES: amount within ±10%, no word overlap detected
+    if(pctDiff <= 0.10){
+      amountOnlyCandidates.push(le);
+    }
+  }
+
+  if(strictMatches.length > 0){
+    return { status: 'paid', confidence: 'high', stage: 'exact', match: strictMatches[0].entry, dateDiffDays: strictMatches[0].dateDiffDays };
+  }
+  if(tolMatches.length > 0){
+    return { status: 'paid_with_tolerance', confidence: 'medium', stage: 'exact_tolerance', match: tolMatches[0].entry, dateDiffDays: tolMatches[0].dateDiffDays, pctDiff: tolMatches[0].pctDiff };
+  }
+  if(fuzzyMatches.length > 0){
+    return { status: 'paid', confidence: 'medium', stage: 'fuzzy', match: fuzzyMatches[0].entry, dateDiffDays: fuzzyMatches[0].dateDiffDays, pctDiff: fuzzyMatches[0].pctDiff, fuzzyMatch: fuzzyMatches[0].fuzzyMatch };
+  }
+  if(possibleMatches.length > 0){
+    return { status: 'possible_match', confidence: 'low', stage: 'possible', match: possibleMatches[0].entry, dateDiffDays: possibleMatches[0].dateDiffDays, pctDiff: possibleMatches[0].pctDiff, amtDiff: possibleMatches[0].amtDiff };
+  }
+  // Return amountOnlyCandidates for Stage 3 escalation (caller decides whether to call Haiku)
+  if(amountOnlyCandidates.length > 0){
+    return { status: 'awaiting_payment', confidence: null, stage: 'needs_ai', match: null, candidates: amountOnlyCandidates };
+  }
+  return { status: 'awaiting_payment', confidence: null, stage: 'no_match', match: null };
+}
+
+// Stage 1+2+3 matcher with cache. Async wrapper that calls Haiku when needed.
+async function matchLedgerEntryWithAI(expense, ledgerEntries, cache) {
+  if(!cache) cache = loadMatchCache();
+  // 1. Cache lookup — if we already have a confirmed match for this expense, reuse it
+  var cached = cache.matches[expense.id];
+  if(cached){
+    var matchedEntry = ledgerEntries.find(function(le){ return ledgerEntryHash(le) === cached.ledgerHash; });
+    if(matchedEntry){
+      return {
+        status: cached.manuallyRejected ? 'awaiting_payment' : 'paid',
+        confidence: cached.manuallyConfirmed ? 'manual' : (cached.confidence || 'cached'),
+        stage: 'cached',
+        match: matchedEntry,
+        cachedFromStage: cached.stage,
+        manuallyConfirmed: cached.manuallyConfirmed || false
+      };
+    }
+  }
+  // 2. Manual paid override
+  if(cache.manualPaid && cache.manualPaid[expense.id]){
+    return { status: 'paid', confidence: 'manual', stage: 'manual_paid', match: null, manualPaidDate: cache.manualPaid[expense.id].paidDate };
+  }
+
+  // 3. Run synchronous Stage 1+2 matcher
+  var result = matchLedgerEntry(expense, ledgerEntries);
+  if(!result) return null;
+
+  // 4. If stages 1-2 matched, save to cache and return
+  if(result.status === 'paid' || result.status === 'paid_with_tolerance'){
+    if(result.match){
+      cache.matches[expense.id] = {
+        ledgerHash: ledgerEntryHash(result.match),
+        stage: result.stage,
+        confidence: result.confidence,
+        ts: new Date().toISOString()
+      };
+      saveMatchCache(cache);
+    }
+    return result;
+  }
+
+  // 5. Stage 3 escalation: only if needs_ai AND we have an API key
+  if(result.stage === 'needs_ai' && result.candidates && result.candidates.length > 0 && CONFIG.CLAUDE_API_KEY){
+    // Filter out previously-rejected candidates
+    var rejectedHashes = (cache.rejected[expense.id]) || [];
+    var validCandidates = result.candidates.filter(function(c){ return rejectedHashes.indexOf(ledgerEntryHash(c)) < 0; });
+    if(validCandidates.length === 0){
+      return { status: 'awaiting_payment', confidence: null, stage: 'no_match', match: null };
+    }
+    var aiResult = await haikuSemanticMatch(expense, validCandidates);
+    if(aiResult && aiResult.match){
+      var aiMatch = aiResult.match;
+      var status, confidence;
+      if(aiResult.confidence >= 0.8){ status = 'paid'; confidence = 'ai_high'; }
+      else if(aiResult.confidence >= 0.5){ status = 'possible_match'; confidence = 'ai_medium'; }
+      else { return { status: 'awaiting_payment', confidence: null, stage: 'ai_rejected', aiReasoning: aiResult.reasoning }; }
+      // Cache only if high confidence
+      if(confidence === 'ai_high'){
+        cache.matches[expense.id] = {
+          ledgerHash: ledgerEntryHash(aiMatch),
+          stage: 'ai',
+          confidence: confidence,
+          aiConfidence: aiResult.confidence,
+          aiReasoning: aiResult.reasoning,
+          ts: new Date().toISOString()
+        };
+        saveMatchCache(cache);
+      }
+      return {
+        status: status,
+        confidence: confidence,
+        stage: 'ai',
+        match: aiMatch,
+        aiConfidence: aiResult.confidence,
+        aiReasoning: aiResult.reasoning
+      };
+    }
+  }
+
+  return result;
+}
+
+async function buildReconciliation(days) {
+  var audit = await buildApprovalAudit(days || 30);
+  var approved = audit.fullyApproved;
+  if(approved.length === 0) {
+    return { paid: [], paidWithTolerance: [], possibleMatch: [], awaitingPayment: [], summary: { totalApproved: 0 } };
+  }
+  // Fetch Ledger entries from earliest approval onwards
+  var earliest = approved.reduce(function(min, e){ return e.date.getTime() < min ? e.date.getTime() : min; }, Date.now());
+  var startDate = new Date(earliest - 86400000); // -1 day buffer
+  var endDate = new Date(Date.now() + 86400000);
+  var ledgerEntries = await getLedgerRange(startDate, endDate);
+
+  var paid = [], paidWithTolerance = [], possibleMatch = [], awaitingPayment = [];
+  var totalApproved = 0, totalPaid = 0, totalAwaiting = 0;
+
+  // Load match cache once per reconciliation pass
+  var cache = loadMatchCache();
+  var matcherStats = { exact: 0, exact_tolerance: 0, fuzzy: 0, ai: 0, cached: 0, manual: 0, awaiting: 0, possible: 0 };
+
+  for(var ei=0; ei<approved.length; ei++){
+    var expense = approved[ei];
+    totalApproved += expense.amount;
+    // If the expense has subItems, match each sub-item individually
+    if(expense.subItems && expense.subItems.length > 1){
+      var allMatched = true;
+      var subResults = [];
+      for(var si_i=0; si_i<expense.subItems.length; si_i++){
+        var si = expense.subItems[si_i];
+        var subExpense = { id: expense.id+':sub'+si_i, amount: si.amount, vendor: si.vendor, body: si.vendor, date: expense.date, supportingDocs: expense.supportingDocs };
+        var subMatch = await matchLedgerEntryWithAI(subExpense, ledgerEntries, cache);
+        subResults.push({ subItem: si, match: subMatch });
+        if(!subMatch || subMatch.status === 'awaiting_payment') allMatched = false;
+        if(subMatch && subMatch.stage) matcherStats[subMatch.stage] = (matcherStats[subMatch.stage]||0) + 1;
+      }
+      var combined = Object.assign({}, expense, { subItemResults: subResults, allSubItemsMatched: allMatched });
+      if(allMatched){ paid.push(combined); totalPaid += expense.amount; }
+      else { awaitingPayment.push(combined); totalAwaiting += expense.amount; }
+      continue;
+    }
+    // Single-amount expense
+    var result = await matchLedgerEntryWithAI(expense, ledgerEntries, cache);
+    var withMatch = Object.assign({}, expense, { matchResult: result });
+    if(result && result.stage) matcherStats[result.stage] = (matcherStats[result.stage]||0) + 1;
+    if(!result){
+      awaitingPayment.push(withMatch); totalAwaiting += expense.amount;
+    } else if(result.status === 'paid'){
+      paid.push(withMatch); totalPaid += expense.amount;
+    } else if(result.status === 'paid_with_tolerance'){
+      paidWithTolerance.push(withMatch); totalPaid += expense.amount;
+    } else if(result.status === 'possible_match'){
+      possibleMatch.push(withMatch);
+    } else {
+      awaitingPayment.push(withMatch); totalAwaiting += expense.amount;
+    }
+  }
+
+  return {
+    paid: paid,
+    paidWithTolerance: paidWithTolerance,
+    possibleMatch: possibleMatch,
+    awaitingPayment: awaitingPayment,
+    matcherStats: matcherStats,
+    cacheSize: Object.keys(cache.matches).length,
+    summary: {
+      totalApproved: totalApproved,
+      totalPaid: totalPaid,
+      totalAwaiting: totalAwaiting,
+      totalPossible: possibleMatch.reduce(function(s,e){return s+e.amount;},0),
+      countApproved: approved.length,
+      countPaid: paid.length,
+      countPaidTolerance: paidWithTolerance.length,
+      countPossible: possibleMatch.length,
+      countAwaiting: awaitingPayment.length
+    }
+  };
+}
+
+// ── Outlier Detection ────────────────────────────────────────────────────────
+// Classifies items needing your manual review. Builds the numbered list shown
+// in the daily DM report so you can reply "1 ok" / "2 chase" etc.
+async function buildOutliers(rec) {
+  var outliers = [];
+  var SEVEN_DAYS_MS = 7 * 86400000;
+  var TEN_DAYS_MS = 10 * 86400000;
+  var now = Date.now();
+
+  // Type 1: Amount mismatch (paid_with_tolerance with diff >= Rs 500)
+  rec.paidWithTolerance.forEach(function(e){
+    var m = e.matchResult ? e.matchResult.match : null;
+    if(!m) return;
+    var diff = m.amount - e.amount;
+    if(Math.abs(diff) >= 500){
+      outliers.push({
+        type: 'amount_mismatch',
+        expense: e,
+        ledger: m,
+        approved: e.amount,
+        actualPaid: m.amount,
+        diff: diff,
+        pctDiff: e.matchResult.pctDiff,
+        likelyTDS: diff < 0 && Math.abs(diff/e.amount) < 0.05
+      });
+    }
+  });
+
+  // Type 2: Low-confidence AI matches (possible_match from ai_medium)
+  rec.possibleMatch.forEach(function(e){
+    if(!e.matchResult) return;
+    if(e.matchResult.stage === 'ai' || e.matchResult.confidence === 'ai_medium'){
+      outliers.push({
+        type: 'ai_low_confidence',
+        expense: e,
+        ledger: e.matchResult.match,
+        aiConfidence: e.matchResult.aiConfidence,
+        aiReasoning: e.matchResult.aiReasoning
+      });
+    } else {
+      outliers.push({
+        type: 'possible_match',
+        expense: e,
+        ledger: e.matchResult.match,
+        approved: e.amount,
+        actualPaid: e.matchResult.match ? e.matchResult.match.amount : 0
+      });
+    }
+  });
+
+  // Type 3: Stale awaiting (approved >=7 days, no Ledger entry yet)
+  rec.awaitingPayment.forEach(function(e){
+    var ageMs = now - e.date.getTime();
+    if(ageMs >= SEVEN_DAYS_MS){
+      outliers.push({
+        type: 'stale_awaiting',
+        expense: e,
+        ageDays: Math.floor(ageMs / 86400000)
+      });
+    }
+  });
+
+  // Type 4: Date drift (paid items with dateDiffDays >= 10)
+  rec.paid.forEach(function(e){
+    if(!e.matchResult || !e.matchResult.dateDiffDays) return;
+    if(e.matchResult.dateDiffDays >= 10){
+      outliers.push({
+        type: 'date_drift',
+        expense: e,
+        ledger: e.matchResult.match,
+        daysAfterApproval: e.matchResult.dateDiffDays
+      });
+    }
+  });
+
+  // Number them so the user can reply with index
+  outliers.forEach(function(o, i){ o.id = i + 1; });
+  return outliers;
+}
+
+// Build a text section for the evening report
+async function buildReconciliationSection() {
+  try {
+    var rec = await buildReconciliation(30);
+    if(rec.summary.countApproved === 0) return '';
+    var lines = [''];
+    lines.push('--- APPROVED EXPENSES STATUS ---');
+    lines.push('');
+    if(rec.paid.length > 0){
+      lines.push('Paid (' + rec.paid.length + '):');
+      rec.paid.forEach(function(e){
+        var m = e.matchResult ? e.matchResult.match : null;
+        var bankAC = m ? m.bankAC : '';
+        var dt = m ? m.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'}) : '';
+        lines.push('  ✓ ' + (e.vendor || e.body.substring(0,30)) + ' Rs.' + formatINR(e.amount) + (m ? ' → ' + dt + ', ' + bankAC : ''));
+      });
+      lines.push('');
+    }
+    if(rec.paidWithTolerance.length > 0){
+      lines.push('Paid (within 5% tolerance) (' + rec.paidWithTolerance.length + '):');
+      rec.paidWithTolerance.forEach(function(e){
+        var m = e.matchResult ? e.matchResult.match : null;
+        lines.push('  ~ ' + (e.vendor || e.body.substring(0,30)) + ' Rs.' + formatINR(e.amount) + ' (paid Rs.' + formatINR(m ? m.amount : 0) + ')');
+      });
+      lines.push('');
+    }
+    if(rec.awaitingPayment.length > 0){
+      lines.push('Approved but not yet paid (' + rec.awaitingPayment.length + '):');
+      rec.awaitingPayment.forEach(function(e){
+        var d = e.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
+        lines.push('  ⏳ ' + (e.vendor || e.body.substring(0,30)) + ' Rs.' + formatINR(e.amount) + ' (approved ' + d + ')');
+      });
+      lines.push('');
+    }
+    if(rec.possibleMatch.length > 0){
+      lines.push('Possible mismatch — needs review (' + rec.possibleMatch.length + '):');
+      rec.possibleMatch.forEach(function(e){
+        var m = e.matchResult ? e.matchResult.match : null;
+        lines.push('  ⚠ ' + (e.vendor || e.body.substring(0,30)) + ' approved Rs.' + formatINR(e.amount) + ' vs Ledger Rs.' + formatINR(m ? m.amount : 0));
+      });
+      lines.push('');
+    }
+    lines.push('Total approved: Rs.' + formatINR(rec.summary.totalApproved));
+    lines.push('Total paid: Rs.' + formatINR(rec.summary.totalPaid));
+    lines.push('Awaiting payment: Rs.' + formatINR(rec.summary.totalAwaiting));
+    return lines.join('\n');
+  } catch(e) {
+    console.error('[Reconciliation section]', e.message);
+    return '';
+  }
+}
+
+// ── EOD Daily Report Builder (HTML for the JPEG sent to SILENT_OBSERVER) ─────
+function escapeHtml(s) {
+  if(s === null || s === undefined) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function buildEODReportHTML(opts) {
+  // opts: { date, audit, rec, outliers, isFriday, weekStats }
+  var d = opts.date;
+  var audit = opts.audit || { fullyApproved:[], partialApproval:[], noApproval:[], allExpenses:[] };
+  var rec = opts.rec || { paid:[], paidWithTolerance:[], possibleMatch:[], awaitingPayment:[], summary:{} };
+  var outliers = opts.outliers || [];
+  var isFriday = opts.isFriday || false;
+  var weekStats = opts.weekStats || null;
+
+  var todayDate = new Date(d);
+  var todayStr = todayDate.toLocaleDateString('en-IN',{day:'numeric',month:'long',year:'numeric',timeZone:'Asia/Kolkata'});
+  var weekday = todayDate.toLocaleDateString('en-IN',{weekday:'long',timeZone:'Asia/Kolkata'});
+
+  // Filter today's activity
+  var todayKey = d;
+  var todaysApprovals = audit.allExpenses ? audit.allExpenses.filter(function(e){
+    return e.date.toISOString().split('T')[0] === todayKey;
+  }) : [];
+  var todayBoth = todaysApprovals.filter(function(e){ return e.status.mm==='yes' && e.status.sm==='yes'; });
+  var todayOne  = todaysApprovals.filter(function(e){ return (e.status.mm==='yes')!==(e.status.sm==='yes'); });
+  var todayNone = todaysApprovals.filter(function(e){ return e.status.mm!=='yes' && e.status.sm!=='yes'; });
+  var todayBothAmt = todayBoth.reduce(function(s,e){return s+e.amount;},0);
+  var todayOneAmt = todayOne.reduce(function(s,e){return s+e.amount;},0);
+  var todayNoneAmt = todayNone.reduce(function(s,e){return s+e.amount;},0);
+  var todayTotalAmt = todayBothAmt + todayOneAmt + todayNoneAmt;
+
+  function bar(pct){ return Math.max(0, Math.min(100, Math.round(pct))); }
+  function pctOf(part, whole){ return whole > 0 ? (part/whole)*100 : 0; }
+
+  // Sections HTML
+  var paidHTML = rec.paid.length ? rec.paid.map(function(e){
+    var m = e.matchResult ? e.matchResult.match : null;
+    var subDocs = e.supportingDocs && e.supportingDocs.length ? '<div class="item-doc">📎 ' + escapeHtml(e.supportingDocs.map(function(d){return d.filename;}).join(', ')) + '</div>' : '';
+    var dt = m ? m.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'}) : '';
+    var stageTag = e.matchResult && e.matchResult.stage ? '<span class="stage-tag stage-'+escapeHtml(e.matchResult.stage)+'">'+escapeHtml(e.matchResult.stage)+'</span>' : '';
+    return '<div class="item">'+
+      '<div class="item-row"><span class="item-name">'+escapeHtml(e.vendor || (e.body||'').substring(0,40))+' '+stageTag+'</span><span class="item-amount">Rs.'+formatINR(e.amount)+'</span></div>'+
+      (m ? '<div class="item-meta">Ledger '+escapeHtml(dt)+' · '+escapeHtml(m.bankAC||'-')+'</div>' : '')+
+      subDocs+'</div>';
+  }).join('') : '<div class="empty">None today</div>';
+
+  var awaitingHTML = rec.awaitingPayment.length ? rec.awaitingPayment.map(function(e){
+    var d2 = e.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
+    var ageDays = Math.floor((Date.now() - e.date.getTime()) / 86400000);
+    return '<div class="item amber">'+
+      '<div class="item-row"><span class="item-name">'+escapeHtml(e.vendor || (e.body||'').substring(0,40))+'</span><span class="item-amount">Rs.'+formatINR(e.amount)+'</span></div>'+
+      '<div class="item-meta">approved '+escapeHtml(d2)+' · '+ageDays+'d ago, no Ledger entry yet</div></div>';
+  }).join('') : '<div class="empty">None — all approved expenses paid</div>';
+
+  var partialHTML = (audit.partialApproval || []).length ? audit.partialApproval.map(function(e){
+    var who = e.status.mm==='yes' ? 'MM ✓ · SM pending' : (e.status.sm==='yes' ? 'SM ✓ · MM pending' : 'Both pending');
+    var hours = Math.floor((Date.now() - e.date.getTime()) / (60*60*1000));
+    var ageStr = hours >= 24 ? Math.floor(hours/24)+'d' : hours+'h';
+    var subTag = e.subItems && e.subItems.length>1 ? ' · '+e.subItems.length+' sub-items' : '';
+    return '<div class="item gray">'+
+      '<div class="item-row"><span class="item-name">'+escapeHtml(e.vendor || (e.body||'').substring(0,40))+'</span><span class="item-amount">Rs.'+formatINR(e.amount)+'</span></div>'+
+      '<div class="item-meta">'+escapeHtml(who)+' · '+ageStr+escapeHtml(subTag)+'</div></div>';
+  }).join('') : '';
+
+  var queryHTML = (audit.noApproval || []).filter(function(e){return e.queryAnswer;}).map(function(e){
+    return '<div class="item gray">'+
+      '<div class="item-row"><span class="item-name">'+escapeHtml(e.vendor || (e.body||'').substring(0,40))+'</span><span class="item-amount">Rs.'+formatINR(e.amount)+'</span></div>'+
+      '<div class="item-meta">Query answered · awaiting MM + SM</div></div>';
+  }).join('');
+
+  var stuckOnMM = (audit.partialApproval || []).filter(function(e){ return e.status.mm==='pending' && e.status.sm==='yes'; }).reduce(function(s,e){return s+e.amount;},0);
+
+  var outliersHTML = outliers.length ? outliers.map(function(o){
+    var n = o.id;
+    if(o.type === 'amount_mismatch'){
+      var sign = o.diff < 0 ? '−' : '+';
+      var pct = (Math.abs(o.diff)/o.approved*100).toFixed(1);
+      return '<div class="item red">'+
+        '<div class="item-row"><span class="item-name"><b>'+n+'.</b> Amount mismatch — '+escapeHtml(o.expense.vendor||'')+'</span></div>'+
+        '<div class="item-meta">Approved Rs.'+formatINR(o.approved)+' · Ledger Rs.'+formatINR(o.actualPaid)+'<br>Diff '+sign+'Rs.'+formatINR(Math.abs(o.diff))+' ('+sign+pct+'%)'+(o.likelyTDS?' — likely TDS':'')+'</div>'+
+        '<div class="action-box"><span class="cmd">'+n+' ok</span>confirm <span class="cmd">'+n+' flag</span>investigate <span class="cmd">'+n+' ignore</span>skip</div></div>';
+    }
+    if(o.type === 'stale_awaiting'){
+      return '<div class="item red">'+
+        '<div class="item-row"><span class="item-name"><b>'+n+'.</b> Stale — '+escapeHtml(o.expense.vendor||'')+'</span></div>'+
+        '<div class="item-meta">Rs.'+formatINR(o.expense.amount)+' · approved '+o.ageDays+'d ago, no Ledger entry yet</div>'+
+        '<div class="action-box"><span class="cmd">'+n+' chase</span>nudge accountant <span class="cmd">'+n+' paid &lt;date&gt;</span>mark paid</div></div>';
+    }
+    if(o.type === 'ai_low_confidence'){
+      return '<div class="item red">'+
+        '<div class="item-row"><span class="item-name"><b>'+n+'.</b> AI match (low conf '+(o.aiConfidence||0).toFixed(2)+') — '+escapeHtml(o.expense.vendor||'')+'</span></div>'+
+        '<div class="item-meta">Possible: '+escapeHtml(o.ledger ? o.ledger.description+' Rs.'+formatINR(o.ledger.amount) : '')+'<br><i>'+escapeHtml(o.aiReasoning||'')+'</i></div>'+
+        '<div class="action-box"><span class="cmd">'+n+' confirm</span>accept match <span class="cmd">'+n+' reject</span>reject match</div></div>';
+    }
+    if(o.type === 'possible_match'){
+      return '<div class="item red">'+
+        '<div class="item-row"><span class="item-name"><b>'+n+'.</b> Possible match — '+escapeHtml(o.expense.vendor||'')+'</span></div>'+
+        '<div class="item-meta">Approved Rs.'+formatINR(o.approved)+' · Candidate Rs.'+formatINR(o.actualPaid)+'</div>'+
+        '<div class="action-box"><span class="cmd">'+n+' confirm</span>accept <span class="cmd">'+n+' reject</span>reject</div></div>';
+    }
+    if(o.type === 'date_drift'){
+      return '<div class="item red">'+
+        '<div class="item-row"><span class="item-name"><b>'+n+'.</b> Date drift — '+escapeHtml(o.expense.vendor||'')+'</span></div>'+
+        '<div class="item-meta">Paid '+o.daysAfterApproval+'d after approval — review</div>'+
+        '<div class="action-box"><span class="cmd">'+n+' ok</span>confirm <span class="cmd">'+n+' flag</span>investigate</div></div>';
+    }
+    return '';
+  }).join('') : '<div class="empty">No outliers — everything matches</div>';
+
+  // Friday-only matcher learning section
+  var weeklyHTML = '';
+  if(isFriday && weekStats){
+    var total = weekStats.totalMatches || 1;
+    var pctExact = pctOf(weekStats.exact||0, total);
+    var pctFuzzy = pctOf(weekStats.fuzzy||0, total);
+    var pctAI    = pctOf(weekStats.ai||0, total);
+    var pctCached= pctOf(weekStats.cached||0, total);
+    weeklyHTML =
+      '<div class="section weekly">'+
+      '<div class="section-header">📈 MATCHER LEARNING (this week)</div>'+
+      '<div class="row"><span class="row-label">Total matches</span><span class="row-value">'+total+'</span></div>'+
+      '<div style="margin-top:10px">'+
+        '<div class="bar-row"><span class="bar-icon">🎯</span><span class="bar-label">Exact</span><span class="bar-track"><span class="bar-fill green" style="width:'+bar(pctExact)+'%"></span></span><span class="bar-num">'+(weekStats.exact||0)+' · '+pctExact.toFixed(0)+'%</span></div>'+
+        '<div class="bar-row"><span class="bar-icon">🔍</span><span class="bar-label">Fuzzy</span><span class="bar-track"><span class="bar-fill amber" style="width:'+bar(pctFuzzy)+'%"></span></span><span class="bar-num">'+(weekStats.fuzzy||0)+' · '+pctFuzzy.toFixed(0)+'%</span></div>'+
+        '<div class="bar-row"><span class="bar-icon">🤖</span><span class="bar-label">Haiku AI</span><span class="bar-track"><span class="bar-fill ai" style="width:'+bar(pctAI)+'%"></span></span><span class="bar-num">'+(weekStats.ai||0)+' · '+pctAI.toFixed(0)+'%</span></div>'+
+        '<div class="bar-row"><span class="bar-icon">💾</span><span class="bar-label">Cached</span><span class="bar-track"><span class="bar-fill cyan" style="width:'+bar(pctCached)+'%"></span></span><span class="bar-num">'+(weekStats.cached||0)+' · '+pctCached.toFixed(0)+'%</span></div>'+
+      '</div>'+
+      '<div class="total-row"><span class="label">AI cost this week</span><span class="val">~Rs.'+(weekStats.aiCost||'0').toString()+'</span></div>'+
+      '<div class="total-row"><span class="label">Manual confirmations</span><span class="val green">'+(weekStats.manualConfirm||0)+'</span></div>'+
+      '<div class="total-row"><span class="label">Manual rejections</span><span class="val amber">'+(weekStats.manualReject||0)+'</span></div>'+
+      '</div>';
+  }
+
+  var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>'+
+    '*{box-sizing:border-box;margin:0;padding:0}'+
+    'body{background:#0b141a;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;padding:30px 20px;color:#e9edef}'+
+    '.phone-frame{max-width:420px;margin:0 auto;background:#0b141a;border-radius:24px;overflow:hidden;box-shadow:0 4px 30px rgba(0,0,0,0.5)}'+
+    '.header{background:#202c33;padding:14px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #2a3942}'+
+    '.avatar{width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#00a884,#008569);display:flex;align-items:center;justify-content:center;color:white;font-weight:600;font-size:16px}'+
+    '.header-name{color:#e9edef;font-size:16px;font-weight:500}'+
+    '.header-status{color:#8696a0;font-size:12px;margin-top:2px}'+
+    '.chat-area{background:#0b141a;padding:16px 12px;background-image:radial-gradient(rgba(255,255,255,0.02) 1px,transparent 1px),radial-gradient(rgba(255,255,255,0.02) 1px,transparent 1px);background-size:40px 40px;background-position:0 0,20px 20px}'+
+    '.timestamp{text-align:center;color:#8696a0;font-size:12px;margin:8px 0 16px}'+
+    '.message{background:#202c33;border-radius:8px;padding:14px 16px;margin-bottom:10px;max-width:95%}'+
+    '.report-title{font-size:14px;font-weight:600;color:#00d9c5;margin-bottom:4px;letter-spacing:0.3px}'+
+    '.report-subtitle{font-size:11px;color:#8696a0;margin-bottom:12px}'+
+    '.section{margin-top:14px;padding-top:12px;border-top:1px solid #2a3942}'+
+    '.section:first-of-type{border-top:none;margin-top:8px;padding-top:0}'+
+    '.section-header{font-size:11px;font-weight:700;color:#00d9c5;text-transform:uppercase;letter-spacing:0.6px;margin-bottom:8px}'+
+    '.row{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:#e9edef;margin-bottom:5px;line-height:1.4}'+
+    '.row-label{color:#8696a0;font-size:12px}.row-value{font-weight:500}'+
+    '.bar-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:12px}'+
+    '.bar-icon{width:18px;text-align:center;font-size:13px}.bar-label{width:72px;color:#d1d7db;font-size:11px}'+
+    '.bar-track{flex:1;height:8px;background:#2a3942;border-radius:4px;overflow:hidden}'+
+    '.bar-fill{height:100%;border-radius:4px}'+
+    '.bar-fill.green{background:linear-gradient(90deg,#00a884,#00d9c5)}'+
+    '.bar-fill.amber{background:linear-gradient(90deg,#d6a84b,#f0c674)}'+
+    '.bar-fill.red{background:linear-gradient(90deg,#ee6b6e,#f08080)}'+
+    '.bar-fill.ai{background:linear-gradient(90deg,#9d6bff,#c8a8ff)}'+
+    '.bar-fill.cyan{background:linear-gradient(90deg,#4abdc4,#7adde2)}'+
+    '.bar-num{color:#d1d7db;font-size:11px;min-width:75px;text-align:right}'+
+    '.item{background:#111b21;border-left:3px solid #00a884;padding:8px 10px;margin-bottom:6px;border-radius:4px}'+
+    '.item.amber{border-left-color:#d6a84b}.item.red{border-left-color:#ee6b6e}.item.gray{border-left-color:#54656f}'+
+    '.item-row{display:flex;justify-content:space-between;font-size:12px}'+
+    '.item-name{color:#e9edef;flex:1}.item-amount{color:#00d9c5;font-weight:600;margin-left:8px;white-space:nowrap}'+
+    '.item-meta{color:#8696a0;font-size:11px;margin-top:3px}'+
+    '.item-doc{color:#6db4ff;font-size:11px;margin-top:3px;font-style:italic}'+
+    '.total-row{display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px dashed #2a3942;font-size:12px}'+
+    '.total-row .label{color:#8696a0}.total-row .val{color:#e9edef;font-weight:600}'+
+    '.total-row .val.green{color:#00d9c5}.total-row .val.amber{color:#f0c674}'+
+    '.action-box{background:#1f2c33;border:1px solid #2a3942;border-radius:6px;padding:8px 10px;margin-top:6px;font-size:11px;color:#8696a0;line-height:1.5}'+
+    '.action-box .cmd{color:#00d9c5;font-family:monospace;background:#0b141a;padding:1px 5px;border-radius:3px;margin-right:4px}'+
+    '.empty{color:#8696a0;font-size:12px;font-style:italic;padding:6px 0}'+
+    '.footer-note{margin-top:12px;padding-top:10px;border-top:1px solid #2a3942;color:#8696a0;font-size:11px;text-align:center;font-style:italic}'+
+    '.stage-tag{display:inline-block;background:#2a3942;color:#8696a0;font-size:9px;padding:1px 5px;border-radius:3px;margin-left:4px;font-weight:400;text-transform:uppercase;letter-spacing:0.3px}'+
+    '.stage-tag.stage-ai{background:#3a2a55;color:#c8a8ff}'+
+    '.stage-tag.stage-cached{background:#2a3a4a;color:#7adde2}'+
+    '.stage-tag.stage-fuzzy{background:#3a3525;color:#f0c674}'+
+    '.delivered{color:#53bdeb;font-size:11px;margin-left:4px}'+
+  '</style></head><body>'+
+    '<div class="phone-frame">'+
+      '<div class="header"><div class="avatar">F</div><div class="header-info"><div class="header-name">Fidato MIS Bot</div><div class="header-status">+91 98701 11582 · online</div></div></div>'+
+      '<div class="chat-area">'+
+        '<div class="timestamp">Today, 7:00 PM</div>'+
+        '<div class="message">'+
+          '<div class="report-title">📊 FIDATO MIS — DAILY REPORT</div>'+
+          '<div class="report-subtitle">'+escapeHtml(todayStr)+' · '+escapeHtml(weekday)+'</div>'+
+
+          '<div class="section">'+
+            '<div class="section-header">Today\'s Activity</div>'+
+            '<div class="row"><span class="row-label">Requests posted</span><span class="row-value">'+todaysApprovals.length+'</span></div>'+
+            '<div class="row"><span class="row-label">Total requested</span><span class="row-value">Rs.'+formatINR(todayTotalAmt)+'</span></div>'+
+            '<div style="margin-top:10px">'+
+              '<div class="bar-row"><span class="bar-icon">✓</span><span class="bar-label">Both ✓</span><span class="bar-track"><span class="bar-fill green" style="width:'+bar(pctOf(todayBoth.length,todaysApprovals.length||1))+'%"></span></span><span class="bar-num">'+todayBoth.length+' · Rs.'+formatINR(todayBothAmt)+'</span></div>'+
+              '<div class="bar-row"><span class="bar-icon">◐</span><span class="bar-label">One only</span><span class="bar-track"><span class="bar-fill amber" style="width:'+bar(pctOf(todayOne.length,todaysApprovals.length||1))+'%"></span></span><span class="bar-num">'+todayOne.length+' · Rs.'+formatINR(todayOneAmt)+'</span></div>'+
+              '<div class="bar-row"><span class="bar-icon">○</span><span class="bar-label">Neither</span><span class="bar-track"><span class="bar-fill red" style="width:'+bar(pctOf(todayNone.length,todaysApprovals.length||1))+'%"></span></span><span class="bar-num">'+todayNone.length+' · Rs.'+formatINR(todayNoneAmt)+'</span></div>'+
+            '</div>'+
+          '</div>'+
+
+          '<div class="section">'+
+            '<div class="section-header">✓ Approved &amp; Paid (all)</div>'+
+            paidHTML+
+          '</div>'+
+
+          '<div class="section">'+
+            '<div class="section-header">⏳ Approved, Awaiting Payment</div>'+
+            awaitingHTML+
+            '<div class="total-row"><span class="label">Total paid</span><span class="val green">Rs.'+formatINR(rec.summary.totalPaid||0)+'</span></div>'+
+            '<div class="total-row"><span class="label">Awaiting payment</span><span class="val amber">Rs.'+formatINR(rec.summary.totalAwaiting||0)+'</span></div>'+
+          '</div>'+
+
+          (partialHTML || queryHTML ?
+            '<div class="section">'+
+              '<div class="section-header">◐ Partial — Needs MM/SM</div>'+
+              partialHTML + queryHTML +
+              (stuckOnMM > 0 ? '<div class="total-row"><span class="label">Stuck on MM</span><span class="val amber">Rs.'+formatINR(stuckOnMM)+'</span></div>' : '')+
+            '</div>' : ''
+          )+
+
+          '<div class="section">'+
+            '<div class="section-header">⚠ Manual Intervention</div>'+
+            outliersHTML+
+          '</div>'+
+
+          weeklyHTML+
+
+          '<div class="footer-note">'+
+            (isFriday ? 'Weekly model report included above.' : 'Next weekly model report — Friday 7 PM') +
+          '</div>'+
+        '</div>'+
+      '</div>'+
+    '</div>'+
+  '</body></html>';
+  return html;
+}
+
+// Compute weekly matcher stats from match cache (for Friday section)
+function computeWeeklyMatcherStats(cache) {
+  if(!cache) cache = loadMatchCache();
+  var oneWeekAgo = Date.now() - 7*86400000;
+  var stats = { exact:0, exact_tolerance:0, fuzzy:0, ai:0, cached:0, manual:0, totalMatches:0, manualConfirm:0, manualReject:0, aiCost:0 };
+  Object.keys(cache.matches).forEach(function(k){
+    var m = cache.matches[k];
+    var ts = m.ts ? new Date(m.ts).getTime() : 0;
+    if(ts < oneWeekAgo) return;
+    stats.totalMatches++;
+    if(m.stage === 'exact') stats.exact++;
+    else if(m.stage === 'exact_tolerance') stats.exact_tolerance++;
+    else if(m.stage === 'fuzzy') stats.fuzzy++;
+    else if(m.stage === 'ai') stats.ai++;
+    if(m.manuallyConfirmed) stats.manualConfirm++;
+    if(m.manuallyRejected) stats.manualReject++;
+  });
+  // Cached count: matches that came from cache this week (we approximate by counting all entries)
+  stats.cached = Object.keys(cache.matches).length;
+  // AI cost rough estimate (each AI call ~$0.0008 ~Rs 0.07)
+  stats.aiCost = (stats.ai * 0.07).toFixed(2);
+  return stats;
+}
+
+// Send the EOD report image to SILENT_OBSERVER
+async function sendEODReport(dateStr) {
+  if(!waReady){ console.log('[EOD] WA not ready'); return; }
+  try {
+    var d = dateStr || new Date().toISOString().split('T')[0];
+    var audit = await buildApprovalAudit(30);
+    var rec = await buildReconciliation(30);
+    var outliers = await buildOutliers(rec);
+    var dayOfWeek = new Date(d).getDay(); // 0=Sun ... 5=Fri
+    var isFriday = dayOfWeek === 5;
+    var weekStats = isFriday ? computeWeeklyMatcherStats() : null;
+
+    var html = buildEODReportHTML({ date: d, audit: audit, rec: rec, outliers: outliers, isFriday: isFriday, weekStats: weekStats });
+    var img = await htmlToImage(html, 460, 2000);
+    var buf = Buffer.isBuffer(img) ? img : Buffer.from(img);
+
+    var captionLines = ['📊 Daily Report — '+ new Date(d).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric',timeZone:'Asia/Kolkata'})];
+    var todaysCount = (audit.allExpenses || []).filter(function(e){ return e.date.toISOString().split('T')[0] === d; }).length;
+    captionLines.push(todaysCount+' requests today · '+(rec.paid.length)+' paid · Rs.'+formatINR(rec.summary.totalAwaiting||0)+' awaiting');
+    if(outliers.length > 0) captionLines.push(outliers.length+' outlier(s) need your input — reply with command shown in image');
+    if(isFriday) captionLines.push('📈 Weekly matcher learning included.');
+
+    var jid = getSilentObserverJid();
+    await waClient.sendMessage(jid, new MessageMedia('image/png', buf.toString('base64'), 'EOD_'+d+'.png'), { caption: captionLines.join('\n') });
+    console.log('[EOD] sent to', jid);
+    // Persist outlier list so user replies can reference by index
+    saveDMState(Object.assign(loadDMState(), { lastOutliers: { date: d, items: outliers.map(function(o){
+      return { id: o.id, type: o.type, expenseId: o.expense.id, ledgerHash: o.ledger ? ledgerEntryHash(o.ledger) : null };
+    })}}));
+    return { success: true, outlierCount: outliers.length };
+  } catch(e) {
+    console.error('[EOD] failed:', e.message);
+    return { error: e.message };
+  }
+}
+
 // ── Report HTML ───────────────────────────────────────────────────────────────
 async function generateDailyReport(dateStr){
   var entries=await getLedgerData(dateStr);var fp=await getFundPosition();
@@ -1351,13 +2328,14 @@ cron.schedule('30 13 * * *',async function(){
   try {
     var data = await generateDailyReport(d);
     var staleSection = await buildStalePendingSection();
+    var recSection = await buildReconciliationSection();
     if(data.entryCount > 0){
       var img = await htmlToImage(buildReportHTML(data),800,1200);
       var buf = Buffer.isBuffer(img)?img:Buffer.from(img);
-      var caption = prefix + 'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut) + staleSection;
+      var caption = prefix + 'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut) + staleSection + recSection;
       await waClient.sendMessage(targetJid, new MessageMedia('image/png',buf.toString('base64'),'MIS.png'), {caption:caption});
-    } else if(staleSection) {
-      await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries today.'+staleSection);
+    } else if(staleSection || recSection) {
+      await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries today.'+staleSection+recSection);
     } else if(silent) {
       // Even with no data, observer should hear from the bot daily so they know it ran
       await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries and no stale approvals.');
@@ -1385,6 +2363,14 @@ cron.schedule('*/10 * * * *',function(){
   scanStalePendings().catch(function(e){console.error('[Cron stale]',e.message);});
 },{timezone:'Asia/Kolkata'});
 
+// 7 PM IST daily — send EOD report image privately to SILENT_OBSERVER (917838537000).
+// On Fridays, the same image includes the weekly matcher learning section.
+// Always fires regardless of silent mode (private DM to one person).
+cron.schedule('0 19 * * *',function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  sendEODReport().catch(function(e){console.error('[EOD cron]',e.message);});
+},{timezone:'Asia/Kolkata'});
+
 app.get('/api/whoami',async function(req,res){
   // Returns the bot's view of recent direct chats so we can debug what JIDs come in
   try {
@@ -1409,12 +2395,59 @@ app.get('/api/whoami',async function(req,res){
 app.get('/api/auth-list',function(req,res){res.json({accountants:CONFIG.ACCOUNTANT_PHONES,testNumbers:CONFIG.TEST_PHONES||[],mm:CONFIG.MM_PHONE,sm:CONFIG.SM_PHONE,note:'Only these phone numbers can DM the bot for expense relay. @lid (anonymous) JIDs are always rejected.'});});
 app.get('/api/dm-state',function(req,res){try{res.json(loadDMState());}catch(e){res.json({error:e.message});}});
 app.get('/api/dm-clear',function(req,res){try{saveDMState({pending:{}});res.json({success:true});}catch(e){res.json({error:e.message});}});
+app.get('/api/reconciliation',async function(req,res){
+  try {
+    var days = parseInt(req.query.days) || 30;
+    var rec = await buildReconciliation(days);
+    var fmt = function(e){
+      var m = e.matchResult ? e.matchResult.match : null;
+      return {
+        date: e.date.toISOString().split('T')[0],
+        vendor: e.vendor,
+        amount: e.amount,
+        amountFormatted: formatINR(e.amount),
+        body: e.body ? e.body.substring(0,200) : '',
+        sender: e.sender,
+        subItems: e.subItems || null,
+        subItemResults: e.subItemResults || null,
+        supportingDocs: e.supportingDocs || null,
+        matchStatus: e.matchResult ? e.matchResult.status : null,
+        matchConfidence: e.matchResult ? e.matchResult.confidence : null,
+        ledgerMatch: m ? {
+          date: m.date.toISOString().split('T')[0],
+          entity: m.entity,
+          description: m.description,
+          amount: m.amount,
+          mode: m.mode,
+          bankAC: m.bankAC,
+          person: m.person
+        } : null,
+        dateDiffDays: e.matchResult ? e.matchResult.dateDiffDays : null,
+        pctDiff: e.matchResult ? e.matchResult.pctDiff : null
+      };
+    };
+    res.json({
+      summary: rec.summary,
+      paid: rec.paid.map(fmt),
+      paidWithTolerance: rec.paidWithTolerance.map(fmt),
+      possibleMatch: rec.possibleMatch.map(fmt),
+      awaitingPayment: rec.awaitingPayment.map(fmt)
+    });
+  } catch(e) { res.json({error: e.message}); }
+});
 app.get('/api/silent-on',function(req,res){try{saveSilentMode(true);res.json({success:true,silentMode:true,message:'Silent mode ON. Bot will stop group reminders and DM the observer ('+SILENT_OBSERVER+') with daily summaries.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/silent-off',function(req,res){try{saveSilentMode(false);res.json({success:true,silentMode:false,message:'Silent mode OFF. Bot will resume group reminders and post evening report to Day Book group.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/silent-status',function(req,res){try{res.json({silentMode:loadSilentMode(),observer:SILENT_OBSERVER});}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-scan',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await scanStalePendings();res.json({success:true,remindersSent:count});}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-state',function(req,res){try{res.json(loadStaleState());}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-reset',function(req,res){try{saveStaleState({reminded:{}});res.json({success:true,message:'Stale reminder state cleared - next scan will re-send any 30+ min pending items'});}catch(e){res.json({error:e.message});}});
+app.get('/api/eod-send',async function(req,res){try{var r=await sendEODReport(req.query.date);res.json(r);}catch(e){res.json({error:e.message});}});
+app.get('/api/eod-preview',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var audit=await buildApprovalAudit(30);var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);var dayOfWeek=new Date(d).getDay();var isFriday=req.query.friday==='1'||dayOfWeek===5;var weekStats=isFriday?computeWeeklyMatcherStats():null;res.send(buildEODReportHTML({date:d,audit:audit,rec:rec,outliers:outliers,isFriday:isFriday,weekStats:weekStats}));}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/eod-image',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var audit=await buildApprovalAudit(30);var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);var dayOfWeek=new Date(d).getDay();var isFriday=req.query.friday==='1'||dayOfWeek===5;var weekStats=isFriday?computeWeeklyMatcherStats():null;var html=buildEODReportHTML({date:d,audit:audit,rec:rec,outliers:outliers,isFriday:isFriday,weekStats:weekStats});var img=await htmlToImage(html,460,2000);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/match-cache',function(req,res){try{res.json(loadMatchCache());}catch(e){res.json({error:e.message});}});
+app.get('/api/match-cache-clear',function(req,res){try{saveMatchCache({matches:{},rejected:{},manualPaid:{}});res.json({success:true});}catch(e){res.json({error:e.message});}});
+app.get('/api/matcher-stats',function(req,res){try{res.json(computeWeeklyMatcherStats());}catch(e){res.json({error:e.message});}});
+app.get('/api/outliers',async function(req,res){try{var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);res.json({count:outliers.length,outliers:outliers});}catch(e){res.json({error:e.message});}});
 app.get('/api/wa-reset',function(req,res){
   try {
     console.log('[WA] Manual reset requested via /api/wa-reset');
