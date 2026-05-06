@@ -180,10 +180,22 @@ function extractLineAmount(line) {
   // Pattern 4: Rs/INR/₹ prefix
   var rm=line.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
   if(rm) return parseFloat(rm[1].replace(/,/g,''));
-  // Pattern 5: standalone large numbers (>=10000), supports Indian-format with commas like "7,08,708"
-  // Match either plain digits 5+ long, OR digits with comma-groupings
-  var lm=line.match(/\b(\d{1,3}(?:,\d{2,3}){1,3}|\d{5,})\b/);
-  if(lm){var v=parseFloat(lm[1].replace(/,/g,'')); if(v>=10000&&v<1000000000) return v;}
+  // Pattern 5: standalone numbers >= 100, supports Indian-format with commas like "7,08,708"
+  // Match: comma-grouped (1,000+), or 3-9 digits standalone
+  // Prefer the longest match to avoid e.g. matching only "708" inside "708708".
+  // Strategy: try comma-format first (more specific), then plain digits.
+  var lm = line.match(/\b(\d{1,3}(?:,\d{2,3}){1,3})\b/);
+  if(!lm) lm = line.match(/\b(\d{3,9})\b/);
+  if(lm){
+    var v = parseFloat(lm[1].replace(/,/g,''));
+    // Accept 100 <= v < 1 billion. Reject typical phone-number-ish values (10-digit Indian phones starting with 7/8/9)
+    if(v >= 100 && v < 1000000000){
+      // Phone-number guard: reject 10-digit standalone numbers starting with 6-9 (Indian mobile prefixes)
+      var raw = lm[1].replace(/,/g,'');
+      if(raw.length === 10 && /^[6-9]/.test(raw)) return 0;
+      return v;
+    }
+  }
   return 0;
 }
 function extractLineVendor(line) {
