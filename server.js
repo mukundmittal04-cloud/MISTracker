@@ -24,6 +24,7 @@ const CONFIG = {
   MM_PHONE: '919873095398',
   SM_PHONE: '919873429794',
   ACCOUNTANT_PHONES: ['919873574112','919873574180','919873574192','919873574103','919773592304'],
+  TEST_PHONES: ['917838537000'], // approved test numbers for DM relay (e.g., your own number for testing)
   MM_NAMES: ['madhur', 'madhur mittal'],
   SM_NAMES: ['sumit', 'sumit mittal'],
 };
@@ -83,6 +84,10 @@ function createWhatsAppClient() {
       try { waClient.initialize().catch(function(e) { console.error('[WA] reinit failed:', e.message); }); }
       catch(e) { console.error('[WA] reinit threw:', e.message); }
     }, 10000);
+  });
+  // Listen for direct messages from accountants — bot acts as relay to approval group
+  waClient.on('message', function(msg) {
+    handleAccountantDM(msg).catch(function(e){ console.error('[DM handler]', e.message); });
   });
   waClient.initialize().catch(function(e) { console.error('WA init failed:', e.message); });
 }
@@ -172,8 +177,9 @@ function extractLineAmount(line) {
   // Pattern 4: Rs/INR/₹ prefix
   var rm=line.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
   if(rm) return parseFloat(rm[1].replace(/,/g,''));
-  // Pattern 5: standalone large numbers (>=10000)
-  var lm=line.match(/\b(\d{5,}(?:[,\d]*)?)\b/);
+  // Pattern 5: standalone large numbers (>=10000), supports Indian-format with commas like "7,08,708"
+  // Match either plain digits 5+ long, OR digits with comma-groupings
+  var lm=line.match(/\b(\d{1,3}(?:,\d{2,3}){1,3}|\d{5,})\b/);
   if(lm){var v=parseFloat(lm[1].replace(/,/g,'')); if(v>=10000&&v<1000000000) return v;}
   return 0;
 }
@@ -527,6 +533,544 @@ async function sendPendingReminders() {
   } catch(e){console.error('[Reminders] Error:',e.message);return 0;}
 }
 
+
+
+
+// ── DM Relay: accountants DM bot, bot validates and posts to group ───────────
+var DM_STATE_FILE = './wa_auth/dm_state.json';
+
+function loadDMState() {
+  try {
+    if(fs.existsSync(DM_STATE_FILE)){
+      return JSON.parse(fs.readFileSync(DM_STATE_FILE, 'utf8'));
+    }
+  } catch(e) { console.error('[DM] state load failed:', e.message); }
+  return { pending: {} }; // jid -> { amount, vendor, reason, mediaIds: [], lastUpdate: ISO, askedFor: 'amount'|'vendor'|null }
+}
+
+function saveDMState(state) {
+  try {
+    if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
+    fs.writeFileSync(DM_STATE_FILE, JSON.stringify(state, null, 2));
+  } catch(e) { console.error('[DM] state save failed:', e.message); }
+}
+
+// Pending state expires after 30 minutes — accountant has to start fresh
+function pruneStaleDMState(state) {
+  var now = Date.now();
+  Object.keys(state.pending).forEach(function(jid){
+    var entry = state.pending[jid];
+    if(now - new Date(entry.lastUpdate).getTime() > 30*60*1000){
+      delete state.pending[jid];
+    }
+  });
+}
+
+// Determine whether a sender is allowed to use the DM relay.
+// Phone-based whitelist ONLY — names are unreliable (anyone can rename a contact "Madhur Mittal").
+// Allowed: ACCOUNTANT_PHONES, MM_PHONE, SM_PHONE, TEST_PHONES.
+// JIDs ending in @lid are opaque WhatsApp internal IDs (not phone numbers) and are REJECTED
+// unless we have a verified mapping. This prevents impersonation via LID-only contacts.
+function isAuthorisedAccountant(rawJid, contactName) {
+  if(!rawJid) return false;
+  // Reject @lid JIDs — these are anonymous WhatsApp internal IDs, no phone verification possible
+  if(rawJid.indexOf('@lid') >= 0) {
+    console.log('[Auth] reject @lid sender:', rawJid, '(name:', contactName, ')');
+    return false;
+  }
+  // Standard phone JID: phone@c.us
+  if(rawJid.indexOf('@c.us') < 0) return false;
+  var phoneOnly = rawJid.split('@')[0].replace(/[^0-9]/g, '');
+  if(!phoneOnly) return false;
+  // Strict whitelist — phone number must be in one of the approved lists
+  var whitelist = CONFIG.ACCOUNTANT_PHONES.concat([CONFIG.MM_PHONE, CONFIG.SM_PHONE]).concat(CONFIG.TEST_PHONES || []);
+  if(whitelist.indexOf(phoneOnly) >= 0) {
+    console.log('[Auth] allow:', phoneOnly, '(', contactName, ')');
+    return true;
+  }
+  console.log('[Auth] reject:', phoneOnly, '(', contactName, ') - not in whitelist');
+  return false;
+}
+
+// Build the structured group post text from a complete pending entry
+function buildGroupPostFromDM(entry, posterName) {
+  var lines = ['*EXPENSE REQUEST*', ''];
+  if(entry.details) lines.push('Details: ' + entry.details);
+  if(entry.subItems && entry.subItems.length > 1){
+    var total = entry.subItems.reduce(function(s,it){return s+it.amount;},0);
+    lines.push('Amount: Rs.' + formatINR(total) + ' total');
+    entry.subItems.forEach(function(si){ lines.push('  - ' + si.vendor + ' Rs.' + formatINR(si.amount)); });
+  } else if(entry.amount > 0) {
+    lines.push('Amount: Rs.' + formatINR(entry.amount));
+  }
+  if(entry.company) lines.push('Company: ' + entry.company);
+  if(entry.fromAC) lines.push('From: ' + entry.fromAC);
+  lines.push('Posted by: ' + posterName);
+  lines.push('');
+  lines.push('MM/SM please review.');
+  return lines.join('\n');
+}
+
+// Handle an incoming DM. Returns true if handled, false if not relevant.
+async function handleAccountantDM(msg) {
+  if(!msg || !waReady) return false;
+  var rawFrom = msg.from || '';
+  // Only direct chats, not groups
+  if(rawFrom.indexOf('@g.us') >= 0) return false;
+  if(rawFrom.indexOf('@c.us') < 0 && rawFrom.indexOf('@lid') < 0) return false;
+  // Don't process bot's own messages
+  if(msg.fromMe) return false;
+
+  var senderInfo = await identifySender(rawFrom);
+  if(!isAuthorisedAccountant(rawFrom, senderInfo.contactName)){
+    console.log('[DM] unauthorised sender:', rawFrom, senderInfo.contactName);
+    // Send a polite reject message ONLY ONCE per sender per day to avoid spam loops
+    if(!global._unauthorisedNotified) global._unauthorisedNotified = {};
+    var dayKey = rawFrom + '_' + new Date().toISOString().split('T')[0];
+    if(!global._unauthorisedNotified[dayKey]){
+      global._unauthorisedNotified[dayKey] = true;
+      try {
+        await waClient.sendMessage(rawFrom, 'This is the Fidato MIS Bot. Your number is not authorised to use the expense approval relay. Please contact Mukund or Madhur if you need access.');
+      } catch(e) { /* ignore */ }
+    }
+    return false;
+  }
+
+  var body = (msg.body || '').trim();
+  var hasMedia = msg.hasMedia || false;
+  var thisMsgId = msg.id._serialized || msg.id.id;
+  console.log('[DM] from', senderInfo.contactName || rawFrom, ':', body.substring(0,80), hasMedia?'[+media]':'');
+
+  var state = loadDMState();
+  pruneStaleDMState(state);
+
+  // Special commands
+  if(/^\s*(cancel|reset|clear)\s*$/i.test(body)){
+    delete state.pending[rawFrom];
+    saveDMState(state);
+    await waClient.sendMessage(rawFrom, 'Pending request cleared. Send a new expense to start over.');
+    return true;
+  }
+  if(/^\s*help\s*$/i.test(body)){
+    await waClient.sendMessage(rawFrom, [
+      'Send me an expense request and I will post it in the approval group.',
+      '',
+      'I need 4 things:',
+      '1. Details (what the payment is for)',
+      '2. Amount',
+      '3. Company',
+      '4. Bank A/C to pay from',
+      '',
+      'You can send them all at once like:',
+      'Details: TMT bar payment slab 110-118',
+      'Amount: 7,08,708',
+      'Company: Hansaflon Buildcon',
+      'From: Hansaflon JKB',
+      '',
+      'Or just write naturally and I will ask for whatever is missing.',
+      'Attachments (PDF/image) are optional — vision will read them.',
+      '',
+      'Reply "cancel" to clear a pending request.'
+    ].join('\n'));
+    return true;
+  }
+
+  // Get or create pending entry for this sender
+  if(!state.pending[rawFrom]) state.pending[rawFrom] = { details: '', amount: 0, company: '', fromAC: '', mediaIds: [], lastUpdate: new Date().toISOString(), askedFor: null, posterName: senderInfo.contactName || rawFrom, subItems: null };
+  var entry = state.pending[rawFrom];
+  entry.lastUpdate = new Date().toISOString();
+  entry.posterName = senderInfo.contactName || entry.posterName;
+
+  // Try to parse a structured single-message format (4 fields with prefixes)
+  // Example:
+  //   Details: TMT bar payment for slab 110-118
+  //   Amount: 7,08,708
+  //   Company: Hansaflon Buildcon
+  //   From: Hansaflon JKB
+  function parseStructuredFields(text) {
+    var result = {};
+    if(!text) return result;
+    var lines = text.split('\n');
+    lines.forEach(function(line) {
+      var m = line.match(/^\s*(details?|amount|company|from|account|reason|vendor|to)\s*[:\-]\s*(.+)$/i);
+      if(m){
+        var key = m[1].toLowerCase();
+        var val = m[2].trim();
+        if(key === 'detail' || key === 'details' || key === 'reason' || key === 'vendor' || key === 'to') result.details = val;
+        else if(key === 'amount'){
+          var p = parseExpenseMessage(val);
+          if(p[0].amount > 0) result.amount = p[0].amount;
+        }
+        else if(key === 'company') result.company = val;
+        else if(key === 'from' || key === 'account') result.fromAC = val;
+      }
+    });
+    return result;
+  }
+
+  // Apply structured fields if any are found in current message
+  var structured = parseStructuredFields(body);
+  if(structured.details && !entry.details) entry.details = structured.details;
+  if(structured.amount && entry.amount === 0) entry.amount = structured.amount;
+  if(structured.company && !entry.company) entry.company = structured.company;
+  if(structured.fromAC && !entry.fromAC) entry.fromAC = structured.fromAC;
+  var hadAnyStructured = structured.details || structured.amount || structured.company || structured.fromAC;
+
+  // If accountant is responding to a follow-up question, fill that field
+  if(entry.askedFor && body && !hadAnyStructured){
+    if(entry.askedFor === 'details'){
+      entry.details = body;
+      entry.askedFor = null;
+    } else if(entry.askedFor === 'amount'){
+      var pa = parseExpenseMessage(body);
+      if(pa.length > 1){
+        entry.subItems = pa;
+        entry.amount = pa.reduce(function(s,p){return s+p.amount;},0);
+        entry.askedFor = null;
+      } else if(pa[0].amount > 0){
+        entry.amount = pa[0].amount;
+        entry.askedFor = null;
+      } else {
+        await waClient.sendMessage(rawFrom, 'Could not detect an amount. Please reply with the amount (e.g. "3 lac" or "300000" or "10k").');
+        saveDMState(state);
+        return true;
+      }
+    } else if(entry.askedFor === 'company'){
+      entry.company = body;
+      entry.askedFor = null;
+    } else if(entry.askedFor === 'fromAC'){
+      entry.fromAC = body;
+      entry.askedFor = null;
+    }
+  } else if(body && !hadAnyStructured && !entry.askedFor){
+    // Free-form first message — try to extract amount + details using existing parser
+    var parsed = parseExpenseMessage(body);
+    if(parsed.length > 1){
+      entry.subItems = parsed;
+      if(entry.amount === 0) entry.amount = parsed.reduce(function(s,p){return s+p.amount;},0);
+      if(!entry.details) entry.details = parsed.map(function(p){return p.vendor+' '+formatINR(p.amount);}).join(', ');
+    } else {
+      var p = parsed[0];
+      if(p.amount > 0 && entry.amount === 0) entry.amount = p.amount;
+      if(!entry.details && body.length > 0){
+        // The whole body becomes details (we'll still ask for the missing fields)
+        entry.details = body.substring(0, 250);
+      }
+    }
+  }
+
+  // Handle attached media (PDF/image)
+  if(hasMedia){
+    try {
+      var media = await msg.downloadMedia();
+      if(media && media.data){
+        var visionResult = await extractFromImage(media, thisMsgId);
+        if(visionResult){
+          entry.mediaIds.push(thisMsgId);
+          // If text didn't supply amount/details, take from vision
+          if(visionResult.imageType !== 'cheque'){
+            if(entry.amount === 0 && visionResult.amount > 0) entry.amount = visionResult.amount;
+            if(!entry.details && visionResult.confidence !== 'low'){
+              var dParts = [];
+              if(visionResult.vendor) dParts.push(visionResult.vendor);
+              if(visionResult.purpose) dParts.push(visionResult.purpose);
+              if(dParts.length > 0) entry.details = dParts.join(' - ').substring(0,250);
+            }
+          }
+          // Cache the media filename so we can attach in the group
+          if(!entry.mediaFiles) entry.mediaFiles = [];
+          entry.mediaFiles.push({ msgId: thisMsgId, filename: body || ('attachment_'+entry.mediaFiles.length+'.'+(media.mimetype||'').split('/')[1]), mimetype: media.mimetype, dataB64: media.data });
+        }
+      }
+    } catch(e) { console.error('[DM] media download failed:', e.message); }
+  }
+
+  // Validate required fields in order: details, amount, company, fromAC
+  if(!entry.details){
+    entry.askedFor = 'details';
+    saveDMState(state);
+    await waClient.sendMessage(rawFrom, 'What is this payment for? Reply with the details (vendor name + reason).');
+    return true;
+  }
+  if(entry.amount <= 0){
+    entry.askedFor = 'amount';
+    saveDMState(state);
+    await waClient.sendMessage(rawFrom, 'How much is this expense for? Reply with amount (e.g. "3 lac", "300000", or "10k").');
+    return true;
+  }
+  if(!entry.company){
+    entry.askedFor = 'company';
+    saveDMState(state);
+    // Helpful: suggest valid companies from Fund Position
+    var companies = '';
+    try {
+      var fp = await getFundPosition();
+      var uniqueCompanies = [];
+      fp.forEach(function(a){ if(a.company && uniqueCompanies.indexOf(a.company) < 0) uniqueCompanies.push(a.company); });
+      if(uniqueCompanies.length > 0) companies = '\n\nValid options:\n' + uniqueCompanies.map(function(c,i){return (i+1)+'. '+c;}).join('\n');
+    } catch(e) {}
+    await waClient.sendMessage(rawFrom, 'Which company is this expense for?' + companies);
+    return true;
+  }
+  if(!entry.fromAC){
+    entry.askedFor = 'fromAC';
+    saveDMState(state);
+    // Helpful: suggest bank A/Cs of that company from Fund Position
+    var accounts = '';
+    try {
+      var fp2 = await getFundPosition();
+      var matchingAccounts = fp2.filter(function(a){ return a.company && entry.company && a.company.toLowerCase().indexOf(entry.company.toLowerCase()) >= 0; }).map(function(a){return a.bankAC;});
+      if(matchingAccounts.length === 0) matchingAccounts = fp2.map(function(a){return a.bankAC;}).filter(function(b){return b;});
+      if(matchingAccounts.length > 0) accounts = '\n\nValid options:\n' + matchingAccounts.slice(0,15).map(function(c,i){return (i+1)+'. '+c;}).join('\n');
+    } catch(e) {}
+    await waClient.sendMessage(rawFrom, 'Which bank A/C should we pay from?' + accounts);
+    return true;
+  }
+
+  // All required fields present — confirm and post
+  var preview = buildGroupPostFromDM(entry, entry.posterName);
+  var confirmText = 'Ready to post:\n\n' + preview + '\n\nReply "yes" to post, "edit reason: <text>" to add reason, or "cancel" to clear.';
+  if(body.toLowerCase() === 'yes' || body.toLowerCase() === 'post' || body.toLowerCase() === 'send'){
+    // Post to group
+    try {
+      var groupText = buildGroupPostFromDM(entry, entry.posterName);
+      var postedMsg;
+      if(entry.mediaFiles && entry.mediaFiles.length > 0){
+        // Send first media with caption, then any additional media without caption
+        var firstMedia = entry.mediaFiles[0];
+        var mm = new MessageMedia(firstMedia.mimetype, firstMedia.dataB64, firstMedia.filename);
+        postedMsg = await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, mm, { caption: groupText });
+        for(var mi=1; mi<entry.mediaFiles.length; mi++){
+          var nm = new MessageMedia(entry.mediaFiles[mi].mimetype, entry.mediaFiles[mi].dataB64, entry.mediaFiles[mi].filename);
+          await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, nm);
+          await new Promise(function(r){setTimeout(r,1500);});
+        }
+      } else {
+        postedMsg = await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, groupText);
+      }
+      delete state.pending[rawFrom];
+      saveDMState(state);
+      await waClient.sendMessage(rawFrom, 'Posted to approval group. MM/SM will review and respond.');
+      console.log('[DM] posted to group from', entry.posterName);
+    } catch(e) {
+      console.error('[DM] post failed:', e.message);
+      await waClient.sendMessage(rawFrom, 'Failed to post: ' + e.message + '. Reply "yes" to retry or "cancel" to clear.');
+    }
+    return true;
+  }
+  // edit field: <new value>
+  var editMatch = body.match(/^\s*edit\s+(details|amount|company|from|account)\s*:\s*(.+)$/i);
+  if(editMatch){
+    var fld = editMatch[1].toLowerCase();
+    var val = editMatch[2].trim();
+    if(fld === 'details') entry.details = val;
+    else if(fld === 'amount'){
+      var pe = parseExpenseMessage(val);
+      if(pe[0].amount > 0) entry.amount = pe[0].amount;
+    }
+    else if(fld === 'company') entry.company = val;
+    else if(fld === 'from' || fld === 'account') entry.fromAC = val;
+    saveDMState(state);
+    await waClient.sendMessage(rawFrom, 'Updated. ' + buildGroupPostFromDM(entry, entry.posterName) + '\n\nReply "yes" to post.');
+    return true;
+  }
+
+  // Show preview and wait for confirmation
+  saveDMState(state);
+  await waClient.sendMessage(rawFrom, confirmText);
+  return true;
+}
+
+// ── Stale-pending scanner (Option 4: tag once after 30 min, no repeat) ───────
+// State persisted on disk (under ./wa_auth so it survives redeploys via the Volume).
+var STALE_STATE_FILE = './wa_auth/reminder_state.json';
+
+function loadStaleState() {
+  try {
+    if(fs.existsSync(STALE_STATE_FILE)){
+      return JSON.parse(fs.readFileSync(STALE_STATE_FILE, 'utf8'));
+    }
+  } catch(e) { console.error('[Stale] state load failed:', e.message); }
+  return { reminded: {} }; // expenseId -> { sentAt: ISO timestamp, missing: ['mm','sm'] }
+}
+
+function saveStaleState(state) {
+  try {
+    if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
+    fs.writeFileSync(STALE_STATE_FILE, JSON.stringify(state, null, 2));
+  } catch(e) { console.error('[Stale] state save failed:', e.message); }
+}
+
+// Build a reminder message that @mentions whoever still hasn't replied.
+// Returns { text, mentionJids } so caller can pass mentions to WhatsApp.
+function buildStaleReminderText(expense, now) {
+  var mm = expense.status.mm, sm = expense.status.sm;
+  var bothPending = mm === 'pending' && sm === 'pending';
+  var mmOnly = mm === 'pending' && sm === 'yes';
+  var smOnly = sm === 'pending' && mm === 'yes';
+  var queryMM = mm === 'question', querySM = sm === 'question';
+  var queryAnswered = expense.queryAnswer ? true : false;
+
+  // Determine who needs to be tagged
+  var mentionJids = [];
+  var mentionTags = [];
+  if(mm === 'pending' || (queryMM && queryAnswered)) {
+    mentionJids.push(CONFIG.MM_PHONE + '@c.us');
+    mentionTags.push('@' + CONFIG.MM_PHONE);
+  }
+  if(sm === 'pending' || (querySM && queryAnswered)) {
+    mentionJids.push(CONFIG.SM_PHONE + '@c.us');
+    mentionTags.push('@' + CONFIG.SM_PHONE);
+  }
+  // If query unanswered, tag the accountants instead (the askers)
+  var queryUnanswered = (queryMM || querySM) && !queryAnswered;
+  if(queryUnanswered) {
+    mentionJids = []; mentionTags = [];
+    CONFIG.ACCOUNTANT_PHONES.forEach(function(p){
+      mentionJids.push(p + '@c.us');
+      mentionTags.push('@' + p);
+    });
+  }
+  if(mentionJids.length === 0) return null;
+
+  var minutesPending = Math.floor((now - expense.date.getTime()) / (60*1000));
+  var lines = [];
+  var header;
+  if(queryUnanswered) header = '[BOT REMINDER] Query unanswered - pending ' + minutesPending + ' min';
+  else if(queryMM || querySM) header = '[BOT REMINDER] Query answered - awaiting MM/SM - pending ' + minutesPending + ' min';
+  else if(bothPending) header = '[BOT REMINDER] Approval needed - pending ' + minutesPending + ' min';
+  else if(mmOnly) header = '[BOT REMINDER] MM approval needed - pending ' + minutesPending + ' min';
+  else if(smOnly) header = '[BOT REMINDER] SM approval needed - pending ' + minutesPending + ' min';
+  else return null;
+  lines.push(header);
+  lines.push('');
+
+  var vendor = expense.vendor || expense.body.substring(0, 60);
+  lines.push(vendor);
+
+  if(expense.subItems && expense.subItems.length > 1){
+    var total = expense.subItems.reduce(function(s, it){ return s + it.amount; }, 0);
+    lines.push('Amount: Rs.' + formatINR(total) + ' total');
+    expense.subItems.forEach(function(si){ lines.push('  - ' + si.vendor + ' Rs.' + formatINR(si.amount)); });
+  } else if(expense.amount > 0){
+    lines.push('Amount: Rs.' + formatINR(expense.amount));
+  }
+
+  var d = expense.date.toLocaleDateString('en-IN', {day:'numeric', month:'short', timeZone:'Asia/Kolkata'});
+  var t = expense.date.toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Kolkata'});
+  lines.push('Requested by: ' + expense.sender + ' - ' + d + ', ' + t);
+
+  if(expense.supportingDocs && expense.supportingDocs.length > 0){
+    var docNames = expense.supportingDocs.map(function(dd){ return dd.filename; }).join(', ');
+    lines.push('Supporting docs: ' + docNames);
+  }
+
+  lines.push('');
+  var mmLabel = mm==='yes'?'MM: Ok':mm==='question'?'MM: query raised':'MM: pending';
+  var smLabel = sm==='yes'?'SM: Ok':sm==='question'?'SM: query raised':'SM: pending';
+  lines.push(mmLabel + ' | ' + smLabel);
+
+  if((queryMM||querySM) && queryAnswered){
+    var ans = expense.queryAnswer;
+    var who = ans.role === 'mm' ? 'MM' : 'SM';
+    var answerLabel = ans.answerByRole && ans.answerByRole !== 'accountant' ? (ans.answerByRole + ' (' + ans.answerBy + ')') : ans.answerBy;
+    lines.push('');
+    lines.push(who + ' asked:');
+    lines.push('"' + ans.question + '"');
+    lines.push('');
+    lines.push(answerLabel + ' answered:');
+    lines.push('"' + ans.answer + '"');
+  }
+
+  lines.push('');
+  lines.push(mentionTags.join(' ') + ' please reply: Yes / No / Hold / or reason');
+
+  return { text: lines.join('\n'), mentionJids: mentionJids };
+}
+
+// Run every 10 minutes — find expenses posted >= 30 min ago that we haven't yet reminded about.
+async function scanStalePendings() {
+  if(!waReady || !CONFIG.BOT_ENABLED) return 0;
+  try {
+    var state = loadStaleState();
+    var audit = await buildApprovalAudit(2); // last 2 days is enough for stale check
+    var now = Date.now();
+    var THIRTY_MIN = 30 * 60 * 1000;
+
+    // Quiet hours: 9 PM - 9 AM IST. Convert to local time check.
+    var nowIST = new Date(now);
+    var hourIST = parseInt(nowIST.toLocaleString('en-IN', { hour: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' }));
+    if(hourIST >= 21 || hourIST < 9) {
+      console.log('[Stale] quiet hours (IST '+hourIST+'h), skipping scan');
+      return 0;
+    }
+
+    // Anything still needing attention = partial OR (noApproval with an actual amount)
+    var candidates = audit.partialApproval.concat(
+      audit.noApproval.filter(function(e){ return e.amount > 0 || (e.subItems && e.subItems.length > 0); })
+    );
+
+    var sentCount = 0;
+    var delay = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
+
+    for(var i=0; i<candidates.length; i++) {
+      var expense = candidates[i];
+      var expenseAge = now - expense.date.getTime();
+      if(expenseAge < THIRTY_MIN) continue; // too fresh
+      if(state.reminded[expense.id]) continue; // already reminded once — Option 4 says don't repeat
+
+      var built = buildStaleReminderText(expense, now);
+      if(!built) continue;
+
+      try {
+        await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, built.text, { mentions: built.mentionJids });
+        state.reminded[expense.id] = { sentAt: new Date().toISOString(), missing: [] };
+        if(expense.status.mm === 'pending') state.reminded[expense.id].missing.push('mm');
+        if(expense.status.sm === 'pending') state.reminded[expense.id].missing.push('sm');
+        sentCount++;
+        console.log('[Stale] reminded', expense.id, '(', expense.amount, ')');
+        await delay(2000);
+      } catch(e) {
+        console.error('[Stale] send failed for', expense.id, e.message);
+      }
+    }
+
+    if(sentCount > 0) saveStaleState(state);
+    return sentCount;
+  } catch(e) {
+    console.error('[Stale] scan failed:', e.message);
+    return 0;
+  }
+}
+
+// Build the "Stale Pending" section that gets appended to evening report
+async function buildStalePendingSection() {
+  try {
+    var audit = await buildApprovalAudit(7);
+    var stillPending = audit.partialApproval.concat(
+      audit.noApproval.filter(function(e){ return e.amount > 0; })
+    );
+    if(stillPending.length === 0) return '';
+
+    var lines = [''];
+    lines.push('--- STALE PENDING APPROVALS ---');
+    lines.push('');
+    var totalStale = 0;
+    stillPending.forEach(function(e){
+      var status = e.status.mm === 'yes' ? 'SM pending' : e.status.sm === 'yes' ? 'MM pending' : e.status.mm === 'question' ? 'Query open' : e.status.sm === 'question' ? 'Query open' : 'Both pending';
+      var age = Math.floor((Date.now() - e.date.getTime()) / (60*60*1000));
+      lines.push('- ' + (e.vendor || e.body.substring(0,40)) + ' Rs.' + formatINR(e.amount) + ' [' + status + ', ' + age + 'h]');
+      totalStale += e.amount;
+    });
+    lines.push('');
+    lines.push('Total stale: Rs.' + formatINR(totalStale));
+    return lines.join('\n');
+  } catch(e) {
+    console.error('[StaleSection] failed:', e.message);
+    return '';
+  }
+}
+
 // ── Ledger + Fund Position ────────────────────────────────────────────────────
 async function getLedgerData(dateStr) {
   var rows=await readSheet('Ledger!A:L');
@@ -617,7 +1161,22 @@ app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.js
 
 // ── Crons ─────────────────────────────────────────────────────────────────────
 // 7 PM IST — evening report
-cron.schedule('30 13 * * *',function(){if(!CONFIG.BOT_ENABLED||!waReady)return;var d=new Date().toISOString().split('T')[0];generateDailyReport(d).then(function(data){if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var buf=Buffer.isBuffer(img)?img:Buffer.from(img);waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}}).catch(function(e){console.error('Cron evening:',e.message);});},{timezone:'Asia/Kolkata'});
+cron.schedule('30 13 * * *',async function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  var d=new Date().toISOString().split('T')[0];
+  try {
+    var data=await generateDailyReport(d);
+    var staleSection = await buildStalePendingSection();
+    if(data.entryCount>0){
+      var img = await htmlToImage(buildReportHTML(data),800,1200);
+      var buf = Buffer.isBuffer(img)?img:Buffer.from(img);
+      var caption = 'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut) + staleSection;
+      await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:caption});
+    } else if(staleSection) {
+      await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'Evening Report - '+d+'\nNo Ledger entries today.'+staleSection);
+    }
+  } catch(e) { console.error('Cron evening:',e.message); }
+},{timezone:'Asia/Kolkata'});
 
 // 9 AM IST — morning summary + pending reminders
 cron.schedule('30 3 * * *',function(){
@@ -630,6 +1189,18 @@ cron.schedule('30 3 * * *',function(){
   setTimeout(function(){sendPendingReminders().catch(function(e){console.error('[Reminders cron]',e.message);});},30000);
 },{timezone:'Asia/Kolkata'});
 
+// Every 10 minutes — scan for pending expenses >= 30 min old, send one reminder each (no repeat)
+cron.schedule('*/10 * * * *',function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  scanStalePendings().catch(function(e){console.error('[Cron stale]',e.message);});
+},{timezone:'Asia/Kolkata'});
+
+app.get('/api/auth-list',function(req,res){res.json({accountants:CONFIG.ACCOUNTANT_PHONES,testNumbers:CONFIG.TEST_PHONES||[],mm:CONFIG.MM_PHONE,sm:CONFIG.SM_PHONE,note:'Only these phone numbers can DM the bot for expense relay. @lid (anonymous) JIDs are always rejected.'});});
+app.get('/api/dm-state',function(req,res){try{res.json(loadDMState());}catch(e){res.json({error:e.message});}});
+app.get('/api/dm-clear',function(req,res){try{saveDMState({pending:{}});res.json({success:true});}catch(e){res.json({error:e.message});}});
+app.get('/api/stale-scan',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await scanStalePendings();res.json({success:true,remindersSent:count});}catch(e){res.json({error:e.message});}});
+app.get('/api/stale-state',function(req,res){try{res.json(loadStaleState());}catch(e){res.json({error:e.message});}});
+app.get('/api/stale-reset',function(req,res){try{saveStaleState({reminded:{}});res.json({success:true,message:'Stale reminder state cleared - next scan will re-send any 30+ min pending items'});}catch(e){res.json({error:e.message});}});
 app.get('/api/wa-reset',function(req,res){
   try {
     console.log('[WA] Manual reset requested via /api/wa-reset');
