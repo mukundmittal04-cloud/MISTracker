@@ -25,6 +25,9 @@ const CONFIG = {
   SM_PHONE: '919873429794',
   ACCOUNTANT_PHONES: ['919873574112','919873574180','919873574192','919873574103','919773592304'],
   TEST_PHONES: ['917838537000'], // approved test numbers for DM relay (e.g., your own number for testing)
+  // Explicit LID whitelist — for cases where WhatsApp's @lid JID can't be resolved to a real phone.
+  // Populate after seeing /api/whoami output if a known number is being rejected.
+  LID_WHITELIST: ['86960253214761@lid'], // 917838537000's @lid as observed in /api/whoami
   MM_NAMES: ['madhur', 'madhur mittal'],
   SM_NAMES: ['sumit', 'sumit mittal'],
 };
@@ -580,26 +583,62 @@ async function isAuthorisedAccountant(rawJid, contactName) {
     // Standard phone-based JID
     phoneOnly = rawJid.split('@')[0].replace(/[^0-9]/g, '');
   } else if(rawJid.indexOf('@lid') >= 0){
-    // LID-based JID — try to resolve real phone via WhatsApp Contact API
+    // LID-based JID — WhatsApp's @lid IDs are opaque internal IDs, not phones.
+    // Try multiple resolution paths to find the real phone number:
+    //   1. contact.number (only set sometimes)
+    //   2. contact.pushname / contact.name / contact.shortName / chat.name (often contains "+91 78385 37000")
+    //   3. contact.id.user (only valid if it's a real phone shape, not the 14-digit LID number)
+    var resolvedPhone = null;
     try {
       var contact = await waClient.getContactById(rawJid);
       if(contact){
-        // Try .number first (E.164 phone), then .id.user
+        // Step 1: contact.number — but only if it's NOT the @lid's own internal ID
         if(contact.number){
-          phoneOnly = String(contact.number).replace(/[^0-9]/g, '');
-        } else if(contact.id && contact.id.user){
-          var u = String(contact.id.user);
-          // Skip if user is itself a LID-style numeric id (16+ digits typical for @lid)
-          if(u.length <= 15 && /^\d+$/.test(u)) phoneOnly = u;
+          var n = String(contact.number).replace(/[^0-9]/g, '');
+          // Filter: real phones are 10-13 digits typically (Indian = 12 with country code 91)
+          if(n.length >= 10 && n.length <= 13) resolvedPhone = n;
         }
+        // Step 2: try the display name fields. Indian phones come as "+91 78385 37000"
+        if(!resolvedPhone){
+          var candidates = [contact.pushname, contact.name, contact.shortName, contact.verifiedName];
+          for(var ci=0; ci<candidates.length; ci++){
+            var cn = String(candidates[ci] || '');
+            // Match Indian phone format: optional +, country code 91, 10-digit number, with optional spaces/dashes
+            var phoneMatch = cn.match(/\+?(91)?[\s\-]?(\d{5})[\s\-]?(\d{5})/);
+            if(phoneMatch){
+              var maybe = '91' + phoneMatch[2] + phoneMatch[3];
+              if(maybe.length === 12){ resolvedPhone = maybe; break; }
+            }
+          }
+        }
+      }
+      // Step 3: also try the chat object's name (sometimes that's where it lives)
+      if(!resolvedPhone){
+        try {
+          var chat = await waClient.getChatById(rawJid);
+          if(chat && chat.name){
+            var phoneMatch2 = String(chat.name).match(/\+?(91)?[\s\-]?(\d{5})[\s\-]?(\d{5})/);
+            if(phoneMatch2){
+              var maybe2 = '91' + phoneMatch2[2] + phoneMatch2[3];
+              if(maybe2.length === 12) resolvedPhone = maybe2;
+            }
+          }
+        } catch(e) {}
       }
     } catch(e) {
       console.log('[Auth] LID resolve failed for', rawJid, ':', e.message);
     }
-    if(!phoneOnly){
+
+    if(!resolvedPhone){
+      // Final fallback: explicit LID whitelist (configured per user)
+      if(CONFIG.LID_WHITELIST && CONFIG.LID_WHITELIST.indexOf(rawJid) >= 0){
+        console.log('[Auth] LID', rawJid, 'allowed via LID_WHITELIST');
+        return true;
+      }
       console.log('[Auth] LID could not be resolved to a phone:', rawJid, '(name:', contactName, ')');
       return false;
     }
+    phoneOnly = resolvedPhone;
     console.log('[Auth] LID', rawJid, 'resolved to phone', phoneOnly);
   } else {
     return false;
