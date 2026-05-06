@@ -359,9 +359,83 @@ async function buildApprovalAudit(days) {
       expenses[j].queryAnswer = answerMap[expenses[j].id];
     }
   }
-  var result={fullyApproved:[],partialApproval:[],noApproval:[],onHold:[],rejected:[],allExpenses:expenses,totalExpenses:expenses.length,totalMessages:messages.length,fetchedDays:days||15,visionCacheSize:visionCache.size};
-  for(var k=0;k<expenses.length;k++){
-    var e=expenses[k],mm=e.status.mm,sm=e.status.sm;
+
+  // ── Vision-based de-duplication ───────────────────────────────────────────
+  // When accountants send a text expense AND a supporting PDF/image as separate messages,
+  // the bot would treat them as 2 separate requests. Detect and merge them so the PDF
+  // becomes a supportingDoc on the primary text expense.
+  //
+  // Match criteria (ALL must hold):
+  //   1. Same sender
+  //   2. Same amount (within Rs 1 tolerance for rounding)
+  //   3. Within 10 minutes of each other
+  //   4. At least one meaningful word in common between the text body and vision purpose/vendor
+  //   5. The media message has NO MM/SM approvals on its own (otherwise it's a separately-tracked item)
+  //   6. Both are from non-MM/SM senders (accountants)
+  //
+  // The text message becomes the "primary"; the media message is attached as supportingDoc.
+  function descriptionsRelate(visionData, textBody) {
+    if(!visionData || !textBody) return false;
+    var visionText = ((visionData.purpose||'') + ' ' + (visionData.vendor||'')).toLowerCase();
+    var stopWords = ['the','and','for','with','from','this','that','please','approve','kindly','payment','amount','rs','inr','total'];
+    var textWords = textBody.toLowerCase().split(/[^a-z0-9]+/).filter(function(w){
+      return w.length >= 3 && stopWords.indexOf(w) < 0;
+    });
+    var visionWords = visionText.split(/[^a-z0-9]+/);
+    for(var w=0; w<textWords.length; w++) {
+      if(visionWords.indexOf(textWords[w]) >= 0) return true;
+    }
+    return false;
+  }
+
+  var dedupedIds = {}; // ids that should be removed from final results
+  for(var di=0; di<expenses.length; di++) {
+    var mediaExp = expenses[di];
+    // Only consider media-only/vision-parsed expenses with a real amount
+    if(!mediaExp.hasMedia || !mediaExp.visionParsed || mediaExp.amount <= 0) continue;
+    // Skip if this media expense already has its own approvals (someone swipe-replied to it directly)
+    if(mediaExp.mmApproval || mediaExp.smApproval) continue;
+
+    // Search for a matching text expense
+    for(var dj=0; dj<expenses.length; dj++) {
+      if(di === dj) continue;
+      var textExp = expenses[dj];
+      // Primary must be a text expense (not media-only)
+      if(textExp.hasMedia && (!textExp.body || textExp.body.length < 10)) continue;
+      // Same sender
+      if(textExp.sender !== mediaExp.sender) continue;
+      // Same amount (within Rs 1 for rounding)
+      if(Math.abs(textExp.amount - mediaExp.amount) > 1) continue;
+      // Within 10 minutes
+      var timeDelta = Math.abs(textExp.date.getTime() - mediaExp.date.getTime());
+      if(timeDelta > 10 * 60 * 1000) continue;
+      // Description overlap: any meaningful word in common
+      // Look at vision data via the cached result (we need the vendor/purpose from extractFromImage)
+      var cached = visionCache.get(mediaExp.id);
+      if(cached && !descriptionsRelate(cached, textExp.body)) continue;
+      // If no cached vision data (shouldn't happen for visionParsed=true), skip overlap check
+
+      // MATCH — attach as supportingDoc on the text expense
+      if(!textExp.supportingDocs) textExp.supportingDocs = [];
+      textExp.supportingDocs.push({
+        filename: mediaExp.body || '[Attachment]',
+        amount: mediaExp.amount,
+        vendor: cached ? cached.vendor : '',
+        purpose: cached ? cached.purpose : (mediaExp.purpose || ''),
+        msgId: mediaExp.id
+      });
+      dedupedIds[mediaExp.id] = textExp.id;
+      console.log('[Dedup] Merged', mediaExp.id, '->', textExp.id, '(', mediaExp.amount, ')');
+      break; // attached to one primary, done
+    }
+  }
+
+  // Filter out the de-duplicated media expenses
+  var consolidatedExpenses = expenses.filter(function(e){ return !dedupedIds[e.id]; });
+
+  var result={fullyApproved:[],partialApproval:[],noApproval:[],onHold:[],rejected:[],allExpenses:consolidatedExpenses,totalExpenses:consolidatedExpenses.length,totalMessages:messages.length,fetchedDays:days||15,visionCacheSize:visionCache.size,dedupedCount:Object.keys(dedupedIds).length};
+  for(var k=0;k<consolidatedExpenses.length;k++){
+    var e=consolidatedExpenses[k],mm=e.status.mm,sm=e.status.sm;
     if(mm==='no'||sm==='no')result.rejected.push(e);
     else if(mm==='hold'||sm==='hold')result.onHold.push(e);
     else if(mm==='yes'&&sm==='yes')result.fullyApproved.push(e);
@@ -403,6 +477,11 @@ function buildReminderText(expense) {
   var d=expense.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
   var t=expense.date.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata'});
   lines.push('Requested by: '+expense.sender+' - '+d+', '+t);
+  // Mention supporting documents if any
+  if(expense.supportingDocs && expense.supportingDocs.length > 0){
+    var docNames = expense.supportingDocs.map(function(d){ return d.filename; }).join(', ');
+    lines.push('Supporting docs: '+docNames);
+  }
   lines.push('');
   var mmLabel=mm==='yes'?'MM: Ok':mm==='question'?'MM: query raised':'MM: pending';
   var smLabel=sm==='yes'?'SM: Ok':sm==='question'?'SM: query raised':'SM: pending';
@@ -507,8 +586,8 @@ app.get('/api/approval-audit',async function(req,res){
   try{
     var days=parseInt(req.query.days)||15;
     var audit=await buildApprovalAudit(days);
-    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',purpose:e.purpose||'',subItems:e.subItems||null,hasMedia:e.hasMedia,visionParsed:e.visionParsed||false,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null,queryAnswer:e.queryAnswer||null};};
-    res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length,visionCacheSize:audit.visionCacheSize},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
+    var fmt=function(e){return{date:e.date.toISOString().split('T')[0],time:e.date.toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}),message:e.body.substring(0,300),sender:e.sender,vendor:e.vendor,amount:e.amount,amountFormatted:e.amount>0?formatINR(e.amount):'',purpose:e.purpose||'',subItems:e.subItems||null,hasMedia:e.hasMedia,visionParsed:e.visionParsed||false,mm:e.status.mm,sm:e.status.sm,mmReply:e.mmApproval?e.mmApproval.raw:null,smReply:e.smApproval?e.smApproval.raw:null,mmName:e.mmApproval?e.mmApproval.name:null,smName:e.smApproval?e.smApproval.name:null,queryAnswer:e.queryAnswer||null,supportingDocs:e.supportingDocs||null};};
+    res.json({summary:{period:days+' days',totalMessages:audit.totalMessages,totalExpenseRequests:audit.totalExpenses,fullyApproved:audit.fullyApproved.length,partialApproval:audit.partialApproval.length,noApproval:audit.noApproval.length,onHold:audit.onHold.length,rejected:audit.rejected.length,dedupedCount:audit.dedupedCount||0,visionCacheSize:audit.visionCacheSize},fullyApproved:audit.fullyApproved.map(fmt),partialApproval:audit.partialApproval.map(fmt),noApproval:audit.noApproval.map(fmt),onHold:audit.onHold.map(fmt),rejected:audit.rejected.map(fmt)});
   }catch(e){res.json({error:e.message});}
 });
 app.get('/api/send-reminders',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await sendPendingReminders();res.json({success:true,remindersSent:count});}catch(e){res.json({error:e.message});}});
