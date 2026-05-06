@@ -411,7 +411,7 @@ app.get('/api/send-reminder-test',async function(req,res){
   try{
     if(!waReady)return res.json({error:'WhatsApp not connected'});
     var to=req.query.to; if(!to)return res.json({error:'pass ?to=917838537000'});
-    var jid=to.replace(/[^0-9]/g,'')+' @c.us';
+    var jid=to.replace(/[^0-9]/g,'')+'@c.us';
     var delay=function(ms){return new Promise(function(r){setTimeout(r,ms);});};
     var samples=[
       {id:'s1',date:new Date(),body:'SM Drawing',sender:'sushant',vendor:'SM Drawing',amount:400000,subItems:null,status:{mm:'pending',sm:'yes'},mmApproval:null,smApproval:{raw:'Ok',date:new Date(),name:'sumit'}},
