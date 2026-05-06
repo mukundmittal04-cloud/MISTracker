@@ -160,18 +160,28 @@ function parseResponse(text) {
 
 // ── Expense message parsing ───────────────────────────────────────────────────
 function extractLineAmount(line) {
+  // Pattern 1: lac/lakh/cr/crore units
   var am=line.match(/(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i);
   if(am){var a=parseFloat(am[1].replace(/,/g,'')); return /cr|crore/i.test(am[0])?a*10000000:a*100000;}
-  var pm=line.match(/(\d[\d,]{4,})\/?-/);
+  // Pattern 2: "k" suffix e.g. 10k, 50k = thousand
+  var km=line.match(/(\d[\d,]*\.?\d*)\s*k\b/i);
+  if(km) return parseFloat(km[1].replace(/,/g,''))*1000;
+  // Pattern 3: numbers ending with /-, /- with spaces, or just / at end
+  var pm=line.match(/(\d[\d,]{3,})\s*\/\s*\-?/);
   if(pm) return parseFloat(pm[1].replace(/,/g,''));
+  // Pattern 4: Rs/INR/₹ prefix
   var rm=line.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
   if(rm) return parseFloat(rm[1].replace(/,/g,''));
+  // Pattern 5: standalone large numbers (>=10000)
+  var lm=line.match(/\b(\d{5,}(?:[,\d]*)?)\b/);
+  if(lm){var v=parseFloat(lm[1].replace(/,/g,'')); if(v>=10000&&v<1000000000) return v;}
   return 0;
 }
 function extractLineVendor(line) {
   return line
     .replace(/(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i, '')
-    .replace(/(\d[\d,]{4,})\/?-/, '')
+    .replace(/(\d[\d,]*\.?\d*)\s*k\b/i, '')
+    .replace(/(\d[\d,]{3,})\s*\/\s*\-?/, '')
     .replace(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i, '')
     .replace(/^\s*(please approve|kindly approve|approve|for|to|on account of|on account|payment to|pay to)\s*/i, '')
     .replace(/\s+/g,' ').trim();
@@ -315,13 +325,26 @@ async function buildApprovalAudit(days) {
               visionResult=await extractFromImage(media,msgId);
               if(visionResult){
                 var isCheque=visionResult.imageType==='cheque', isLow=visionResult.confidence==='low';
-                if(!isCheque&&!isLow){if(amount===0&&visionResult.amount>0)amount=visionResult.amount; if((!vendor||body.length<15)&&visionResult.vendor)vendor=visionResult.vendor;}
-                if(!isCheque&&!isLow&&visionResult.purpose)purpose=visionResult.purpose;
+                // Cheques: hard-skip vendor/amount (handwriting unreliable, just bank reference)
+                if(!isCheque){
+                  // Use vision amount if text had none — even from low-conf, since amount=0 means we have nothing else
+                  if(amount===0 && visionResult.amount>0) amount=visionResult.amount;
+                  // Vendor: only from high-confidence reads
+                  if(!isLow && (!vendor||body.length<15) && visionResult.vendor) vendor=visionResult.vendor;
+                  // Purpose: only from high-confidence reads
+                  if(!isLow && visionResult.purpose) purpose=visionResult.purpose;
+                }
               }
             }
           }catch(e){console.error('[Vision] Failed for',msgId,e.message);}
         }
-        expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image attached]':'[Empty]'),sender:senderInfo.contactName||rawSender,vendor:vendor||(hasMedia?'[See image]':''),amount:amount,purpose:purpose,subItems:subItems,hasMedia:hasMedia,visionParsed:visionResult?true:false,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'},queryAnswer:null});
+        // Skip junk: no body, no media, no amount → not a real expense request
+        var isJunk = (!body) && !hasMedia && amount === 0;
+        // Also skip super-short non-meaningful messages from system/unknown senders
+        if(!isJunk && body && body.length < 4 && !hasMedia && amount === 0) isJunk = true;
+        if(!isJunk){
+          expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image attached]':'[Empty]'),sender:senderInfo.contactName||rawSender,vendor:vendor||(hasMedia?'[See image]':''),amount:amount,purpose:purpose,subItems:subItems,hasMedia:hasMedia,visionParsed:visionResult?true:false,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'},queryAnswer:null});
+        }
       }
     }
   }
