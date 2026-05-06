@@ -518,6 +518,7 @@ function buildReminderText(expense) {
 
 async function sendPendingReminders() {
   if(!waReady){console.log('[Reminders] WA not connected');return 0;}
+  if(loadSilentMode()){console.log('[Reminders] silent mode ON — skipping group reminders');return 0;}
   try {
     var audit=await buildApprovalAudit(15);
     var toRemind=audit.partialApproval.concat(audit.noApproval).filter(function(e){
@@ -685,15 +686,20 @@ async function handleAccountantDM(msg) {
 
   var senderInfo = await identifySender(rawFrom);
   if(!(await isAuthorisedAccountant(rawFrom, senderInfo.contactName))){
-    console.log('[DM] unauthorised sender:', rawFrom, senderInfo.contactName);
-    // Send a polite reject message ONLY ONCE per sender per day to avoid spam loops
-    if(!global._unauthorisedNotified) global._unauthorisedNotified = {};
-    var dayKey = rawFrom + '_' + new Date().toISOString().split('T')[0];
-    if(!global._unauthorisedNotified[dayKey]){
-      global._unauthorisedNotified[dayKey] = true;
-      try {
-        await waClient.sendMessage(rawFrom, 'This is the Fidato MIS Bot. Your number is not authorised to use the expense approval relay. Please contact Mukund or Madhur if you need access.');
-      } catch(e) { /* ignore */ }
+    // Silent for unauthorised senders — number can be used normally for personal chats
+    // without the bot interfering. The DM relay only activates for whitelisted phones.
+    // Only auto-reply if explicitly enabled (REPLY_TO_UNAUTHORISED env var) — and even then
+    // a generic message that doesn't reveal admin names.
+    console.log('[DM] unauthorised sender (silent):', rawFrom, senderInfo.contactName);
+    if(process.env.REPLY_TO_UNAUTHORISED === 'true'){
+      if(!global._unauthorisedNotified) global._unauthorisedNotified = {};
+      var dayKey = rawFrom + '_' + new Date().toISOString().split('T')[0];
+      if(!global._unauthorisedNotified[dayKey]){
+        global._unauthorisedNotified[dayKey] = true;
+        try {
+          await waClient.sendMessage(rawFrom, 'This is an automated assistant. Your number is not authorised. Please contact admin if you need access.');
+        } catch(e) { /* ignore */ }
+      }
     }
     return false;
   }
@@ -711,6 +717,40 @@ async function handleAccountantDM(msg) {
     delete state.pending[rawFrom];
     saveDMState(state);
     await waClient.sendMessage(rawFrom, 'Pending request cleared. Send a new expense to start over.');
+    return true;
+  }
+  // Silent-mode toggle (only the observer himself can change this)
+  var phoneOfSender = rawFrom.indexOf('@c.us')>=0 ? rawFrom.split('@')[0] : null;
+  // For @lid sender, try to resolve via display name (same logic as auth, abbreviated)
+  if(!phoneOfSender){
+    try {
+      var c = await waClient.getContactById(rawFrom);
+      var nameStr = String((c && (c.pushname||c.name||c.shortName)) || '');
+      var pm = nameStr.match(/\+?(91)?[\s\-]?(\d{5})[\s\-]?(\d{5})/);
+      if(pm) phoneOfSender = '91' + pm[2] + pm[3];
+    } catch(e){}
+  }
+  if(/^\s*silent\s+on\s*$/i.test(body)){
+    if(phoneOfSender !== SILENT_OBSERVER){
+      await waClient.sendMessage(rawFrom, 'Only the silent-mode observer ('+SILENT_OBSERVER+') can toggle this.');
+      return true;
+    }
+    saveSilentMode(true);
+    await waClient.sendMessage(rawFrom, 'Silent mode ON. I will stop posting reminders to the approval group. Daily summary at 7 PM will come to you privately.');
+    return true;
+  }
+  if(/^\s*silent\s+off\s*$/i.test(body)){
+    if(phoneOfSender !== SILENT_OBSERVER){
+      await waClient.sendMessage(rawFrom, 'Only the silent-mode observer ('+SILENT_OBSERVER+') can toggle this.');
+      return true;
+    }
+    saveSilentMode(false);
+    await waClient.sendMessage(rawFrom, 'Silent mode OFF. Resuming group reminders and evening report to Day Book group.');
+    return true;
+  }
+  if(/^\s*silent\s+status\s*$/i.test(body)){
+    var s = loadSilentMode();
+    await waClient.sendMessage(rawFrom, 'Silent mode is currently '+(s?'ON':'OFF')+'.');
     return true;
   }
   if(/^\s*help\s*$/i.test(body)){
@@ -738,7 +778,7 @@ async function handleAccountantDM(msg) {
   }
 
   // Get or create pending entry for this sender
-  if(!state.pending[rawFrom]) state.pending[rawFrom] = { details: '', amount: 0, company: '', fromAC: '', mediaIds: [], lastUpdate: new Date().toISOString(), askedFor: null, posterName: senderInfo.contactName || rawFrom, subItems: null };
+  if(!state.pending[rawFrom]) state.pending[rawFrom] = { details: '', amount: 0, company: '', fromAC: '', mediaIds: [], lastUpdate: new Date().toISOString(), askedFor: null, posterName: senderInfo.contactName || rawFrom, subItems: null, companyOptions: [], fromACOptions: [] };
   var entry = state.pending[rawFrom];
   entry.lastUpdate = new Date().toISOString();
   entry.posterName = senderInfo.contactName || entry.posterName;
@@ -798,10 +838,25 @@ async function handleAccountantDM(msg) {
         return true;
       }
     } else if(entry.askedFor === 'company'){
-      entry.company = body;
+      // Map numeric reply "7" → companyOptions[6]; otherwise store raw text
+      var trimmed = body.trim();
+      if(/^\d+$/.test(trimmed) && entry.companyOptions && entry.companyOptions.length){
+        var idx = parseInt(trimmed) - 1;
+        if(idx >= 0 && idx < entry.companyOptions.length) entry.company = entry.companyOptions[idx];
+        else entry.company = trimmed;
+      } else {
+        entry.company = trimmed;
+      }
       entry.askedFor = null;
     } else if(entry.askedFor === 'fromAC'){
-      entry.fromAC = body;
+      var trimmed2 = body.trim();
+      if(/^\d+$/.test(trimmed2) && entry.fromACOptions && entry.fromACOptions.length){
+        var idx2 = parseInt(trimmed2) - 1;
+        if(idx2 >= 0 && idx2 < entry.fromACOptions.length) entry.fromAC = entry.fromACOptions[idx2];
+        else entry.fromAC = trimmed2;
+      } else {
+        entry.fromAC = trimmed2;
+      }
       entry.askedFor = null;
     }
   } else if(body && !hadAnyStructured && !entry.askedFor){
@@ -862,29 +917,30 @@ async function handleAccountantDM(msg) {
   }
   if(!entry.company){
     entry.askedFor = 'company';
-    saveDMState(state);
-    // Helpful: suggest valid companies from Fund Position
     var companies = '';
     try {
       var fp = await getFundPosition();
       var uniqueCompanies = [];
       fp.forEach(function(a){ if(a.company && uniqueCompanies.indexOf(a.company) < 0) uniqueCompanies.push(a.company); });
-      if(uniqueCompanies.length > 0) companies = '\n\nValid options:\n' + uniqueCompanies.map(function(c,i){return (i+1)+'. '+c;}).join('\n');
-    } catch(e) {}
+      entry.companyOptions = uniqueCompanies;
+      if(uniqueCompanies.length > 0) companies = '\n\nReply with a number or the name:\n' + uniqueCompanies.map(function(c,i){return (i+1)+'. '+c;}).join('\n');
+    } catch(e) { entry.companyOptions = []; }
+    saveDMState(state);
     await waClient.sendMessage(rawFrom, 'Which company is this expense for?' + companies);
     return true;
   }
   if(!entry.fromAC){
     entry.askedFor = 'fromAC';
-    saveDMState(state);
-    // Helpful: suggest bank A/Cs of that company from Fund Position
     var accounts = '';
     try {
       var fp2 = await getFundPosition();
-      var matchingAccounts = fp2.filter(function(a){ return a.company && entry.company && a.company.toLowerCase().indexOf(entry.company.toLowerCase()) >= 0; }).map(function(a){return a.bankAC;});
-      if(matchingAccounts.length === 0) matchingAccounts = fp2.map(function(a){return a.bankAC;}).filter(function(b){return b;});
-      if(matchingAccounts.length > 0) accounts = '\n\nValid options:\n' + matchingAccounts.slice(0,15).map(function(c,i){return (i+1)+'. '+c;}).join('\n');
-    } catch(e) {}
+      // List ALL accounts (no company filter) — full list, deduplicated, in Fund Position order
+      var allAccounts = [];
+      fp2.forEach(function(a){ if(a.bankAC && allAccounts.indexOf(a.bankAC) < 0) allAccounts.push(a.bankAC); });
+      entry.fromACOptions = allAccounts;
+      if(allAccounts.length > 0) accounts = '\n\nReply with a number or the name:\n' + allAccounts.map(function(c,i){return (i+1)+'. '+c;}).join('\n');
+    } catch(e) { entry.fromACOptions = []; }
+    saveDMState(state);
     await waClient.sendMessage(rawFrom, 'Which bank A/C should we pay from?' + accounts);
     return true;
   }
@@ -961,6 +1017,36 @@ function saveStaleState(state) {
     if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
     fs.writeFileSync(STALE_STATE_FILE, JSON.stringify(state, null, 2));
   } catch(e) { console.error('[Stale] state save failed:', e.message); }
+}
+
+
+// ── Silent mode toggle ───────────────────────────────────────────────────────
+// When ON: bot stops posting reminders + MIS to groups. Only listens + audits.
+// At 7 PM, bot DMs the daily summary to SILENT_OBSERVER instead.
+var SILENT_STATE_FILE = './wa_auth/silent_mode.json';
+var SILENT_OBSERVER = '917838537000'; // phone to receive private summaries when silent mode is on
+
+function loadSilentMode() {
+  try {
+    if(fs.existsSync(SILENT_STATE_FILE)){
+      var s = JSON.parse(fs.readFileSync(SILENT_STATE_FILE, 'utf8'));
+      return s.enabled === true;
+    }
+  } catch(e) { console.error('[Silent] load failed:', e.message); }
+  return false;
+}
+
+function saveSilentMode(enabled) {
+  try {
+    if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
+    fs.writeFileSync(SILENT_STATE_FILE, JSON.stringify({ enabled: enabled, updatedAt: new Date().toISOString() }, null, 2));
+    console.log('[Silent] mode set to:', enabled ? 'ON (silent)' : 'OFF (group reminders active)');
+  } catch(e) { console.error('[Silent] save failed:', e.message); }
+}
+
+// Helper: get the JID to DM the silent observer
+function getSilentObserverJid() {
+  return SILENT_OBSERVER + '@c.us';
 }
 
 // Build a reminder message that @mentions whoever still hasn't replied.
@@ -1053,6 +1139,7 @@ function buildStaleReminderText(expense, now) {
 // Run every 10 minutes — find expenses posted >= 30 min ago that we haven't yet reminded about.
 async function scanStalePendings() {
   if(!waReady || !CONFIG.BOT_ENABLED) return 0;
+  if(loadSilentMode()){console.log('[Stale] silent mode ON — skipping group scan');return 0;}
   try {
     var state = loadStaleState();
     var audit = await buildApprovalAudit(2); // last 2 days is enough for stale check
@@ -1226,16 +1313,23 @@ app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.js
 cron.schedule('30 13 * * *',async function(){
   if(!CONFIG.BOT_ENABLED||!waReady)return;
   var d=new Date().toISOString().split('T')[0];
+  var silent = loadSilentMode();
+  // When silent: target is the observer (private DM). When not: the Day Book group.
+  var targetJid = silent ? getSilentObserverJid() : CONFIG.WHATSAPP_GROUP_JID;
+  var prefix = silent ? '[SILENT MODE] ' : '';
   try {
-    var data=await generateDailyReport(d);
+    var data = await generateDailyReport(d);
     var staleSection = await buildStalePendingSection();
-    if(data.entryCount>0){
+    if(data.entryCount > 0){
       var img = await htmlToImage(buildReportHTML(data),800,1200);
       var buf = Buffer.isBuffer(img)?img:Buffer.from(img);
-      var caption = 'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut) + staleSection;
-      await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:caption});
+      var caption = prefix + 'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut) + staleSection;
+      await waClient.sendMessage(targetJid, new MessageMedia('image/png',buf.toString('base64'),'MIS.png'), {caption:caption});
     } else if(staleSection) {
-      await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'Evening Report - '+d+'\nNo Ledger entries today.'+staleSection);
+      await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries today.'+staleSection);
+    } else if(silent) {
+      // Even with no data, observer should hear from the bot daily so they know it ran
+      await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries and no stale approvals.');
     }
   } catch(e) { console.error('Cron evening:',e.message); }
 },{timezone:'Asia/Kolkata'});
@@ -1244,10 +1338,13 @@ cron.schedule('30 13 * * *',async function(){
 cron.schedule('30 3 * * *',function(){
   if(!CONFIG.BOT_ENABLED||!waReady)return;
   var y=new Date();y.setDate(y.getDate()-1);var d=y.toISOString().split('T')[0];
+  var silent = loadSilentMode();
+  var targetJid = silent ? getSilentObserverJid() : CONFIG.WHATSAPP_GROUP_JID;
+  var prefix = silent ? '[SILENT MODE] ' : '';
   generateDailyReport(d).then(function(data){
-    if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var buf=Buffer.isBuffer(img)?img:Buffer.from(img);waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}
+    if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var buf=Buffer.isBuffer(img)?img:Buffer.from(img);waClient.sendMessage(targetJid,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:prefix+'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}
   }).catch(function(e){console.error('Cron morning:',e.message);});
-  // 30s after morning summary, send pending approval reminders to approval group
+  // 30s after morning summary, send pending approval reminders. sendPendingReminders is itself silent-mode-aware.
   setTimeout(function(){sendPendingReminders().catch(function(e){console.error('[Reminders cron]',e.message);});},30000);
 },{timezone:'Asia/Kolkata'});
 
@@ -1281,6 +1378,9 @@ app.get('/api/whoami',async function(req,res){
 app.get('/api/auth-list',function(req,res){res.json({accountants:CONFIG.ACCOUNTANT_PHONES,testNumbers:CONFIG.TEST_PHONES||[],mm:CONFIG.MM_PHONE,sm:CONFIG.SM_PHONE,note:'Only these phone numbers can DM the bot for expense relay. @lid (anonymous) JIDs are always rejected.'});});
 app.get('/api/dm-state',function(req,res){try{res.json(loadDMState());}catch(e){res.json({error:e.message});}});
 app.get('/api/dm-clear',function(req,res){try{saveDMState({pending:{}});res.json({success:true});}catch(e){res.json({error:e.message});}});
+app.get('/api/silent-on',function(req,res){try{saveSilentMode(true);res.json({success:true,silentMode:true,message:'Silent mode ON. Bot will stop group reminders and DM the observer ('+SILENT_OBSERVER+') with daily summaries.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/silent-off',function(req,res){try{saveSilentMode(false);res.json({success:true,silentMode:false,message:'Silent mode OFF. Bot will resume group reminders and post evening report to Day Book group.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/silent-status',function(req,res){try{res.json({silentMode:loadSilentMode(),observer:SILENT_OBSERVER});}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-scan',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await scanStalePendings();res.json({success:true,remindersSent:count});}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-state',function(req,res){try{res.json(loadStaleState());}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-reset',function(req,res){try{saveStaleState({reminded:{}});res.json({success:true,message:'Stale reminder state cleared - next scan will re-send any 30+ min pending items'});}catch(e){res.json({error:e.message});}});
