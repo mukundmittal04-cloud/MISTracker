@@ -167,33 +167,50 @@ function parseResponse(text) {
 }
 
 // ── Expense message parsing ───────────────────────────────────────────────────
-function extractLineAmount(line) {
+// Extract amount from a line.
+// strict=true: ONLY accepts patterns with clear currency markers (lac/cr/k/Rs/INR/₹/...).
+//   Plain numbers without markers are ignored (avoid false positives on dates/IDs/block numbers).
+// strict=false (default): plain numbers ≥100 also accepted (lenient — single-amount messages).
+function extractLineAmount(line, strict) {
+  if(!line) return 0;
   // Pattern 1: lac/lakh/cr/crore units
   var am=line.match(/(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i);
   if(am){var a=parseFloat(am[1].replace(/,/g,'')); return /cr|crore/i.test(am[0])?a*10000000:a*100000;}
   // Pattern 2: "k" suffix e.g. 10k, 50k = thousand
   var km=line.match(/(\d[\d,]*\.?\d*)\s*k\b/i);
   if(km) return parseFloat(km[1].replace(/,/g,''))*1000;
-  // Pattern 3: numbers ending with /-, /- with spaces, or just / at end
+  // Pattern 3: numbers ending with /-, /- with spaces, or just / at end (4+ digits)
   var pm=line.match(/(\d[\d,]{3,})\s*\/\s*\-?/);
   if(pm) return parseFloat(pm[1].replace(/,/g,''));
   // Pattern 4: Rs/INR/₹ prefix
   var rm=line.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
   if(rm) return parseFloat(rm[1].replace(/,/g,''));
-  // Pattern 5: standalone numbers >= 100, supports Indian-format with commas like "7,08,708"
-  // Match: comma-grouped (1,000+), or 3-9 digits standalone
-  // Prefer the longest match to avoid e.g. matching only "708" inside "708708".
-  // Strategy: try comma-format first (more specific), then plain digits.
+  // STRICT MODE STOPS HERE — no plain-number fallback. Used in multi-line splitter
+  // to prevent block numbers, dates, and other non-currency digits from being matched.
+  if(strict) return 0;
+  // Pattern 5 (lenient): standalone numbers, supports Indian-format with commas
+  // Comma-grouped numbers ("7,08,708") are still safe because they require commas
   var lm = line.match(/\b(\d{1,3}(?:,\d{2,3}){1,3})\b/);
-  if(!lm) lm = line.match(/\b(\d{3,9})\b/);
   if(lm){
     var v = parseFloat(lm[1].replace(/,/g,''));
-    // Accept 100 <= v < 1 billion. Reject typical phone-number-ish values (10-digit Indian phones starting with 7/8/9)
-    if(v >= 100 && v < 1000000000){
-      // Phone-number guard: reject 10-digit standalone numbers starting with 6-9 (Indian mobile prefixes)
-      var raw = lm[1].replace(/,/g,'');
-      if(raw.length === 10 && /^[6-9]/.test(raw)) return 0;
-      return v;
+    if(v >= 100 && v < 1000000000) return v;
+  }
+  // Pattern 6 (lenient, last resort): plain digits 4-9 long
+  // 4+ digits is safer than 3+ — avoids "118", "110" block numbers
+  // Skip if the entire string contains a date pattern (DD-Mmm-YYYY, DD/MM/YY, etc.)
+  if(/\d{1,2}[\-\/](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|\d{1,2})[\-\/]\d{2,4}/i.test(line)) return 0;
+  var lm2 = line.match(/\b(\d{4,9})\b/);
+  if(lm2){
+    var v2 = parseFloat(lm2[1]);
+    if(v2 >= 100 && v2 < 1000000000){
+      // Phone-number guard: reject 10-digit standalone numbers starting with 6-9
+      if(lm2[1].length === 10 && /^[6-9]/.test(lm2[1])) return 0;
+      // Year guard: reject standalone 4-digit numbers in the 1900-2100 range when appearing near words like "year", "of", or with no other amount context
+      if(lm2[1].length === 4 && v2 >= 1900 && v2 <= 2100){
+        // If line has no other indicators of being an amount, reject the year-like number
+        if(!/(amount|paid|payment|approve|due|invoice|bill|expense|cost|fee|rs|inr|\u20B9|\$|lac|lakh|cr|crore|k\b)/i.test(line)) return 0;
+      }
+      return v2;
     }
   }
   return 0;
@@ -210,13 +227,15 @@ function extractLineVendor(line) {
 function parseExpenseMessage(body) {
   if(!body) return [{vendor:'',amount:0}];
   var lines=body.split('\n').map(function(l){return l.trim();}).filter(Boolean);
+  // STRICT detection for multi-line items — avoids matching block numbers, dates, etc.
   var itemLines=[];
   for(var i=0;i<lines.length;i++){
-    var a=extractLineAmount(lines[i]);
+    var a=extractLineAmount(lines[i], true); // strict=true
     if(a>0){var v=extractLineVendor(lines[i]); if(v&&v.length>1)itemLines.push({vendor:v,amount:a});}
   }
   if(itemLines.length>1) return itemLines;
-  var total=0; for(var j=0;j<lines.length;j++) total+=extractLineAmount(lines[j]);
+  // For single-amount: lenient mode picks up plain numbers as fallback
+  var total=0; for(var j=0;j<lines.length;j++) total+=extractLineAmount(lines[j], false);
   var vendor=extractLineVendor(lines[0])||lines[0].substring(0,150);
   return [{vendor:vendor,amount:total}];
 }
