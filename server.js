@@ -59,15 +59,30 @@ function createWhatsAppClient() {
   waClient.on('disconnected', function(reason) {
     console.log('[WA] Disconnected:', reason);
     waReady = false;
+    // Track LOGOUT count over a 5-min window. Only wipe wa_auth after 3 consecutive LOGOUTs
+    // (prevents accidental wipe on transient disconnects, but recovers from real session corruption).
+    if (!global._waLogoutLog) global._waLogoutLog = [];
+    var now = Date.now();
     if (reason === 'LOGOUT') {
-      console.log('[WA] LOGOUT — clearing wa_auth in 5s then restarting');
-      setTimeout(function() {
-        try { if (fs.existsSync('./wa_auth')) { fs.rmSync('./wa_auth', { recursive: true, force: true }); console.log('[WA] wa_auth cleared'); } } catch(e) { console.error('[WA] Clear failed:', e.message); }
-        createWhatsAppClient();
-      }, 5000);
-    } else {
-      setTimeout(function() { waClient.initialize().catch(function(e) { console.error('[WA] reinit failed:', e.message); }); }, 10000);
+      global._waLogoutLog.push(now);
+      // Keep only LOGOUTs from last 5 minutes
+      global._waLogoutLog = global._waLogoutLog.filter(function(t){ return now - t < 5*60*1000; });
+      console.log('[WA] LOGOUT count in 5min window:', global._waLogoutLog.length);
+      if (global._waLogoutLog.length >= 3) {
+        console.log('[WA] 3+ LOGOUTs in 5min — clearing wa_auth and restarting fresh');
+        global._waLogoutLog = [];
+        setTimeout(function() {
+          try { if (fs.existsSync('./wa_auth')) { fs.rmSync('./wa_auth', { recursive: true, force: true }); console.log('[WA] wa_auth cleared'); } } catch(e) { console.error('[WA] Clear failed:', e.message); }
+          createWhatsAppClient();
+        }, 5000);
+        return;
+      }
     }
+    // Default behavior: just try to reinitialize the existing client (preserves saved session)
+    setTimeout(function() {
+      try { waClient.initialize().catch(function(e) { console.error('[WA] reinit failed:', e.message); }); }
+      catch(e) { console.error('[WA] reinit threw:', e.message); }
+    }, 10000);
   });
   waClient.initialize().catch(function(e) { console.error('WA init failed:', e.message); });
 }
