@@ -446,6 +446,18 @@ cron.schedule('30 3 * * *',function(){
   setTimeout(function(){sendPendingReminders().catch(function(e){console.error('[Reminders cron]',e.message);});},30000);
 },{timezone:'Asia/Kolkata'});
 
+app.get('/api/wa-reset',function(req,res){
+  try {
+    console.log('[WA] Manual reset requested via /api/wa-reset');
+    waReady = false;
+    latestQR = null; latestQRDataUrl = null;
+    try { if (waClient) { waClient.destroy().catch(function(e){}); } } catch(e) {}
+    try { if (fs.existsSync('./wa_auth')) { fs.rmSync('./wa_auth', { recursive: true, force: true }); console.log('[WA] wa_auth folder cleared'); } } catch(e) { console.error('[WA] Clear error:', e.message); }
+    setTimeout(function() { createWhatsAppClient(); }, 3000);
+    res.json({ok:true, message:'WhatsApp reset triggered. Wait 30-60s, then check /api/pair for new QR.'});
+  } catch(e) { res.json({error:e.message}); }
+});
+
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.5 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');});
