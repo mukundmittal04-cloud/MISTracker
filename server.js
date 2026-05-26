@@ -1,7 +1,9 @@
 // ============================================================
-// FIDATO MIS SERVER v2.5 — Vision + PDF + Pending Reminders
+// FIDATO MIS SERVER v2.6 — Reverse-scan + Top-N report + MORE commands
+// Adds: reverse Ledger→approval matcher, recurring-pattern suppression,
+//       top-3 per report section with MORE X drill-down DM commands.
+// All v2.5 features preserved unchanged.
 // ============================================================
-
 const express = require('express');
 const { google } = require('googleapis');
 const fetch = require('node-fetch');
@@ -12,7 +14,6 @@ const puppeteer = require('puppeteer');
 const fs = require('fs');
 const app = express();
 app.use(express.json());
-
 const CONFIG = {
   SHEET_ID: process.env.SHEET_ID || '1JDoDEk2smAJu0S3RO1WLPZ4MzGZD-_Kn1pP9K8U0J5w',
   GOOGLE_CREDENTIALS: process.env.GOOGLE_CREDENTIALS,
@@ -24,13 +25,41 @@ const CONFIG = {
   MM_PHONE: '919873095398',
   SM_PHONE: '919873429794',
   ACCOUNTANT_PHONES: ['919873574112','919873574180','919873574192','919873574103','919773592304'],
-  TEST_PHONES: ['917838537000'], // approved test numbers for DM relay (e.g., your own number for testing)
-  // Explicit LID whitelist — for cases where WhatsApp's @lid JID can't be resolved to a real phone.
-  // Populate after seeing /api/whoami output if a known number is being rejected.
-  LID_WHITELIST: ['86960253214761@lid'], // 917838537000's @lid as observed in /api/whoami
+  TEST_PHONES: ['917838537000'],
+  LID_WHITELIST: ['86960253214761@lid'],
   MM_NAMES: ['madhur', 'madhur mittal'],
   SM_NAMES: ['sumit', 'sumit mittal'],
 };
+
+// ── v2.6 NEW: Reverse-scan + report tuning constants ─────────────────────────
+// Floor amount below which Ledger OUT entries are ignored (treated as petty cash).
+var REVERSE_SCAN_MIN_AMOUNT = parseInt(process.env.REVERSE_SCAN_MIN_AMOUNT) || 50000;
+// Reverse-scan window in days (default 3).
+var REVERSE_SCAN_WINDOW_DAYS = parseInt(process.env.REVERSE_SCAN_WINDOW_DAYS) || 3;
+// Top-N caps for the daily report (each section shows this many; rest rolled up).
+var REPORT_TOP_N = parseInt(process.env.RECON_TOP_N) || 3;
+var STALE_TOP_N = parseInt(process.env.STALE_TOP_N) || 3;
+// "Recent" window for stale section in hours (default 72h).
+var STALE_RECENT_HOURS = parseInt(process.env.STALE_RECENT_HOURS) || 72;
+
+// Recurring-vendor patterns — Ledger entries matching these are suppressed from
+// the "payment without approval" anomaly list. Tune by adding patterns.
+var RECURRING_PATTERNS = [
+  /bank charges?/i, /\btds\b/i, /\bgst\b/i, /gst payment/i, /gst challan/i,
+  /(mm|sm)\s+drawing/i, /\bmm\s+pdc\b/i, /\bsm\s+pdc\b/i, /drawing\s+(mm|sm)/i,
+  /\bcar\s*emi\b/i, /\bhome\s*loan\b/i, /\bemi\b/i,
+  /\bsalary\b/i, /\bpf\b/i, /\besic?\b/i,
+  /cash\s*withdrawal/i, /internal transfer/i, /\bcontra\b/i,
+  /electricity\s+bill/i, /water\s+bill/i, /property\s+tax/i,
+];
+function isRecurringPattern(le) {
+  if(!le) return false;
+  var text = ((le.description||'') + ' ' + (le.head||'') + ' ' + (le.tag||'') + ' ' + (le.person||'')).toLowerCase();
+  for(var i=0; i<RECURRING_PATTERNS.length; i++){
+    if(RECURRING_PATTERNS[i].test(text)) return true;
+  }
+  return false;
+}
 
 // ── Google Sheets ─────────────────────────────────────────────────────────────
 var sheetsApi = null;
@@ -48,7 +77,6 @@ async function readSheet(range) {
   var r = await sheetsApi.spreadsheets.values.get({ spreadsheetId: CONFIG.SHEET_ID, range: range });
   return r.data.values || [];
 }
-
 // ── WhatsApp ──────────────────────────────────────────────────────────────────
 var waClient = null, waReady = false, latestQR = null, latestQRDataUrl = null;
 function createWhatsAppClient() {
@@ -63,13 +91,10 @@ function createWhatsAppClient() {
   waClient.on('disconnected', function(reason) {
     console.log('[WA] Disconnected:', reason);
     waReady = false;
-    // Track LOGOUT count over a 5-min window. Only wipe wa_auth after 3 consecutive LOGOUTs
-    // (prevents accidental wipe on transient disconnects, but recovers from real session corruption).
     if (!global._waLogoutLog) global._waLogoutLog = [];
     var now = Date.now();
     if (reason === 'LOGOUT') {
       global._waLogoutLog.push(now);
-      // Keep only LOGOUTs from last 5 minutes
       global._waLogoutLog = global._waLogoutLog.filter(function(t){ return now - t < 5*60*1000; });
       console.log('[WA] LOGOUT count in 5min window:', global._waLogoutLog.length);
       if (global._waLogoutLog.length >= 3) {
@@ -82,19 +107,16 @@ function createWhatsAppClient() {
         return;
       }
     }
-    // Default behavior: just try to reinitialize the existing client (preserves saved session)
     setTimeout(function() {
       try { waClient.initialize().catch(function(e) { console.error('[WA] reinit failed:', e.message); }); }
       catch(e) { console.error('[WA] reinit threw:', e.message); }
     }, 10000);
   });
-  // Listen for direct messages from accountants — bot acts as relay to approval group
   waClient.on('message', function(msg) {
     handleAccountantDM(msg).catch(function(e){ console.error('[DM handler]', e.message); });
   });
   waClient.initialize().catch(function(e) { console.error('WA init failed:', e.message); });
 }
-
 // ── Puppeteer ─────────────────────────────────────────────────────────────────
 var browserInstance = null;
 async function htmlToImage(html, width, height) {
@@ -108,7 +130,6 @@ async function htmlToImage(html, width, height) {
   await page.close();
   return shot;
 }
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function parseSheetDate(val) {
   if (!val) return null; if (val instanceof Date) return val;
@@ -122,7 +143,6 @@ function formatINR(num) {
   var l=s.substring(s.length-3), o=s.substring(0,s.length-3);
   if(o!=='')l=','+l; return (neg?'-':'')+o.replace(/\B(?=(\d{2})+(?!\d))/g,',')+l;
 }
-
 // ── Sender identification ─────────────────────────────────────────────────────
 async function identifySender(rawSender) {
   var role = 'unknown', contactName = '';
@@ -146,7 +166,6 @@ async function identifySender(rawSender) {
   } catch (e) { /* skip */ }
   return { role: role, contactName: contactName };
 }
-
 // ── Response parsing ──────────────────────────────────────────────────────────
 function parseResponse(text) {
   if(!text)return 'pending'; var l=text.toLowerCase().trim();
@@ -165,49 +184,30 @@ function parseResponse(text) {
   for(var k=0;k<hold.length;k++){if(l===hold[k]||l.indexOf(hold[k])>=0)return 'hold';}
   return 'other';
 }
-
 // ── Expense message parsing ───────────────────────────────────────────────────
-// Extract amount from a line.
-// strict=true: ONLY accepts patterns with clear currency markers (lac/cr/k/Rs/INR/₹/...).
-//   Plain numbers without markers are ignored (avoid false positives on dates/IDs/block numbers).
-// strict=false (default): plain numbers ≥100 also accepted (lenient — single-amount messages).
 function extractLineAmount(line, strict) {
   if(!line) return 0;
-  // Pattern 1: lac/lakh/cr/crore units
   var am=line.match(/(\d[\d,]*\.?\d*)\s*(?:lac|lakh|lacs|l\b|cr|crore)/i);
   if(am){var a=parseFloat(am[1].replace(/,/g,'')); return /cr|crore/i.test(am[0])?a*10000000:a*100000;}
-  // Pattern 2: "k" suffix e.g. 10k, 50k = thousand
   var km=line.match(/(\d[\d,]*\.?\d*)\s*k\b/i);
   if(km) return parseFloat(km[1].replace(/,/g,''))*1000;
-  // Pattern 3: numbers ending with /-, /- with spaces, or just / at end (4+ digits)
   var pm=line.match(/(\d[\d,]{3,})\s*\/\s*\-?/);
   if(pm) return parseFloat(pm[1].replace(/,/g,''));
-  // Pattern 4: Rs/INR/₹ prefix
   var rm=line.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)(\d[\d,]*\.?\d*)/i);
   if(rm) return parseFloat(rm[1].replace(/,/g,''));
-  // STRICT MODE STOPS HERE — no plain-number fallback. Used in multi-line splitter
-  // to prevent block numbers, dates, and other non-currency digits from being matched.
   if(strict) return 0;
-  // Pattern 5 (lenient): standalone numbers, supports Indian-format with commas
-  // Comma-grouped numbers ("7,08,708") are still safe because they require commas
   var lm = line.match(/\b(\d{1,3}(?:,\d{2,3}){1,3})\b/);
   if(lm){
     var v = parseFloat(lm[1].replace(/,/g,''));
     if(v >= 100 && v < 1000000000) return v;
   }
-  // Pattern 6 (lenient, last resort): plain digits 4-9 long
-  // 4+ digits is safer than 3+ — avoids "118", "110" block numbers
-  // Skip if the entire string contains a date pattern (DD-Mmm-YYYY, DD/MM/YY, etc.)
   if(/\d{1,2}[\-\/](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|\d{1,2})[\-\/]\d{2,4}/i.test(line)) return 0;
   var lm2 = line.match(/\b(\d{4,9})\b/);
   if(lm2){
     var v2 = parseFloat(lm2[1]);
     if(v2 >= 100 && v2 < 1000000000){
-      // Phone-number guard: reject 10-digit standalone numbers starting with 6-9
       if(lm2[1].length === 10 && /^[6-9]/.test(lm2[1])) return 0;
-      // Year guard: reject standalone 4-digit numbers in the 1900-2100 range when appearing near words like "year", "of", or with no other amount context
       if(lm2[1].length === 4 && v2 >= 1900 && v2 <= 2100){
-        // If line has no other indicators of being an amount, reject the year-like number
         if(!/(amount|paid|payment|approve|due|invoice|bill|expense|cost|fee|rs|inr|\u20B9|\$|lac|lakh|cr|crore|k\b)/i.test(line)) return 0;
       }
       return v2;
@@ -227,19 +227,16 @@ function extractLineVendor(line) {
 function parseExpenseMessage(body) {
   if(!body) return [{vendor:'',amount:0}];
   var lines=body.split('\n').map(function(l){return l.trim();}).filter(Boolean);
-  // STRICT detection for multi-line items — avoids matching block numbers, dates, etc.
   var itemLines=[];
   for(var i=0;i<lines.length;i++){
-    var a=extractLineAmount(lines[i], true); // strict=true
+    var a=extractLineAmount(lines[i], true);
     if(a>0){var v=extractLineVendor(lines[i]); if(v&&v.length>1)itemLines.push({vendor:v,amount:a});}
   }
   if(itemLines.length>1) return itemLines;
-  // For single-amount: lenient mode picks up plain numbers as fallback
   var total=0; for(var j=0;j<lines.length;j++) total+=extractLineAmount(lines[j], false);
   var vendor=extractLineVendor(lines[0])||lines[0].substring(0,150);
   return [{vendor:vendor,amount:total}];
 }
-
 // ── Vision (image + PDF) ──────────────────────────────────────────────────────
 const visionCache = new Map();
 async function extractFromImage(media, msgId) {
@@ -274,7 +271,6 @@ async function extractFromImage(media, msgId) {
     return result;
   } catch (e) { console.error('[Vision] Exception:', e.message); return null; }
 }
-
 // ── Approval audit ────────────────────────────────────────────────────────────
 async function fetchApprovalMessages(days) {
   if(!waReady||!waClient)throw new Error('WhatsApp not connected');
@@ -287,17 +283,11 @@ async function fetchApprovalMessages(days) {
   var cutoff=new Date(); cutoff.setDate(cutoff.getDate()-(days||15));
   return allMessages.filter(function(m){return new Date(m.timestamp*1000)>=cutoff;});
 }
-
 async function buildApprovalAudit(days) {
   var messages = await fetchApprovalMessages(days||15);
   var expenses = [], replyMap = {};
-  // questionMessages: msgId -> { expenseId, role, question, date, name }
-  // tracks MM/SM messages that were classified as questions, so accountant
-  // replies to them can be linked back to the original expense
   var questionMessages = {};
-  // answerMap: expenseId -> { role: 'mm'|'sm', question, answer, answerDate, answerBy }
   var answerMap = {};
-
   for(var i=0;i<messages.length;i++){
     var msg=messages[i];
     var rawSender=msg.author||msg.from||'';
@@ -308,18 +298,13 @@ async function buildApprovalAudit(days) {
     var thisMsgId = msg.id._serialized||msg.id.id;
     var quotedMsgId=null;
     if(msg.hasQuotedMsg){try{var q=await msg.getQuotedMessage();quotedMsgId=q.id._serialized||q.id.id;}catch(e){}}
-
     if(quotedMsgId){
       var resp=parseResponse(body);
-
-      // Case A: this is a swipe-reply to an MM/SM question message → it's an ANSWER
-      // Accept answers from: accountants, OR the OTHER promoter (e.g. SM clarifies MM's question)
       if(questionMessages[quotedMsgId]){
         var qInfo = questionMessages[quotedMsgId];
         var answerFromOtherPromoter = (qInfo.role==='mm' && senderInfo.role==='sm') || (qInfo.role==='sm' && senderInfo.role==='mm');
         var answerFromAccountant = senderInfo.role!=='mm' && senderInfo.role!=='sm';
         if(answerFromOtherPromoter || answerFromAccountant){
-          // Don't treat short Yes/No replies from the other promoter as the answer — those are votes
           var promoterReplyShort = answerFromOtherPromoter && (parseResponse(body)==='yes' || parseResponse(body)==='no' || parseResponse(body)==='hold');
           if(!promoterReplyShort){
             answerMap[qInfo.expenseId] = {
@@ -331,16 +316,13 @@ async function buildApprovalAudit(days) {
               answerBy: senderInfo.contactName || rawSender,
               answerByRole: answerFromOtherPromoter ? (senderInfo.role==='mm' ? 'MM' : 'SM') : 'accountant'
             };
-            continue; // don't process as a normal vote
+            continue;
           }
         }
       }
-
-      // Case B: normal MM/SM swipe-reply to an expense
       if(!replyMap[quotedMsgId])replyMap[quotedMsgId]={mm:null,sm:null};
       if(senderInfo.role==='mm'){
         replyMap[quotedMsgId].mm={response:resp,date:msgDate,raw:body,name:senderInfo.contactName,msgId:thisMsgId};
-        // If MM raised a question, register this message ID so accountant replies link back
         if(resp==='question'){
           questionMessages[thisMsgId] = { expenseId: quotedMsgId, role: 'mm', question: body, date: msgDate, name: senderInfo.contactName };
         }
@@ -351,7 +333,6 @@ async function buildApprovalAudit(days) {
         }
       }
     } else {
-      // Skip bot's own reminder messages — not expense requests
       if(body.indexOf('[BOT REMINDER]')===0){continue;}
       if(senderInfo.role!=='mm'&&senderInfo.role!=='sm'){
         var msgId=thisMsgId;
@@ -365,22 +346,16 @@ async function buildApprovalAudit(days) {
               visionResult=await extractFromImage(media,msgId);
               if(visionResult){
                 var isCheque=visionResult.imageType==='cheque', isLow=visionResult.confidence==='low';
-                // Cheques: hard-skip vendor/amount (handwriting unreliable, just bank reference)
                 if(!isCheque){
-                  // Use vision amount if text had none — even from low-conf, since amount=0 means we have nothing else
                   if(amount===0 && visionResult.amount>0) amount=visionResult.amount;
-                  // Vendor: only from high-confidence reads
                   if(!isLow && (!vendor||body.length<15) && visionResult.vendor) vendor=visionResult.vendor;
-                  // Purpose: only from high-confidence reads
                   if(!isLow && visionResult.purpose) purpose=visionResult.purpose;
                 }
               }
             }
           }catch(e){console.error('[Vision] Failed for',msgId,e.message);}
         }
-        // Skip junk: no body, no media, no amount → not a real expense request
         var isJunk = (!body) && !hasMedia && amount === 0;
-        // Also skip super-short non-meaningful messages from system/unknown senders
         if(!isJunk && body && body.length < 4 && !hasMedia && amount === 0) isJunk = true;
         if(!isJunk){
           expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image attached]':'[Empty]'),sender:senderInfo.contactName||rawSender,vendor:vendor||(hasMedia?'[See image]':''),amount:amount,purpose:purpose,subItems:subItems,hasMedia:hasMedia,visionParsed:visionResult?true:false,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'},queryAnswer:null});
@@ -388,32 +363,13 @@ async function buildApprovalAudit(days) {
       }
     }
   }
-
-  // Wire votes into expenses
   for(var j=0;j<expenses.length;j++){
     var rep=replyMap[expenses[j].id];
     if(rep){expenses[j].mmApproval=rep.mm;expenses[j].smApproval=rep.sm;expenses[j].status.mm=rep.mm?rep.mm.response:'pending';expenses[j].status.sm=rep.sm?rep.sm.response:'pending';}
-
-    // Wire query-answer pair if one exists for this expense
     if(answerMap[expenses[j].id]){
       expenses[j].queryAnswer = answerMap[expenses[j].id];
     }
   }
-
-  // ── Vision-based de-duplication ───────────────────────────────────────────
-  // When accountants send a text expense AND a supporting PDF/image as separate messages,
-  // the bot would treat them as 2 separate requests. Detect and merge them so the PDF
-  // becomes a supportingDoc on the primary text expense.
-  //
-  // Match criteria (ALL must hold):
-  //   1. Same sender
-  //   2. Same amount (within Rs 1 tolerance for rounding)
-  //   3. Within 10 minutes of each other
-  //   4. At least one meaningful word in common between the text body and vision purpose/vendor
-  //   5. The media message has NO MM/SM approvals on its own (otherwise it's a separately-tracked item)
-  //   6. Both are from non-MM/SM senders (accountants)
-  //
-  // The text message becomes the "primary"; the media message is attached as supportingDoc.
   function descriptionsRelate(visionData, textBody) {
     if(!visionData || !textBody) return false;
     var visionText = ((visionData.purpose||'') + ' ' + (visionData.vendor||'')).toLowerCase();
@@ -427,35 +383,21 @@ async function buildApprovalAudit(days) {
     }
     return false;
   }
-
-  var dedupedIds = {}; // ids that should be removed from final results
+  var dedupedIds = {};
   for(var di=0; di<expenses.length; di++) {
     var mediaExp = expenses[di];
-    // Only consider media-only/vision-parsed expenses with a real amount
     if(!mediaExp.hasMedia || !mediaExp.visionParsed || mediaExp.amount <= 0) continue;
-    // Skip if this media expense already has its own approvals (someone swipe-replied to it directly)
     if(mediaExp.mmApproval || mediaExp.smApproval) continue;
-
-    // Search for a matching text expense
     for(var dj=0; dj<expenses.length; dj++) {
       if(di === dj) continue;
       var textExp = expenses[dj];
-      // Primary must be a text expense (not media-only)
       if(textExp.hasMedia && (!textExp.body || textExp.body.length < 10)) continue;
-      // Same sender
       if(textExp.sender !== mediaExp.sender) continue;
-      // Same amount (within Rs 1 for rounding)
       if(Math.abs(textExp.amount - mediaExp.amount) > 1) continue;
-      // Within 10 minutes
       var timeDelta = Math.abs(textExp.date.getTime() - mediaExp.date.getTime());
       if(timeDelta > 10 * 60 * 1000) continue;
-      // Description overlap: any meaningful word in common
-      // Look at vision data via the cached result (we need the vendor/purpose from extractFromImage)
       var cached = visionCache.get(mediaExp.id);
       if(cached && !descriptionsRelate(cached, textExp.body)) continue;
-      // If no cached vision data (shouldn't happen for visionParsed=true), skip overlap check
-
-      // MATCH — attach as supportingDoc on the text expense
       if(!textExp.supportingDocs) textExp.supportingDocs = [];
       textExp.supportingDocs.push({
         filename: mediaExp.body || '[Attachment]',
@@ -466,13 +408,10 @@ async function buildApprovalAudit(days) {
       });
       dedupedIds[mediaExp.id] = textExp.id;
       console.log('[Dedup] Merged', mediaExp.id, '->', textExp.id, '(', mediaExp.amount, ')');
-      break; // attached to one primary, done
+      break;
     }
   }
-
-  // Filter out the de-duplicated media expenses
   var consolidatedExpenses = expenses.filter(function(e){ return !dedupedIds[e.id]; });
-
   var result={fullyApproved:[],partialApproval:[],noApproval:[],onHold:[],rejected:[],allExpenses:consolidatedExpenses,totalExpenses:consolidatedExpenses.length,totalMessages:messages.length,fetchedDays:days||15,visionCacheSize:visionCache.size,dedupedCount:Object.keys(dedupedIds).length};
   for(var k=0;k<consolidatedExpenses.length;k++){
     var e=consolidatedExpenses[k],mm=e.status.mm,sm=e.status.sm;
@@ -484,12 +423,10 @@ async function buildApprovalAudit(days) {
   }
   return result;
 }
-
 // ── Pending reminders ─────────────────────────────────────────────────────────
 function getDaysPending(date) {
   return Math.max(1, Math.floor((new Date() - date) / (1000*60*60*24)));
 }
-
 function buildReminderText(expense) {
   var mm=expense.status.mm, sm=expense.status.sm;
   var bothPending=mm==='pending'&&sm==='pending';
@@ -517,7 +454,6 @@ function buildReminderText(expense) {
   var d=expense.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
   var t=expense.date.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata'});
   lines.push('Requested by: '+expense.sender+' - '+d+', '+t);
-  // Mention supporting documents if any
   if(expense.supportingDocs && expense.supportingDocs.length > 0){
     var docNames = expense.supportingDocs.map(function(d){ return d.filename; }).join(', ');
     lines.push('Supporting docs: '+docNames);
@@ -546,7 +482,6 @@ function buildReminderText(expense) {
   else{lines.push('');lines.push('Please swipe-reply Ok to approve');}
   return lines.join('\n');
 }
-
 async function sendPendingReminders() {
   if(!waReady){console.log('[Reminders] WA not connected');return 0;}
   if(loadSilentMode()){console.log('[Reminders] silent mode ON — skipping group reminders');return 0;}
@@ -567,30 +502,22 @@ async function sendPendingReminders() {
     return toRemind.length;
   } catch(e){console.error('[Reminders] Error:',e.message);return 0;}
 }
-
-
-
-
-// ── DM Relay: accountants DM bot, bot validates and posts to group ───────────
+// ── DM Relay state ───────────────────────────────────────────────────────────
 var DM_STATE_FILE = './wa_auth/dm_state.json';
-
 function loadDMState() {
   try {
     if(fs.existsSync(DM_STATE_FILE)){
       return JSON.parse(fs.readFileSync(DM_STATE_FILE, 'utf8'));
     }
   } catch(e) { console.error('[DM] state load failed:', e.message); }
-  return { pending: {} }; // jid -> { amount, vendor, reason, mediaIds: [], lastUpdate: ISO, askedFor: 'amount'|'vendor'|null }
+  return { pending: {} };
 }
-
 function saveDMState(state) {
   try {
     if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
     fs.writeFileSync(DM_STATE_FILE, JSON.stringify(state, null, 2));
   } catch(e) { console.error('[DM] state save failed:', e.message); }
 }
-
-// Pending state expires after 30 minutes — accountant has to start fresh
 function pruneStaleDMState(state) {
   var now = Date.now();
   Object.keys(state.pending).forEach(function(jid){
@@ -600,42 +527,25 @@ function pruneStaleDMState(state) {
     }
   });
 }
-
-// Determine whether a sender is allowed to use the DM relay.
-// Phone-based whitelist ONLY. For @lid JIDs (opaque WhatsApp IDs), we resolve
-// the real phone via WhatsApp's Contact API before checking the whitelist.
-// Allowed: ACCOUNTANT_PHONES, MM_PHONE, SM_PHONE, TEST_PHONES.
 async function isAuthorisedAccountant(rawJid, contactName) {
   if(!rawJid) return false;
-  if(rawJid.indexOf('@g.us') >= 0) return false; // group JID — DM relay is direct only
-
+  if(rawJid.indexOf('@g.us') >= 0) return false;
   var phoneOnly = null;
-
   if(rawJid.indexOf('@c.us') >= 0){
-    // Standard phone-based JID
     phoneOnly = rawJid.split('@')[0].replace(/[^0-9]/g, '');
   } else if(rawJid.indexOf('@lid') >= 0){
-    // LID-based JID — WhatsApp's @lid IDs are opaque internal IDs, not phones.
-    // Try multiple resolution paths to find the real phone number:
-    //   1. contact.number (only set sometimes)
-    //   2. contact.pushname / contact.name / contact.shortName / chat.name (often contains "+91 78385 37000")
-    //   3. contact.id.user (only valid if it's a real phone shape, not the 14-digit LID number)
     var resolvedPhone = null;
     try {
       var contact = await waClient.getContactById(rawJid);
       if(contact){
-        // Step 1: contact.number — but only if it's NOT the @lid's own internal ID
         if(contact.number){
           var n = String(contact.number).replace(/[^0-9]/g, '');
-          // Filter: real phones are 10-13 digits typically (Indian = 12 with country code 91)
           if(n.length >= 10 && n.length <= 13) resolvedPhone = n;
         }
-        // Step 2: try the display name fields. Indian phones come as "+91 78385 37000"
         if(!resolvedPhone){
           var candidates = [contact.pushname, contact.name, contact.shortName, contact.verifiedName];
           for(var ci=0; ci<candidates.length; ci++){
             var cn = String(candidates[ci] || '');
-            // Match Indian phone format: optional +, country code 91, 10-digit number, with optional spaces/dashes
             var phoneMatch = cn.match(/\+?(91)?[\s\-]?(\d{5})[\s\-]?(\d{5})/);
             if(phoneMatch){
               var maybe = '91' + phoneMatch[2] + phoneMatch[3];
@@ -644,7 +554,6 @@ async function isAuthorisedAccountant(rawJid, contactName) {
           }
         }
       }
-      // Step 3: also try the chat object's name (sometimes that's where it lives)
       if(!resolvedPhone){
         try {
           var chat = await waClient.getChatById(rawJid);
@@ -660,9 +569,7 @@ async function isAuthorisedAccountant(rawJid, contactName) {
     } catch(e) {
       console.log('[Auth] LID resolve failed for', rawJid, ':', e.message);
     }
-
     if(!resolvedPhone){
-      // Final fallback: explicit LID whitelist (configured per user)
       if(CONFIG.LID_WHITELIST && CONFIG.LID_WHITELIST.indexOf(rawJid) >= 0){
         console.log('[Auth] LID', rawJid, 'allowed via LID_WHITELIST');
         return true;
@@ -675,7 +582,6 @@ async function isAuthorisedAccountant(rawJid, contactName) {
   } else {
     return false;
   }
-
   if(!phoneOnly) return false;
   var whitelist = CONFIG.ACCOUNTANT_PHONES.concat([CONFIG.MM_PHONE, CONFIG.SM_PHONE]).concat(CONFIG.TEST_PHONES || []);
   if(whitelist.indexOf(phoneOnly) >= 0){
@@ -685,8 +591,6 @@ async function isAuthorisedAccountant(rawJid, contactName) {
   console.log('[Auth] reject:', phoneOnly, '(', contactName, ') - not in whitelist');
   return false;
 }
-
-// Build the structured group post text from a complete pending entry
 function buildGroupPostFromDM(entry, posterName) {
   var lines = ['*EXPENSE REQUEST*', ''];
   if(entry.details) lines.push('Details: ' + entry.details);
@@ -704,23 +608,15 @@ function buildGroupPostFromDM(entry, posterName) {
   lines.push('MM/SM please review.');
   return lines.join('\n');
 }
-
-// Handle an incoming DM. Returns true if handled, false if not relevant.
+// ── Handle accountant DM ─────────────────────────────────────────────────────
 async function handleAccountantDM(msg) {
   if(!msg || !waReady) return false;
   var rawFrom = msg.from || '';
-  // Only direct chats, not groups
   if(rawFrom.indexOf('@g.us') >= 0) return false;
   if(rawFrom.indexOf('@c.us') < 0 && rawFrom.indexOf('@lid') < 0) return false;
-  // Don't process bot's own messages
   if(msg.fromMe) return false;
-
   var senderInfo = await identifySender(rawFrom);
   if(!(await isAuthorisedAccountant(rawFrom, senderInfo.contactName))){
-    // Silent for unauthorised senders — number can be used normally for personal chats
-    // without the bot interfering. The DM relay only activates for whitelisted phones.
-    // Only auto-reply if explicitly enabled (REPLY_TO_UNAUTHORISED env var) — and even then
-    // a generic message that doesn't reveal admin names.
     console.log('[DM] unauthorised sender (silent):', rawFrom, senderInfo.contactName);
     if(process.env.REPLY_TO_UNAUTHORISED === 'true'){
       if(!global._unauthorisedNotified) global._unauthorisedNotified = {};
@@ -734,25 +630,19 @@ async function handleAccountantDM(msg) {
     }
     return false;
   }
-
   var body = (msg.body || '').trim();
   var hasMedia = msg.hasMedia || false;
   var thisMsgId = msg.id._serialized || msg.id.id;
   console.log('[DM] from', senderInfo.contactName || rawFrom, ':', body.substring(0,80), hasMedia?'[+media]':'');
-
   var state = loadDMState();
   pruneStaleDMState(state);
-
-  // Special commands
   if(/^\s*(cancel|reset|clear)\s*$/i.test(body)){
     delete state.pending[rawFrom];
     saveDMState(state);
     await waClient.sendMessage(rawFrom, 'Pending request cleared. Send a new expense to start over.');
     return true;
   }
-  // Silent-mode toggle (only the observer himself can change this)
   var phoneOfSender = rawFrom.indexOf('@c.us')>=0 ? rawFrom.split('@')[0] : null;
-  // For @lid sender, try to resolve via display name (same logic as auth, abbreviated)
   if(!phoneOfSender){
     try {
       var c = await waClient.getContactById(rawFrom);
@@ -784,10 +674,7 @@ async function handleAccountantDM(msg) {
     await waClient.sendMessage(rawFrom, 'Silent mode is currently '+(s?'ON':'OFF')+'.');
     return true;
   }
-
   // ── Manual intervention commands (only from SILENT_OBSERVER) ─────────────
-  // Patterns: "1 ok", "1 confirm", "1 reject", "1 flag", "1 ignore",
-  //           "2 chase", "2 paid 6-May", "2 paid 06/05/2026", "3 confirm"
   if(phoneOfSender === SILENT_OBSERVER){
     var cmdMatch = body.match(/^\s*(\d+)\s+(ok|confirm|reject|flag|ignore|chase|paid)(?:\s+(.+))?\s*$/i);
     if(cmdMatch){
@@ -805,7 +692,6 @@ async function handleAccountantDM(msg) {
       if(!cache.matches) cache.matches = {};
       if(!cache.rejected) cache.rejected = {};
       if(!cache.manualPaid) cache.manualPaid = {};
-
       if(verb === 'ok' || verb === 'confirm'){
         if(target.ledgerHash){
           cache.matches[target.expenseId] = Object.assign(cache.matches[target.expenseId] || {}, {
@@ -820,7 +706,6 @@ async function handleAccountantDM(msg) {
         if(target.ledgerHash){
           if(!cache.rejected[target.expenseId]) cache.rejected[target.expenseId] = [];
           if(cache.rejected[target.expenseId].indexOf(target.ledgerHash) < 0) cache.rejected[target.expenseId].push(target.ledgerHash);
-          // Also flag the cached match if it exists
           if(cache.matches[target.expenseId] && cache.matches[target.expenseId].ledgerHash === target.ledgerHash){
             cache.matches[target.expenseId].manuallyRejected = true;
           }
@@ -830,7 +715,6 @@ async function handleAccountantDM(msg) {
         return true;
       }
       if(verb === 'ignore'){
-        // Mark expense to skip outlier list permanently
         if(!cache.ignored) cache.ignored = {};
         cache.ignored[target.expenseId] = true;
         saveMatchCache(cache);
@@ -838,14 +722,12 @@ async function handleAccountantDM(msg) {
         return true;
       }
       if(verb === 'paid'){
-        // Manual: this expense was paid. Optional arg = date.
         cache.manualPaid[target.expenseId] = { paidDate: arg || new Date().toISOString().split('T')[0], ts: new Date().toISOString() };
         saveMatchCache(cache);
         await waClient.sendMessage(rawFrom, '✓ Outlier #'+idx+' marked as paid'+(arg?' on '+arg:'')+'. The matcher will reflect this in the next report.');
         return true;
       }
       if(verb === 'chase'){
-        // Send a private nudge to the approval group's accountant audience (or just acknowledge)
         try {
           await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, '[BOT NUDGE] Reminder — please log Ledger entry for: ' + (target.expenseId || ''));
           await waClient.sendMessage(rawFrom, '📣 Nudge posted in approval group for outlier #'+idx+'.');
@@ -856,9 +738,144 @@ async function handleAccountantDM(msg) {
       }
     }
   }
-
+  // ── v2.6 NEW: MORE X drill-down commands (only from SILENT_OBSERVER) ─────
+  // MORE STALE | MORE PAID | MORE TOLERANCE | MORE AWAITING | MORE MISMATCH
+  // MORE UNMATCHED | MORE RECURRING — each dumps the full bucket as chunked text.
+  if(phoneOfSender === SILENT_OBSERVER){
+    var moreMatch = body.match(/^\s*more\s+(stale|paid|tolerance|awaiting|mismatch|unmatched|recurring)\s*$/i);
+    if(moreMatch){
+      var which = moreMatch[1].toLowerCase();
+      try {
+        var sendChunked = async function(jid, text){
+          var maxLen = 3500;
+          if(text.length <= maxLen){ await waClient.sendMessage(jid, text); return; }
+          var chunks = [];
+          var lines = text.split('\n');
+          var cur = '';
+          for(var i=0; i<lines.length; i++){
+            if((cur + lines[i] + '\n').length > maxLen){ chunks.push(cur); cur = ''; }
+            cur += lines[i] + '\n';
+          }
+          if(cur) chunks.push(cur);
+          for(var ci=0; ci<chunks.length; ci++){
+            await waClient.sendMessage(jid, '(' + (ci+1) + '/' + chunks.length + ')\n' + chunks[ci]);
+            if(ci < chunks.length-1) await new Promise(function(r){setTimeout(r,1200);});
+          }
+        };
+        if(which === 'stale'){
+          var audit = await buildApprovalAudit(15);
+          var allStale = audit.partialApproval.concat(
+            audit.noApproval.filter(function(e){ return e.amount > 0; })
+          );
+          allStale.sort(function(a,b){ return b.date.getTime() - a.date.getTime(); });
+          if(allStale.length === 0){
+            await waClient.sendMessage(rawFrom, 'No stale pending approvals.');
+          } else {
+            var total = 0;
+            var ls = ['FULL STALE PENDING LIST (' + allStale.length + '):', ''];
+            allStale.forEach(function(e){
+              var status = e.status.mm === 'yes' ? 'SM pending' : e.status.sm === 'yes' ? 'MM pending' : e.status.mm === 'question' ? 'Query open' : e.status.sm === 'question' ? 'Query open' : 'Both pending';
+              var age = Math.floor((Date.now() - e.date.getTime()) / (60*60*1000));
+              ls.push('- ' + (e.vendor || e.body.substring(0,40)) + ' Rs.' + formatINR(e.amount) + ' [' + status + ', ' + age + 'h]');
+              total += e.amount;
+            });
+            ls.push('');
+            ls.push('Total: Rs.' + formatINR(total));
+            await sendChunked(rawFrom, ls.join('\n'));
+          }
+          return true;
+        }
+        var rec = await buildReconciliation(30);
+        if(which === 'paid'){
+          if(rec.paid.length === 0){ await waClient.sendMessage(rawFrom, 'No fully-matched paid items.'); return true; }
+          var sorted = rec.paid.slice().sort(function(a,b){
+            var aD = (a.matchResult && a.matchResult.match) ? a.matchResult.match.date.getTime() : 0;
+            var bD = (b.matchResult && b.matchResult.match) ? b.matchResult.match.date.getTime() : 0;
+            return bD - aD;
+          });
+          var lp = ['FULL PAID LIST (' + sorted.length + '):', ''];
+          sorted.forEach(function(e){
+            var m = e.matchResult ? e.matchResult.match : null;
+            var dt = m ? m.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'}) : '';
+            lp.push('  ✓ ' + (e.vendor || e.body.substring(0,40)) + ' Rs.' + formatINR(e.amount) + (m ? ' → ' + dt + ', ' + (m.bankAC||'-') : ''));
+          });
+          lp.push('');
+          lp.push('Total paid: Rs.' + formatINR(rec.summary.totalPaid));
+          await sendChunked(rawFrom, lp.join('\n'));
+          return true;
+        }
+        if(which === 'tolerance'){
+          if(rec.paidWithTolerance.length === 0){ await waClient.sendMessage(rawFrom, 'No items in the tolerance bucket.'); return true; }
+          var lt = ['FULL TOLERANCE LIST (' + rec.paidWithTolerance.length + '):', ''];
+          rec.paidWithTolerance.forEach(function(e){
+            var m = e.matchResult ? e.matchResult.match : null;
+            lt.push('  ~ ' + (e.vendor || e.body.substring(0,40)) + ' Rs.' + formatINR(e.amount) + ' (paid Rs.' + formatINR(m ? m.amount : 0) + ')');
+          });
+          await sendChunked(rawFrom, lt.join('\n'));
+          return true;
+        }
+        if(which === 'awaiting'){
+          if(rec.awaitingPayment.length === 0){ await waClient.sendMessage(rawFrom, 'Nothing currently awaiting payment.'); return true; }
+          var sortedA = rec.awaitingPayment.slice().sort(function(a,b){ return b.date.getTime() - a.date.getTime(); });
+          var la = ['FULL AWAITING LIST (' + sortedA.length + '):', ''];
+          sortedA.forEach(function(e){
+            var d = e.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
+            la.push('  ⏳ ' + (e.vendor || e.body.substring(0,40)) + ' Rs.' + formatINR(e.amount) + ' (approved ' + d + ')');
+          });
+          la.push('');
+          la.push('Total awaiting: Rs.' + formatINR(rec.summary.totalAwaiting));
+          await sendChunked(rawFrom, la.join('\n'));
+          return true;
+        }
+        if(which === 'mismatch'){
+          if(rec.possibleMatch.length === 0){ await waClient.sendMessage(rawFrom, 'No possible mismatches.'); return true; }
+          var lm2 = ['FULL MISMATCH LIST (' + rec.possibleMatch.length + '):', ''];
+          rec.possibleMatch.forEach(function(e){
+            var m = e.matchResult ? e.matchResult.match : null;
+            lm2.push('  ⚠ ' + (e.vendor || e.body.substring(0,40)) + ' approved Rs.' + formatINR(e.amount) + ' vs Ledger Rs.' + formatINR(m ? m.amount : 0));
+          });
+          await sendChunked(rawFrom, lm2.join('\n'));
+          return true;
+        }
+        if(which === 'unmatched'){
+          if(!rec.ledgerWithoutApproval || rec.ledgerWithoutApproval.length === 0){
+            await waClient.sendMessage(rawFrom, 'No unmatched Ledger payments — every recent payment has an approval.');
+            return true;
+          }
+          var lu = ['LEDGER PAYMENTS WITHOUT APPROVAL (' + rec.ledgerWithoutApproval.length + '):', '', '(Last ' + REVERSE_SCAN_WINDOW_DAYS + ' days, floor Rs.' + formatINR(REVERSE_SCAN_MIN_AMOUNT) + ')', ''];
+          rec.ledgerWithoutApproval.forEach(function(le){
+            var dt = le.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
+            var desc = (le.description||le.entity||'').substring(0,50);
+            lu.push('  ❗ ' + desc + ' Rs.' + formatINR(le.amount) + ' (' + (le.bankAC||'-') + ', ' + dt + ')');
+          });
+          lu.push('');
+          lu.push('Total: Rs.' + formatINR(rec.summary.totalUnmatchedLedger || 0));
+          await sendChunked(rawFrom, lu.join('\n'));
+          return true;
+        }
+        if(which === 'recurring'){
+          if(!rec.ledgerRecurring || rec.ledgerRecurring.length === 0){
+            await waClient.sendMessage(rawFrom, 'No recurring/auto Ledger items in the recent window.');
+            return true;
+          }
+          var lr = ['RECURRING/AUTO LEDGER ITEMS (' + rec.ledgerRecurring.length + '):', '', '(Suppressed from unmatched list)', ''];
+          rec.ledgerRecurring.forEach(function(le){
+            var dt = le.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
+            var desc = (le.description||le.entity||'').substring(0,50);
+            lr.push('  ℹ ' + desc + ' Rs.' + formatINR(le.amount) + ' (' + (le.bankAC||'-') + ', ' + dt + ')');
+          });
+          await sendChunked(rawFrom, lr.join('\n'));
+          return true;
+        }
+      } catch(e) {
+        console.error('[MORE cmd]', e.message);
+        await waClient.sendMessage(rawFrom, 'Failed to fetch list: ' + e.message);
+        return true;
+      }
+    }
+  }
   if(/^\s*help\s*$/i.test(body)){
-    await waClient.sendMessage(rawFrom, [
+    var helpLines = [
       'Send me an expense request and I will post it in the approval group.',
       '',
       'I need 4 things:',
@@ -877,22 +894,27 @@ async function handleAccountantDM(msg) {
       'Attachments (PDF/image) are optional — vision will read them.',
       '',
       'Reply "cancel" to clear a pending request.'
-    ].join('\n'));
+    ];
+    if(phoneOfSender === SILENT_OBSERVER){
+      helpLines.push('');
+      helpLines.push('— Observer commands —');
+      helpLines.push('MORE STALE       full pending list');
+      helpLines.push('MORE PAID        full matched/paid list');
+      helpLines.push('MORE AWAITING    full not-yet-paid list');
+      helpLines.push('MORE MISMATCH    full possible-mismatch list');
+      helpLines.push('MORE UNMATCHED   Ledger payments without approval');
+      helpLines.push('MORE RECURRING   suppressed auto/recurring items');
+      helpLines.push('MORE TOLERANCE   paid within 5% tolerance');
+      helpLines.push('silent on/off/status');
+      helpLines.push('<n> ok | reject | flag | chase | paid <date>  (outlier action)');
+    }
+    await waClient.sendMessage(rawFrom, helpLines.join('\n'));
     return true;
   }
-
-  // Get or create pending entry for this sender
   if(!state.pending[rawFrom]) state.pending[rawFrom] = { details: '', amount: 0, company: '', fromAC: '', mediaIds: [], lastUpdate: new Date().toISOString(), askedFor: null, posterName: senderInfo.contactName || rawFrom, subItems: null, companyOptions: [], fromACOptions: [] };
   var entry = state.pending[rawFrom];
   entry.lastUpdate = new Date().toISOString();
   entry.posterName = senderInfo.contactName || entry.posterName;
-
-  // Try to parse a structured single-message format (4 fields with prefixes)
-  // Example:
-  //   Details: TMT bar payment for slab 110-118
-  //   Amount: 7,08,708
-  //   Company: Hansaflon Buildcon
-  //   From: Hansaflon JKB
   function parseStructuredFields(text) {
     var result = {};
     if(!text) return result;
@@ -913,16 +935,12 @@ async function handleAccountantDM(msg) {
     });
     return result;
   }
-
-  // Apply structured fields if any are found in current message
   var structured = parseStructuredFields(body);
   if(structured.details && !entry.details) entry.details = structured.details;
   if(structured.amount && entry.amount === 0) entry.amount = structured.amount;
   if(structured.company && !entry.company) entry.company = structured.company;
   if(structured.fromAC && !entry.fromAC) entry.fromAC = structured.fromAC;
   var hadAnyStructured = structured.details || structured.amount || structured.company || structured.fromAC;
-
-  // If accountant is responding to a follow-up question, fill that field
   if(entry.askedFor && body && !hadAnyStructured){
     if(entry.askedFor === 'details'){
       entry.details = body;
@@ -942,7 +960,6 @@ async function handleAccountantDM(msg) {
         return true;
       }
     } else if(entry.askedFor === 'company'){
-      // Map numeric reply "7" → companyOptions[6]; otherwise store raw text
       var trimmed = body.trim();
       if(/^\d+$/.test(trimmed) && entry.companyOptions && entry.companyOptions.length){
         var idx = parseInt(trimmed) - 1;
@@ -964,7 +981,6 @@ async function handleAccountantDM(msg) {
       entry.askedFor = null;
     }
   } else if(body && !hadAnyStructured && !entry.askedFor){
-    // Free-form first message — try to extract amount + details using existing parser
     var parsed = parseExpenseMessage(body);
     if(parsed.length > 1){
       entry.subItems = parsed;
@@ -974,13 +990,10 @@ async function handleAccountantDM(msg) {
       var p = parsed[0];
       if(p.amount > 0 && entry.amount === 0) entry.amount = p.amount;
       if(!entry.details && body.length > 0){
-        // The whole body becomes details (we'll still ask for the missing fields)
         entry.details = body.substring(0, 250);
       }
     }
   }
-
-  // Handle attached media (PDF/image)
   if(hasMedia){
     try {
       var media = await msg.downloadMedia();
@@ -988,7 +1001,6 @@ async function handleAccountantDM(msg) {
         var visionResult = await extractFromImage(media, thisMsgId);
         if(visionResult){
           entry.mediaIds.push(thisMsgId);
-          // If text didn't supply amount/details, take from vision
           if(visionResult.imageType !== 'cheque'){
             if(entry.amount === 0 && visionResult.amount > 0) entry.amount = visionResult.amount;
             if(!entry.details && visionResult.confidence !== 'low'){
@@ -998,15 +1010,12 @@ async function handleAccountantDM(msg) {
               if(dParts.length > 0) entry.details = dParts.join(' - ').substring(0,250);
             }
           }
-          // Cache the media filename so we can attach in the group
           if(!entry.mediaFiles) entry.mediaFiles = [];
           entry.mediaFiles.push({ msgId: thisMsgId, filename: body || ('attachment_'+entry.mediaFiles.length+'.'+(media.mimetype||'').split('/')[1]), mimetype: media.mimetype, dataB64: media.data });
         }
       }
     } catch(e) { console.error('[DM] media download failed:', e.message); }
   }
-
-  // Validate required fields in order: details, amount, company, fromAC
   if(!entry.details){
     entry.askedFor = 'details';
     saveDMState(state);
@@ -1038,7 +1047,6 @@ async function handleAccountantDM(msg) {
     var accounts = '';
     try {
       var fp2 = await getFundPosition();
-      // List ALL accounts (no company filter) — full list, deduplicated, in Fund Position order
       var allAccounts = [];
       fp2.forEach(function(a){ if(a.bankAC && allAccounts.indexOf(a.bankAC) < 0) allAccounts.push(a.bankAC); });
       entry.fromACOptions = allAccounts;
@@ -1048,17 +1056,13 @@ async function handleAccountantDM(msg) {
     await waClient.sendMessage(rawFrom, 'Which bank A/C should we pay from?' + accounts);
     return true;
   }
-
-  // All required fields present — confirm and post
   var preview = buildGroupPostFromDM(entry, entry.posterName);
   var confirmText = 'Ready to post:\n\n' + preview + '\n\nReply "yes" to post, "edit reason: <text>" to add reason, or "cancel" to clear.';
   if(body.toLowerCase() === 'yes' || body.toLowerCase() === 'post' || body.toLowerCase() === 'send'){
-    // Post to group
     try {
       var groupText = buildGroupPostFromDM(entry, entry.posterName);
       var postedMsg;
       if(entry.mediaFiles && entry.mediaFiles.length > 0){
-        // Send first media with caption, then any additional media without caption
         var firstMedia = entry.mediaFiles[0];
         var mm = new MessageMedia(firstMedia.mimetype, firstMedia.dataB64, firstMedia.filename);
         postedMsg = await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, mm, { caption: groupText });
@@ -1080,7 +1084,6 @@ async function handleAccountantDM(msg) {
     }
     return true;
   }
-  // edit field: <new value>
   var editMatch = body.match(/^\s*edit\s+(details|amount|company|from|account)\s*:\s*(.+)$/i);
   if(editMatch){
     var fld = editMatch[1].toLowerCase();
@@ -1096,40 +1099,29 @@ async function handleAccountantDM(msg) {
     await waClient.sendMessage(rawFrom, 'Updated. ' + buildGroupPostFromDM(entry, entry.posterName) + '\n\nReply "yes" to post.');
     return true;
   }
-
-  // Show preview and wait for confirmation
   saveDMState(state);
   await waClient.sendMessage(rawFrom, confirmText);
   return true;
 }
-
-// ── Stale-pending scanner (Option 4: tag once after 30 min, no repeat) ───────
-// State persisted on disk (under ./wa_auth so it survives redeploys via the Volume).
+// ── Stale-pending scanner ────────────────────────────────────────────────────
 var STALE_STATE_FILE = './wa_auth/reminder_state.json';
-
 function loadStaleState() {
   try {
     if(fs.existsSync(STALE_STATE_FILE)){
       return JSON.parse(fs.readFileSync(STALE_STATE_FILE, 'utf8'));
     }
   } catch(e) { console.error('[Stale] state load failed:', e.message); }
-  return { reminded: {} }; // expenseId -> { sentAt: ISO timestamp, missing: ['mm','sm'] }
+  return { reminded: {} };
 }
-
 function saveStaleState(state) {
   try {
     if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
     fs.writeFileSync(STALE_STATE_FILE, JSON.stringify(state, null, 2));
   } catch(e) { console.error('[Stale] state save failed:', e.message); }
 }
-
-
 // ── Silent mode toggle ───────────────────────────────────────────────────────
-// When ON: bot stops posting reminders + MIS to groups. Only listens + audits.
-// At 7 PM, bot DMs the daily summary to SILENT_OBSERVER instead.
 var SILENT_STATE_FILE = './wa_auth/silent_mode.json';
-var SILENT_OBSERVER = '917838537000'; // phone to receive private summaries when silent mode is on
-
+var SILENT_OBSERVER = '917838537000';
 function loadSilentMode() {
   try {
     if(fs.existsSync(SILENT_STATE_FILE)){
@@ -1137,13 +1129,8 @@ function loadSilentMode() {
       return s.enabled === true;
     }
   } catch(e) { console.error('[Silent] load failed:', e.message); }
-  // Default to SILENT mode on fresh install (no state file).
-  // Bot listens, audits, processes DMs, but does NOT post group reminders/MIS.
-  // Reports go privately to SILENT_OBSERVER instead.
-  // Toggle off via: DM "silent off" from observer phone, or hit /api/silent-off
   return true;
 }
-
 function saveSilentMode(enabled) {
   try {
     if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
@@ -1151,14 +1138,9 @@ function saveSilentMode(enabled) {
     console.log('[Silent] mode set to:', enabled ? 'ON (silent)' : 'OFF (group reminders active)');
   } catch(e) { console.error('[Silent] save failed:', e.message); }
 }
-
-// Helper: get the JID to DM the silent observer
 function getSilentObserverJid() {
   return SILENT_OBSERVER + '@c.us';
 }
-
-// Build a reminder message that @mentions whoever still hasn't replied.
-// Returns { text, mentionJids } so caller can pass mentions to WhatsApp.
 function buildStaleReminderText(expense, now) {
   var mm = expense.status.mm, sm = expense.status.sm;
   var bothPending = mm === 'pending' && sm === 'pending';
@@ -1166,8 +1148,6 @@ function buildStaleReminderText(expense, now) {
   var smOnly = sm === 'pending' && mm === 'yes';
   var queryMM = mm === 'question', querySM = sm === 'question';
   var queryAnswered = expense.queryAnswer ? true : false;
-
-  // Determine who needs to be tagged
   var mentionJids = [];
   var mentionTags = [];
   if(mm === 'pending' || (queryMM && queryAnswered)) {
@@ -1178,7 +1158,6 @@ function buildStaleReminderText(expense, now) {
     mentionJids.push(CONFIG.SM_PHONE + '@c.us');
     mentionTags.push('@' + CONFIG.SM_PHONE);
   }
-  // If query unanswered, tag the accountants instead (the askers)
   var queryUnanswered = (queryMM || querySM) && !queryAnswered;
   if(queryUnanswered) {
     mentionJids = []; mentionTags = [];
@@ -1188,7 +1167,6 @@ function buildStaleReminderText(expense, now) {
     });
   }
   if(mentionJids.length === 0) return null;
-
   var minutesPending = Math.floor((now - expense.date.getTime()) / (60*1000));
   var lines = [];
   var header;
@@ -1200,10 +1178,8 @@ function buildStaleReminderText(expense, now) {
   else return null;
   lines.push(header);
   lines.push('');
-
   var vendor = expense.vendor || expense.body.substring(0, 60);
   lines.push(vendor);
-
   if(expense.subItems && expense.subItems.length > 1){
     var total = expense.subItems.reduce(function(s, it){ return s + it.amount; }, 0);
     lines.push('Amount: Rs.' + formatINR(total) + ' total');
@@ -1211,21 +1187,17 @@ function buildStaleReminderText(expense, now) {
   } else if(expense.amount > 0){
     lines.push('Amount: Rs.' + formatINR(expense.amount));
   }
-
   var d = expense.date.toLocaleDateString('en-IN', {day:'numeric', month:'short', timeZone:'Asia/Kolkata'});
   var t = expense.date.toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Kolkata'});
   lines.push('Requested by: ' + expense.sender + ' - ' + d + ', ' + t);
-
   if(expense.supportingDocs && expense.supportingDocs.length > 0){
     var docNames = expense.supportingDocs.map(function(dd){ return dd.filename; }).join(', ');
     lines.push('Supporting docs: ' + docNames);
   }
-
   lines.push('');
   var mmLabel = mm==='yes'?'MM: Ok':mm==='question'?'MM: query raised':'MM: pending';
   var smLabel = sm==='yes'?'SM: Ok':sm==='question'?'SM: query raised':'SM: pending';
   lines.push(mmLabel + ' | ' + smLabel);
-
   if((queryMM||querySM) && queryAnswered){
     var ans = expense.queryAnswer;
     var who = ans.role === 'mm' ? 'MM' : 'SM';
@@ -1237,48 +1209,36 @@ function buildStaleReminderText(expense, now) {
     lines.push(answerLabel + ' answered:');
     lines.push('"' + ans.answer + '"');
   }
-
   lines.push('');
   lines.push(mentionTags.join(' ') + ' please reply: Yes / No / Hold / or reason');
-
   return { text: lines.join('\n'), mentionJids: mentionJids };
 }
-
-// Run every 10 minutes — find expenses posted >= 30 min ago that we haven't yet reminded about.
 async function scanStalePendings() {
   if(!waReady || !CONFIG.BOT_ENABLED) return 0;
   if(loadSilentMode()){console.log('[Stale] silent mode ON — skipping group scan');return 0;}
   try {
     var state = loadStaleState();
-    var audit = await buildApprovalAudit(2); // last 2 days is enough for stale check
+    var audit = await buildApprovalAudit(2);
     var now = Date.now();
     var THIRTY_MIN = 30 * 60 * 1000;
-
-    // Quiet hours: 9 PM - 9 AM IST. Convert to local time check.
     var nowIST = new Date(now);
     var hourIST = parseInt(nowIST.toLocaleString('en-IN', { hour: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' }));
     if(hourIST >= 21 || hourIST < 9) {
       console.log('[Stale] quiet hours (IST '+hourIST+'h), skipping scan');
       return 0;
     }
-
-    // Anything still needing attention = partial OR (noApproval with an actual amount)
     var candidates = audit.partialApproval.concat(
       audit.noApproval.filter(function(e){ return e.amount > 0 || (e.subItems && e.subItems.length > 0); })
     );
-
     var sentCount = 0;
     var delay = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
-
     for(var i=0; i<candidates.length; i++) {
       var expense = candidates[i];
       var expenseAge = now - expense.date.getTime();
-      if(expenseAge < THIRTY_MIN) continue; // too fresh
-      if(state.reminded[expense.id]) continue; // already reminded once — Option 4 says don't repeat
-
+      if(expenseAge < THIRTY_MIN) continue;
+      if(state.reminded[expense.id]) continue;
       var built = buildStaleReminderText(expense, now);
       if(!built) continue;
-
       try {
         await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, built.text, { mentions: built.mentionJids });
         state.reminded[expense.id] = { sentAt: new Date().toISOString(), missing: [] };
@@ -1291,7 +1251,6 @@ async function scanStalePendings() {
         console.error('[Stale] send failed for', expense.id, e.message);
       }
     }
-
     if(sentCount > 0) saveStaleState(state);
     return sentCount;
   } catch(e) {
@@ -1299,8 +1258,7 @@ async function scanStalePendings() {
     return 0;
   }
 }
-
-// Build the "Stale Pending" section that gets appended to evening report
+// ── v2.6 REWRITE: buildStalePendingSection — top-N recent + older rollup ──
 async function buildStalePendingSection() {
   try {
     var audit = await buildApprovalAudit(7);
@@ -1308,26 +1266,41 @@ async function buildStalePendingSection() {
       audit.noApproval.filter(function(e){ return e.amount > 0; })
     );
     if(stillPending.length === 0) return '';
-
-    var lines = [''];
-    lines.push('--- STALE PENDING APPROVALS ---');
-    lines.push('');
-    var totalStale = 0;
+    var nowMs = Date.now();
+    stillPending.sort(function(a,b){ return b.date.getTime() - a.date.getTime(); });
+    var recent = [];
+    var older = [];
     stillPending.forEach(function(e){
+      var ageHrs = (nowMs - e.date.getTime()) / (60*60*1000);
+      if(ageHrs <= STALE_RECENT_HOURS) recent.push(e);
+      else older.push(e);
+    });
+    if(recent.length > STALE_TOP_N){
+      older = recent.slice(STALE_TOP_N).concat(older);
+      recent = recent.slice(0, STALE_TOP_N);
+    }
+    var lines = [''];
+    lines.push('--- STALE PENDING (recent) ---');
+    lines.push('');
+    var totalRecent = 0;
+    recent.forEach(function(e){
       var status = e.status.mm === 'yes' ? 'SM pending' : e.status.sm === 'yes' ? 'MM pending' : e.status.mm === 'question' ? 'Query open' : e.status.sm === 'question' ? 'Query open' : 'Both pending';
-      var age = Math.floor((Date.now() - e.date.getTime()) / (60*60*1000));
+      var age = Math.floor((nowMs - e.date.getTime()) / (60*60*1000));
       lines.push('- ' + (e.vendor || e.body.substring(0,40)) + ' Rs.' + formatINR(e.amount) + ' [' + status + ', ' + age + 'h]');
-      totalStale += e.amount;
+      totalRecent += e.amount;
     });
     lines.push('');
-    lines.push('Total stale: Rs.' + formatINR(totalStale));
+    lines.push('Total recent: Rs.' + formatINR(totalRecent));
+    if(older.length > 0){
+      var totalOlder = older.reduce(function(s,e){return s + e.amount;}, 0);
+      lines.push('+ ' + older.length + ' older items totalling Rs.' + formatINR(totalOlder) + ' — reply MORE STALE to see all');
+    }
     return lines.join('\n');
   } catch(e) {
     console.error('[StaleSection] failed:', e.message);
     return '';
   }
 }
-
 // ── Ledger + Fund Position ────────────────────────────────────────────────────
 async function getLedgerData(dateStr) {
   var rows=await readSheet('Ledger!A:L');
@@ -1349,8 +1322,6 @@ async function getFundPosition() {
   }
   return accounts;
 }
-
-
 async function getLedgerRange(startDate, endDate) {
   var rows = await readSheet('Ledger!A:L');
   var entries = [];
@@ -1371,20 +1342,7 @@ async function getLedgerRange(startDate, endDate) {
   }
   return entries;
 }
-
-// ── Ledger Matcher ────────────────────────────────────────────────────────────
-// For each fully-approved expense, find the matching Ledger entry (the actual
-// payment). Categorise as paid / paid_with_tolerance / possible_match / awaiting_payment.
-//
-// Match criteria:
-//   1. STRICT: amount equal (±Rs 1), OUT entry, within 14 days of approval, vendor word overlap
-//   2. TOLERANCE: amount within ±5%, otherwise same as strict
-//   3. POSSIBLE: same week + word overlap, but amount differs >5%
-//   4. AWAITING: no match found
-
 // ── Stage 2: Fuzzy matching helpers ──────────────────────────────────────────
-// Levenshtein distance (edit distance). Returns # of single-char edits to convert a→b.
-// Catches "Kackar" ↔ "Kakkar" (distance 1), "Trinity" ↔ "Trnity" (distance 1).
 function levenshtein(a, b) {
   if(!a) return b ? b.length : 0;
   if(!b) return a.length;
@@ -1403,9 +1361,6 @@ function levenshtein(a, b) {
   }
   return prev[n];
 }
-
-// Soundex encoding — phonetic match for names. "Kackar", "Kakkar", "Kacker" all → K260.
-// Handles transliterated Indian names where spelling varies but sound is identical.
 function soundex(s) {
   if(!s) return '';
   s = s.toUpperCase().replace(/[^A-Z]/g, '');
@@ -1421,28 +1376,20 @@ function soundex(s) {
   }
   return (first + code + '000').substring(0,4);
 }
-
-// Check if two strings are "fuzzy similar":
-//   - Levenshtein distance ≤ 3 for short words (4-8 chars)
-//   - Levenshtein ≤ 4 for longer
-//   - OR phonetic match via Soundex
 function fuzzyMatch(a, b) {
   if(!a || !b) return false;
   a = a.toLowerCase(); b = b.toLowerCase();
   if(a === b) return true;
-  if(a.indexOf(b) >= 0 || b.indexOf(a) >= 0) return true; // substring
+  if(a.indexOf(b) >= 0 || b.indexOf(a) >= 0) return true;
   var maxLen = Math.max(a.length, b.length);
   var threshold = maxLen <= 8 ? 3 : 4;
   var dist = levenshtein(a, b);
   if(dist <= threshold) return true;
-  // Phonetic fallback for name-like strings (alphabetic only)
   if(/^[a-z]+$/.test(a) && /^[a-z]+$/.test(b)){
     if(soundex(a) === soundex(b)) return true;
   }
   return false;
 }
-
-// Stage 2 word overlap: word-by-word fuzzy match between expense and ledger
 function ledgerFuzzyWordOverlap(ledgerEntry, expense) {
   if(!ledgerEntry || !expense) return null;
   var ledgerText = ((ledgerEntry.description||'') + ' ' + (ledgerEntry.entity||'') + ' ' + (ledgerEntry.person||'')).toLowerCase();
@@ -1453,10 +1400,9 @@ function ledgerFuzzyWordOverlap(ledgerEntry, expense) {
   var expenseText = expenseTextRaw.toLowerCase();
   var stopWords = ['the','and','for','with','from','this','that','please','approve','kindly','payment','amount','rs','inr','total','expense','expenses','final'];
   var expWords = expenseText.split(/[^a-z0-9]+/).filter(function(w){
-    return w.length >= 4 && stopWords.indexOf(w) < 0; // 4+ chars to avoid noise like "for"
+    return w.length >= 4 && stopWords.indexOf(w) < 0;
   });
   var ledgerWords = ledgerText.split(/[^a-z0-9]+/).filter(function(w){ return w.length >= 4; });
-  // Try each expense word against each ledger word
   for(var i=0; i<expWords.length; i++){
     for(var j=0; j<ledgerWords.length; j++){
       if(fuzzyMatch(expWords[i], ledgerWords[j])){
@@ -1466,12 +1412,10 @@ function ledgerFuzzyWordOverlap(ledgerEntry, expense) {
   }
   return null;
 }
-
 function ledgerWordOverlap(ledgerEntry, expense) {
   if(!ledgerEntry || !expense) return false;
   var ledgerText = ((ledgerEntry.description||'') + ' ' + (ledgerEntry.entity||'') + ' ' + (ledgerEntry.person||'')).toLowerCase();
   var expenseTextRaw = (expense.vendor||'') + ' ' + (expense.body||'');
-  // Also include supportingDocs vendor/purpose if present (vision-extracted real vendor names)
   if(expense.supportingDocs && expense.supportingDocs.length){
     expense.supportingDocs.forEach(function(d){ expenseTextRaw += ' ' + (d.vendor||'') + ' ' + (d.purpose||''); });
   }
@@ -1486,20 +1430,8 @@ function ledgerWordOverlap(ledgerEntry, expense) {
   }
   return false;
 }
-
 // ── Match Cache ──────────────────────────────────────────────────────────────
-// Persists confirmed/learned matches across runs. Avoids re-billing Haiku for
-// the same (expense, ledger) pair. Also stores manual interventions (your
-// "1 ok" / "1 reject" replies) so the matcher learns over time.
-//
-// Shape:
-//   {
-//     matches: { <expenseId>: { ledgerHash, stage, confidence, manuallyConfirmed?, manuallyRejected?, ts } },
-//     rejected: { <expenseId>: [ledgerHash1, ledgerHash2, ...] },  // ledger entries explicitly NOT a match
-//     manualPaid: { <expenseId>: { paidDate, ts } }                // user-supplied "this was paid"
-//   }
 var MATCH_CACHE_FILE = './wa_auth/match_cache.json';
-
 function loadMatchCache() {
   try {
     if(fs.existsSync(MATCH_CACHE_FILE)){
@@ -1508,29 +1440,21 @@ function loadMatchCache() {
   } catch(e) { console.error('[MatchCache] load failed:', e.message); }
   return { matches: {}, rejected: {}, manualPaid: {} };
 }
-
 function saveMatchCache(cache) {
   try {
     if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth', { recursive: true });
     fs.writeFileSync(MATCH_CACHE_FILE, JSON.stringify(cache, null, 2));
   } catch(e) { console.error('[MatchCache] save failed:', e.message); }
 }
-
-// Build a stable hash for a ledger entry so the cache survives re-fetches
 function ledgerEntryHash(le) {
   if(!le) return null;
   var d = le.date ? le.date.toISOString().split('T')[0] : '';
   return d + '|' + le.amount + '|' + (le.bankAC||'') + '|' + (le.description||'').substring(0,50);
 }
-
 // ── Stage 3: Haiku semantic matcher ──────────────────────────────────────────
-// Asks Claude to pick the right Ledger entry from candidates that survived
-// amount + date filtering but failed strict/fuzzy word matching.
 async function haikuSemanticMatch(expense, candidates) {
   if(!CONFIG.CLAUDE_API_KEY) return null;
   if(!candidates || candidates.length === 0) return null;
-
-  // Trim to top 5 candidates by amount proximity to keep prompt short
   var top5 = candidates.slice(0,5);
   var expenseSummary = (expense.vendor || '') + (expense.body && expense.body !== expense.vendor ? ' · ' + expense.body : '');
   if(expense.supportingDocs && expense.supportingDocs.length){
@@ -1539,12 +1463,10 @@ async function haikuSemanticMatch(expense, candidates) {
       if(d.purpose) expenseSummary += ' · doc purpose: ' + d.purpose;
     });
   }
-
   var candidateLines = top5.map(function(c, i){
     var dt = c.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'});
     return (i) + '. ' + dt + ' · Rs.' + c.amount + ' · ' + (c.bankAC||'-') + ' · ' + (c.description||'') + (c.entity?' · '+c.entity:'') + (c.person?' · person:'+c.person:'');
   }).join('\n');
-
   var prompt = 'You are matching an approved expense request to its actual Ledger payment.\n\n' +
     'APPROVED EXPENSE:\n' +
     'Date: ' + expense.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'}) + '\n' +
@@ -1554,7 +1476,6 @@ async function haikuSemanticMatch(expense, candidates) {
     'Which candidate (if any) is the actual payment for this approval? ' +
     'Consider synonyms (e.g. TMT bar = Steel rods), informal vs formal names, Hindi/English mix, abbreviations. ' +
     'Reply ONLY with strict JSON: {"match": <index 0-' + (top5.length-1) + '|null>, "confidence": <0.0-1.0>, "reasoning": "<one sentence>"}';
-
   try {
     var resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -1589,60 +1510,48 @@ async function haikuSemanticMatch(expense, candidates) {
     return null;
   }
 }
-
-// Stage 1 + Stage 2 matcher (sync, free). Returns a result OR a candidate list for Stage 3.
 function matchLedgerEntry(expense, ledgerEntries) {
   if(!expense || !expense.amount || expense.amount <= 0) return null;
   var approvalDate = expense.date.getTime();
   var fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
   var sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
-
   var strictMatches = [];
   var tolMatches = [];
-  var fuzzyMatches = [];      // Stage 2: fuzzy word + amount within tolerance
-  var possibleMatches = [];   // word overlap only, amount differs
-  var amountOnlyCandidates = []; // for Stage 3 escalation: amount fits but no word overlap
-
+  var fuzzyMatches = [];
+  var possibleMatches = [];
+  var amountOnlyCandidates = [];
   for(var i=0; i<ledgerEntries.length; i++){
     var le = ledgerEntries[i];
     if(le.inOut !== 'OUT') continue;
     var ledgerMs = le.date.getTime();
     var dateDiff = ledgerMs - approvalDate;
     if(dateDiff < -86400000) continue;
-    if(dateDiff > fourteenDaysMs) continue; // bound the candidate window early
-
+    if(dateDiff > fourteenDaysMs) continue;
     var amtDiff = Math.abs(le.amount - expense.amount);
     var pctDiff = amtDiff / expense.amount;
     var strictWords = ledgerWordOverlap(le, expense);
     var fuzzyWordsRes = strictWords ? null : ledgerFuzzyWordOverlap(le, expense);
     var fuzzyWords = fuzzyWordsRes ? true : false;
-
-    // STAGE 1 — STRICT: exact amount + word overlap
     if(amtDiff <= 1 && strictWords){
       strictMatches.push({ entry: le, dateDiffDays: Math.round(dateDiff/86400000) });
       continue;
     }
-    // STAGE 1 — TOLERANCE: ±5% + strict word overlap
     if(pctDiff <= 0.05 && strictWords){
       tolMatches.push({ entry: le, dateDiffDays: Math.round(dateDiff/86400000), pctDiff: pctDiff });
       continue;
     }
-    // STAGE 2 — FUZZY: ±5% amount + fuzzy/phonetic word match
     if(pctDiff <= 0.05 && fuzzyWords){
       fuzzyMatches.push({ entry: le, dateDiffDays: Math.round(dateDiff/86400000), pctDiff: pctDiff, fuzzyMatch: fuzzyWordsRes });
       continue;
     }
-    // POSSIBLE: same week + word/fuzzy overlap (regardless of amount)
     if(Math.abs(dateDiff) <= sevenDaysMs && (strictWords || fuzzyWords)){
       possibleMatches.push({ entry: le, dateDiffDays: Math.round(dateDiff/86400000), pctDiff: pctDiff, amtDiff: amtDiff });
       continue;
     }
-    // STAGE 3 ESCALATION CANDIDATES: amount within ±10%, no word overlap detected
     if(pctDiff <= 0.10){
       amountOnlyCandidates.push(le);
     }
   }
-
   if(strictMatches.length > 0){
     return { status: 'paid', confidence: 'high', stage: 'exact', match: strictMatches[0].entry, dateDiffDays: strictMatches[0].dateDiffDays };
   }
@@ -1655,17 +1564,13 @@ function matchLedgerEntry(expense, ledgerEntries) {
   if(possibleMatches.length > 0){
     return { status: 'possible_match', confidence: 'low', stage: 'possible', match: possibleMatches[0].entry, dateDiffDays: possibleMatches[0].dateDiffDays, pctDiff: possibleMatches[0].pctDiff, amtDiff: possibleMatches[0].amtDiff };
   }
-  // Return amountOnlyCandidates for Stage 3 escalation (caller decides whether to call Haiku)
   if(amountOnlyCandidates.length > 0){
     return { status: 'awaiting_payment', confidence: null, stage: 'needs_ai', match: null, candidates: amountOnlyCandidates };
   }
   return { status: 'awaiting_payment', confidence: null, stage: 'no_match', match: null };
 }
-
-// Stage 1+2+3 matcher with cache. Async wrapper that calls Haiku when needed.
 async function matchLedgerEntryWithAI(expense, ledgerEntries, cache) {
   if(!cache) cache = loadMatchCache();
-  // 1. Cache lookup — if we already have a confirmed match for this expense, reuse it
   var cached = cache.matches[expense.id];
   if(cached){
     var matchedEntry = ledgerEntries.find(function(le){ return ledgerEntryHash(le) === cached.ledgerHash; });
@@ -1680,16 +1585,11 @@ async function matchLedgerEntryWithAI(expense, ledgerEntries, cache) {
       };
     }
   }
-  // 2. Manual paid override
   if(cache.manualPaid && cache.manualPaid[expense.id]){
     return { status: 'paid', confidence: 'manual', stage: 'manual_paid', match: null, manualPaidDate: cache.manualPaid[expense.id].paidDate };
   }
-
-  // 3. Run synchronous Stage 1+2 matcher
   var result = matchLedgerEntry(expense, ledgerEntries);
   if(!result) return null;
-
-  // 4. If stages 1-2 matched, save to cache and return
   if(result.status === 'paid' || result.status === 'paid_with_tolerance'){
     if(result.match){
       cache.matches[expense.id] = {
@@ -1702,10 +1602,7 @@ async function matchLedgerEntryWithAI(expense, ledgerEntries, cache) {
     }
     return result;
   }
-
-  // 5. Stage 3 escalation: only if needs_ai AND we have an API key
   if(result.stage === 'needs_ai' && result.candidates && result.candidates.length > 0 && CONFIG.CLAUDE_API_KEY){
-    // Filter out previously-rejected candidates
     var rejectedHashes = (cache.rejected[expense.id]) || [];
     var validCandidates = result.candidates.filter(function(c){ return rejectedHashes.indexOf(ledgerEntryHash(c)) < 0; });
     if(validCandidates.length === 0){
@@ -1718,7 +1615,6 @@ async function matchLedgerEntryWithAI(expense, ledgerEntries, cache) {
       if(aiResult.confidence >= 0.8){ status = 'paid'; confidence = 'ai_high'; }
       else if(aiResult.confidence >= 0.5){ status = 'possible_match'; confidence = 'ai_medium'; }
       else { return { status: 'awaiting_payment', confidence: null, stage: 'ai_rejected', aiReasoning: aiResult.reasoning }; }
-      // Cache only if high confidence
       if(confidence === 'ai_high'){
         cache.matches[expense.id] = {
           ledgerHash: ledgerEntryHash(aiMatch),
@@ -1740,33 +1636,28 @@ async function matchLedgerEntryWithAI(expense, ledgerEntries, cache) {
       };
     }
   }
-
   return result;
 }
-
+// ── v2.6 EXTENDED: buildReconciliation with reverse-direction scan ───────────
 async function buildReconciliation(days) {
   var audit = await buildApprovalAudit(days || 30);
   var approved = audit.fullyApproved;
-  if(approved.length === 0) {
-    return { paid: [], paidWithTolerance: [], possibleMatch: [], awaitingPayment: [], summary: { totalApproved: 0 } };
-  }
-  // Fetch Ledger entries from earliest approval onwards
-  var earliest = approved.reduce(function(min, e){ return e.date.getTime() < min ? e.date.getTime() : min; }, Date.now());
-  var startDate = new Date(earliest - 86400000); // -1 day buffer
+  // Even if no approvals, we still want to run the reverse pass so a Ledger
+  // payment with no approval at all gets flagged. So we always continue.
+  var earliest = approved.length > 0
+    ? approved.reduce(function(min, e){ return e.date.getTime() < min ? e.date.getTime() : min; }, Date.now())
+    : Date.now() - (REVERSE_SCAN_WINDOW_DAYS * 86400000);
+  var startDate = new Date(earliest - 86400000);
   var endDate = new Date(Date.now() + 86400000);
   var ledgerEntries = await getLedgerRange(startDate, endDate);
-
   var paid = [], paidWithTolerance = [], possibleMatch = [], awaitingPayment = [];
   var totalApproved = 0, totalPaid = 0, totalAwaiting = 0;
-
-  // Load match cache once per reconciliation pass
   var cache = loadMatchCache();
   var matcherStats = { exact: 0, exact_tolerance: 0, fuzzy: 0, ai: 0, cached: 0, manual: 0, awaiting: 0, possible: 0 };
-
+  // FORWARD pass: each approved expense -> find Ledger match
   for(var ei=0; ei<approved.length; ei++){
     var expense = approved[ei];
     totalApproved += expense.amount;
-    // If the expense has subItems, match each sub-item individually
     if(expense.subItems && expense.subItems.length > 1){
       var allMatched = true;
       var subResults = [];
@@ -1783,7 +1674,6 @@ async function buildReconciliation(days) {
       else { awaitingPayment.push(combined); totalAwaiting += expense.amount; }
       continue;
     }
-    // Single-amount expense
     var result = await matchLedgerEntryWithAI(expense, ledgerEntries, cache);
     var withMatch = Object.assign({}, expense, { matchResult: result });
     if(result && result.stage) matcherStats[result.stage] = (matcherStats[result.stage]||0) + 1;
@@ -1799,12 +1689,56 @@ async function buildReconciliation(days) {
       awaitingPayment.push(withMatch); totalAwaiting += expense.amount;
     }
   }
-
+  // v2.6 REVERSE pass: Ledger entries with no matching approval
+  // Collect every Ledger entry that was matched in the forward pass
+  var matchedHashes = {};
+  function _addMatched(items){
+    items.forEach(function(item){
+      if(item.matchResult && item.matchResult.match){
+        matchedHashes[ledgerEntryHash(item.matchResult.match)] = true;
+      }
+      if(item.subItemResults){
+        item.subItemResults.forEach(function(sr){
+          if(sr.match && sr.match.match){
+            matchedHashes[ledgerEntryHash(sr.match.match)] = true;
+          }
+        });
+      }
+    });
+  }
+  _addMatched(paid);
+  _addMatched(paidWithTolerance);
+  _addMatched(possibleMatch);
+  // Walk Ledger OUT entries within the reverse-scan window
+  var nowMs = Date.now();
+  var windowStartMs = nowMs - (REVERSE_SCAN_WINDOW_DAYS * 86400000);
+  var ledgerWithoutApproval = [];
+  var ledgerRecurring = [];
+  for(var li=0; li<ledgerEntries.length; li++){
+    var le = ledgerEntries[li];
+    if(le.inOut !== 'OUT') continue;
+    if(le.amount < REVERSE_SCAN_MIN_AMOUNT) continue;
+    if(le.date.getTime() < windowStartMs) continue;
+    if(matchedHashes[ledgerEntryHash(le)]) continue;
+    if(isRecurringPattern(le)){
+      ledgerRecurring.push(le);
+    } else {
+      ledgerWithoutApproval.push(le);
+    }
+  }
+  ledgerWithoutApproval.sort(function(a,b){
+    var dDiff = b.date.getTime() - a.date.getTime();
+    if(dDiff !== 0) return dDiff;
+    return b.amount - a.amount;
+  });
+  ledgerRecurring.sort(function(a,b){ return b.date.getTime() - a.date.getTime(); });
   return {
     paid: paid,
     paidWithTolerance: paidWithTolerance,
     possibleMatch: possibleMatch,
     awaitingPayment: awaitingPayment,
+    ledgerWithoutApproval: ledgerWithoutApproval,
+    ledgerRecurring: ledgerRecurring,
     matcherStats: matcherStats,
     cacheSize: Object.keys(cache.matches).length,
     summary: {
@@ -1812,25 +1746,23 @@ async function buildReconciliation(days) {
       totalPaid: totalPaid,
       totalAwaiting: totalAwaiting,
       totalPossible: possibleMatch.reduce(function(s,e){return s+e.amount;},0),
+      totalUnmatchedLedger: ledgerWithoutApproval.reduce(function(s,e){return s+e.amount;},0),
+      totalRecurringLedger: ledgerRecurring.reduce(function(s,e){return s+e.amount;},0),
       countApproved: approved.length,
       countPaid: paid.length,
       countPaidTolerance: paidWithTolerance.length,
       countPossible: possibleMatch.length,
-      countAwaiting: awaitingPayment.length
+      countAwaiting: awaitingPayment.length,
+      countUnmatchedLedger: ledgerWithoutApproval.length,
+      countRecurringLedger: ledgerRecurring.length
     }
   };
 }
-
 // ── Outlier Detection ────────────────────────────────────────────────────────
-// Classifies items needing your manual review. Builds the numbered list shown
-// in the daily DM report so you can reply "1 ok" / "2 chase" etc.
 async function buildOutliers(rec) {
   var outliers = [];
   var SEVEN_DAYS_MS = 7 * 86400000;
-  var TEN_DAYS_MS = 10 * 86400000;
   var now = Date.now();
-
-  // Type 1: Amount mismatch (paid_with_tolerance with diff >= Rs 500)
   rec.paidWithTolerance.forEach(function(e){
     var m = e.matchResult ? e.matchResult.match : null;
     if(!m) return;
@@ -1848,8 +1780,6 @@ async function buildOutliers(rec) {
       });
     }
   });
-
-  // Type 2: Low-confidence AI matches (possible_match from ai_medium)
   rec.possibleMatch.forEach(function(e){
     if(!e.matchResult) return;
     if(e.matchResult.stage === 'ai' || e.matchResult.confidence === 'ai_medium'){
@@ -1870,8 +1800,6 @@ async function buildOutliers(rec) {
       });
     }
   });
-
-  // Type 3: Stale awaiting (approved >=7 days, no Ledger entry yet)
   rec.awaitingPayment.forEach(function(e){
     var ageMs = now - e.date.getTime();
     if(ageMs >= SEVEN_DAYS_MS){
@@ -1882,8 +1810,6 @@ async function buildOutliers(rec) {
       });
     }
   });
-
-  // Type 4: Date drift (paid items with dateDiffDays >= 10)
   rec.paid.forEach(function(e){
     if(!e.matchResult || !e.matchResult.dateDiffDays) return;
     if(e.matchResult.dateDiffDays >= 10){
@@ -1895,84 +1821,130 @@ async function buildOutliers(rec) {
       });
     }
   });
-
-  // Number them so the user can reply with index
   outliers.forEach(function(o, i){ o.id = i + 1; });
   return outliers;
 }
-
-// Build a text section for the evening report
+// ── v2.6 REWRITE: buildReconciliationSection — top-N per section + reverse-scan ──
 async function buildReconciliationSection() {
   try {
     var rec = await buildReconciliation(30);
-    if(rec.summary.countApproved === 0) return '';
+    if(rec.summary.countApproved === 0 && (!rec.ledgerWithoutApproval || rec.ledgerWithoutApproval.length === 0)) return '';
+    function sortPaidByLedgerDate(arr){
+      var copy = arr.slice();
+      copy.sort(function(a,b){
+        var aD = (a.matchResult && a.matchResult.match) ? a.matchResult.match.date.getTime() : 0;
+        var bD = (b.matchResult && b.matchResult.match) ? b.matchResult.match.date.getTime() : 0;
+        return bD - aD;
+      });
+      return copy;
+    }
+    function sortByApprovalDateDesc(arr){
+      var copy = arr.slice();
+      copy.sort(function(a,b){ return b.date.getTime() - a.date.getTime(); });
+      return copy;
+    }
     var lines = [''];
     lines.push('--- APPROVED EXPENSES STATUS ---');
     lines.push('');
     if(rec.paid.length > 0){
-      lines.push('Paid (' + rec.paid.length + '):');
-      rec.paid.forEach(function(e){
+      var sortedPaid = sortPaidByLedgerDate(rec.paid);
+      var shown = sortedPaid.slice(0, REPORT_TOP_N);
+      lines.push('Recent paid (top ' + shown.length + ' of ' + rec.paid.length + '):');
+      shown.forEach(function(e){
         var m = e.matchResult ? e.matchResult.match : null;
         var bankAC = m ? m.bankAC : '';
         var dt = m ? m.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'}) : '';
         lines.push('  ✓ ' + (e.vendor || e.body.substring(0,30)) + ' Rs.' + formatINR(e.amount) + (m ? ' → ' + dt + ', ' + bankAC : ''));
       });
+      if(rec.paid.length > REPORT_TOP_N){
+        lines.push('  + ' + (rec.paid.length - REPORT_TOP_N) + ' more paid items — reply MORE PAID to see all');
+      }
       lines.push('');
     }
     if(rec.paidWithTolerance.length > 0){
-      lines.push('Paid (within 5% tolerance) (' + rec.paidWithTolerance.length + '):');
-      rec.paidWithTolerance.forEach(function(e){
+      var sortedTol = sortPaidByLedgerDate(rec.paidWithTolerance);
+      var shownTol = sortedTol.slice(0, REPORT_TOP_N);
+      lines.push('Paid (within 5% tolerance) (top ' + shownTol.length + ' of ' + rec.paidWithTolerance.length + '):');
+      shownTol.forEach(function(e){
         var m = e.matchResult ? e.matchResult.match : null;
         lines.push('  ~ ' + (e.vendor || e.body.substring(0,30)) + ' Rs.' + formatINR(e.amount) + ' (paid Rs.' + formatINR(m ? m.amount : 0) + ')');
       });
+      if(rec.paidWithTolerance.length > REPORT_TOP_N){
+        lines.push('  + ' + (rec.paidWithTolerance.length - REPORT_TOP_N) + ' more — reply MORE TOLERANCE to see all');
+      }
       lines.push('');
     }
     if(rec.awaitingPayment.length > 0){
-      lines.push('Approved but not yet paid (' + rec.awaitingPayment.length + '):');
-      rec.awaitingPayment.forEach(function(e){
+      var sortedAwait = sortByApprovalDateDesc(rec.awaitingPayment);
+      var shownAwait = sortedAwait.slice(0, REPORT_TOP_N);
+      lines.push('Approved but not yet paid (top ' + shownAwait.length + ' of ' + rec.awaitingPayment.length + '):');
+      shownAwait.forEach(function(e){
         var d = e.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
         lines.push('  ⏳ ' + (e.vendor || e.body.substring(0,30)) + ' Rs.' + formatINR(e.amount) + ' (approved ' + d + ')');
       });
+      if(rec.awaitingPayment.length > REPORT_TOP_N){
+        lines.push('  + ' + (rec.awaitingPayment.length - REPORT_TOP_N) + ' more — reply MORE AWAITING to see all');
+      }
       lines.push('');
     }
     if(rec.possibleMatch.length > 0){
-      lines.push('Possible mismatch — needs review (' + rec.possibleMatch.length + '):');
-      rec.possibleMatch.forEach(function(e){
+      var sortedPoss = sortByApprovalDateDesc(rec.possibleMatch);
+      var shownPoss = sortedPoss.slice(0, REPORT_TOP_N);
+      lines.push('Possible mismatch — needs review (top ' + shownPoss.length + ' of ' + rec.possibleMatch.length + '):');
+      shownPoss.forEach(function(e){
         var m = e.matchResult ? e.matchResult.match : null;
         lines.push('  ⚠ ' + (e.vendor || e.body.substring(0,30)) + ' approved Rs.' + formatINR(e.amount) + ' vs Ledger Rs.' + formatINR(m ? m.amount : 0));
       });
+      if(rec.possibleMatch.length > REPORT_TOP_N){
+        lines.push('  + ' + (rec.possibleMatch.length - REPORT_TOP_N) + ' more — reply MORE MISMATCH to see all');
+      }
+      lines.push('');
+    }
+    // v2.6 NEW: reverse-scan — Ledger entries without WhatsApp approval
+    if(rec.ledgerWithoutApproval && rec.ledgerWithoutApproval.length > 0){
+      var shownRev = rec.ledgerWithoutApproval.slice(0, REPORT_TOP_N);
+      lines.push('⚠ Ledger payments WITHOUT approval (top ' + shownRev.length + ' of ' + rec.ledgerWithoutApproval.length + '):');
+      shownRev.forEach(function(le){
+        var dt = le.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
+        var desc = (le.description||le.entity||'').substring(0,40);
+        lines.push('  ❗ ' + desc + ' Rs.' + formatINR(le.amount) + ' (' + (le.bankAC||'-') + ', ' + dt + ')');
+      });
+      if(rec.ledgerWithoutApproval.length > REPORT_TOP_N){
+        lines.push('  + ' + (rec.ledgerWithoutApproval.length - REPORT_TOP_N) + ' more — reply MORE UNMATCHED to see all');
+      }
+      lines.push('');
+    }
+    if(rec.ledgerRecurring && rec.ledgerRecurring.length > 0){
+      lines.push('ℹ ' + rec.ledgerRecurring.length + ' recurring/auto Ledger items suppressed (EMI, salary, bank charges, etc.) — reply MORE RECURRING to see');
       lines.push('');
     }
     lines.push('Total approved: Rs.' + formatINR(rec.summary.totalApproved));
     lines.push('Total paid: Rs.' + formatINR(rec.summary.totalPaid));
     lines.push('Awaiting payment: Rs.' + formatINR(rec.summary.totalAwaiting));
+    if(rec.summary.totalUnmatchedLedger > 0){
+      lines.push('Ledger unmatched: Rs.' + formatINR(rec.summary.totalUnmatchedLedger));
+    }
     return lines.join('\n');
   } catch(e) {
     console.error('[Reconciliation section]', e.message);
     return '';
   }
 }
-
 // ── EOD Daily Report Builder (HTML for the JPEG sent to SILENT_OBSERVER) ─────
 function escapeHtml(s) {
   if(s === null || s === undefined) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
-
 function buildEODReportHTML(opts) {
-  // opts: { date, audit, rec, outliers, isFriday, weekStats }
   var d = opts.date;
   var audit = opts.audit || { fullyApproved:[], partialApproval:[], noApproval:[], allExpenses:[] };
   var rec = opts.rec || { paid:[], paidWithTolerance:[], possibleMatch:[], awaitingPayment:[], summary:{} };
   var outliers = opts.outliers || [];
   var isFriday = opts.isFriday || false;
   var weekStats = opts.weekStats || null;
-
   var todayDate = new Date(d);
   var todayStr = todayDate.toLocaleDateString('en-IN',{day:'numeric',month:'long',year:'numeric',timeZone:'Asia/Kolkata'});
   var weekday = todayDate.toLocaleDateString('en-IN',{weekday:'long',timeZone:'Asia/Kolkata'});
-
-  // Filter today's activity
   var todayKey = d;
   var todaysApprovals = audit.allExpenses ? audit.allExpenses.filter(function(e){
     return e.date.toISOString().split('T')[0] === todayKey;
@@ -1984,12 +1956,16 @@ function buildEODReportHTML(opts) {
   var todayOneAmt = todayOne.reduce(function(s,e){return s+e.amount;},0);
   var todayNoneAmt = todayNone.reduce(function(s,e){return s+e.amount;},0);
   var todayTotalAmt = todayBothAmt + todayOneAmt + todayNoneAmt;
-
   function bar(pct){ return Math.max(0, Math.min(100, Math.round(pct))); }
   function pctOf(part, whole){ return whole > 0 ? (part/whole)*100 : 0; }
-
-  // Sections HTML
-  var paidHTML = rec.paid.length ? rec.paid.map(function(e){
+  // v2.6: also show top-N in the JPEG (mirror text format)
+  var paidShown = rec.paid.slice().sort(function(a,b){
+    var aD = (a.matchResult && a.matchResult.match) ? a.matchResult.match.date.getTime() : 0;
+    var bD = (b.matchResult && b.matchResult.match) ? b.matchResult.match.date.getTime() : 0;
+    return bD - aD;
+  }).slice(0, REPORT_TOP_N);
+  var paidExtra = rec.paid.length - paidShown.length;
+  var paidHTML = paidShown.length ? paidShown.map(function(e){
     var m = e.matchResult ? e.matchResult.match : null;
     var subDocs = e.supportingDocs && e.supportingDocs.length ? '<div class="item-doc">📎 ' + escapeHtml(e.supportingDocs.map(function(d){return d.filename;}).join(', ')) + '</div>' : '';
     var dt = m ? m.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'}) : '';
@@ -1999,16 +1975,28 @@ function buildEODReportHTML(opts) {
       (m ? '<div class="item-meta">Ledger '+escapeHtml(dt)+' · '+escapeHtml(m.bankAC||'-')+'</div>' : '')+
       subDocs+'</div>';
   }).join('') : '<div class="empty">None today</div>';
-
-  var awaitingHTML = rec.awaitingPayment.length ? rec.awaitingPayment.map(function(e){
+  if(paidExtra > 0) paidHTML += '<div class="empty">+ ' + paidExtra + ' more — reply MORE PAID</div>';
+  var awaitShown = rec.awaitingPayment.slice().sort(function(a,b){ return b.date.getTime() - a.date.getTime(); }).slice(0, REPORT_TOP_N);
+  var awaitExtra = rec.awaitingPayment.length - awaitShown.length;
+  var awaitingHTML = awaitShown.length ? awaitShown.map(function(e){
     var d2 = e.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
     var ageDays = Math.floor((Date.now() - e.date.getTime()) / 86400000);
     return '<div class="item amber">'+
       '<div class="item-row"><span class="item-name">'+escapeHtml(e.vendor || (e.body||'').substring(0,40))+'</span><span class="item-amount">Rs.'+formatINR(e.amount)+'</span></div>'+
       '<div class="item-meta">approved '+escapeHtml(d2)+' · '+ageDays+'d ago, no Ledger entry yet</div></div>';
   }).join('') : '<div class="empty">None — all approved expenses paid</div>';
-
-  var partialHTML = (audit.partialApproval || []).length ? audit.partialApproval.map(function(e){
+  if(awaitExtra > 0) awaitingHTML += '<div class="empty">+ ' + awaitExtra + ' more — reply MORE AWAITING</div>';
+  // v2.6: reverse-scan section in JPEG
+  var revShown = (rec.ledgerWithoutApproval || []).slice(0, REPORT_TOP_N);
+  var revExtra = (rec.ledgerWithoutApproval || []).length - revShown.length;
+  var revHTML = revShown.length ? revShown.map(function(le){
+    var dt = le.date.toLocaleDateString('en-IN',{day:'numeric',month:'short',timeZone:'Asia/Kolkata'});
+    return '<div class="item red">'+
+      '<div class="item-row"><span class="item-name">❗ '+escapeHtml((le.description||le.entity||'').substring(0,40))+'</span><span class="item-amount">Rs.'+formatINR(le.amount)+'</span></div>'+
+      '<div class="item-meta">'+escapeHtml(le.bankAC||'-')+' · '+escapeHtml(dt)+' · no approval found</div></div>';
+  }).join('') : '';
+  if(revExtra > 0) revHTML += '<div class="empty">+ ' + revExtra + ' more — reply MORE UNMATCHED</div>';
+  var partialHTML = (audit.partialApproval || []).length ? audit.partialApproval.slice(0, REPORT_TOP_N).map(function(e){
     var who = e.status.mm==='yes' ? 'MM ✓ · SM pending' : (e.status.sm==='yes' ? 'SM ✓ · MM pending' : 'Both pending');
     var hours = Math.floor((Date.now() - e.date.getTime()) / (60*60*1000));
     var ageStr = hours >= 24 ? Math.floor(hours/24)+'d' : hours+'h';
@@ -2017,15 +2005,14 @@ function buildEODReportHTML(opts) {
       '<div class="item-row"><span class="item-name">'+escapeHtml(e.vendor || (e.body||'').substring(0,40))+'</span><span class="item-amount">Rs.'+formatINR(e.amount)+'</span></div>'+
       '<div class="item-meta">'+escapeHtml(who)+' · '+ageStr+escapeHtml(subTag)+'</div></div>';
   }).join('') : '';
-
-  var queryHTML = (audit.noApproval || []).filter(function(e){return e.queryAnswer;}).map(function(e){
+  var partialExtra = (audit.partialApproval || []).length - REPORT_TOP_N;
+  if(partialExtra > 0) partialHTML += '<div class="empty">+ ' + partialExtra + ' more — reply MORE STALE</div>';
+  var queryHTML = (audit.noApproval || []).filter(function(e){return e.queryAnswer;}).slice(0, REPORT_TOP_N).map(function(e){
     return '<div class="item gray">'+
       '<div class="item-row"><span class="item-name">'+escapeHtml(e.vendor || (e.body||'').substring(0,40))+'</span><span class="item-amount">Rs.'+formatINR(e.amount)+'</span></div>'+
       '<div class="item-meta">Query answered · awaiting MM + SM</div></div>';
   }).join('');
-
   var stuckOnMM = (audit.partialApproval || []).filter(function(e){ return e.status.mm==='pending' && e.status.sm==='yes'; }).reduce(function(s,e){return s+e.amount;},0);
-
   var outliersHTML = outliers.length ? outliers.map(function(o){
     var n = o.id;
     if(o.type === 'amount_mismatch'){
@@ -2062,8 +2049,6 @@ function buildEODReportHTML(opts) {
     }
     return '';
   }).join('') : '<div class="empty">No outliers — everything matches</div>';
-
-  // Friday-only matcher learning section
   var weeklyHTML = '';
   if(isFriday && weekStats){
     var total = weekStats.totalMatches || 1;
@@ -2086,7 +2071,6 @@ function buildEODReportHTML(opts) {
       '<div class="total-row"><span class="label">Manual rejections</span><span class="val amber">'+(weekStats.manualReject||0)+'</span></div>'+
       '</div>';
   }
-
   var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>'+
     '*{box-sizing:border-box;margin:0;padding:0}'+
     'body{background:#0b141a;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;padding:30px 20px;color:#e9edef}'+
@@ -2139,9 +2123,8 @@ function buildEODReportHTML(opts) {
       '<div class="chat-area">'+
         '<div class="timestamp">Today, 7:00 PM</div>'+
         '<div class="message">'+
-          '<div class="report-title">📊 FIDATO MIS — DAILY REPORT</div>'+
+          '<div class="report-title">📊 FIDATO MIS — DAILY REPORT (v2.6)</div>'+
           '<div class="report-subtitle">'+escapeHtml(todayStr)+' · '+escapeHtml(weekday)+'</div>'+
-
           '<div class="section">'+
             '<div class="section-header">Today\'s Activity</div>'+
             '<div class="row"><span class="row-label">Requests posted</span><span class="row-value">'+todaysApprovals.length+'</span></div>'+
@@ -2152,36 +2135,38 @@ function buildEODReportHTML(opts) {
               '<div class="bar-row"><span class="bar-icon">○</span><span class="bar-label">Neither</span><span class="bar-track"><span class="bar-fill red" style="width:'+bar(pctOf(todayNone.length,todaysApprovals.length||1))+'%"></span></span><span class="bar-num">'+todayNone.length+' · Rs.'+formatINR(todayNoneAmt)+'</span></div>'+
             '</div>'+
           '</div>'+
-
           '<div class="section">'+
-            '<div class="section-header">✓ Approved &amp; Paid (all)</div>'+
+            '<div class="section-header">✓ Recent Paid (top '+REPORT_TOP_N+')</div>'+
             paidHTML+
           '</div>'+
-
           '<div class="section">'+
             '<div class="section-header">⏳ Approved, Awaiting Payment</div>'+
             awaitingHTML+
             '<div class="total-row"><span class="label">Total paid</span><span class="val green">Rs.'+formatINR(rec.summary.totalPaid||0)+'</span></div>'+
             '<div class="total-row"><span class="label">Awaiting payment</span><span class="val amber">Rs.'+formatINR(rec.summary.totalAwaiting||0)+'</span></div>'+
           '</div>'+
-
+          (revHTML ?
+            '<div class="section">'+
+              '<div class="section-header">⚠ Ledger Payments WITHOUT Approval</div>'+
+              revHTML+
+              (rec.summary.totalUnmatchedLedger ? '<div class="total-row"><span class="label">Total unmatched</span><span class="val amber">Rs.'+formatINR(rec.summary.totalUnmatchedLedger)+'</span></div>' : '')+
+            '</div>' : ''
+          )+
           (partialHTML || queryHTML ?
             '<div class="section">'+
-              '<div class="section-header">◐ Partial — Needs MM/SM</div>'+
+              '<div class="section-header">◐ Partial — Needs MM/SM (top '+REPORT_TOP_N+')</div>'+
               partialHTML + queryHTML +
               (stuckOnMM > 0 ? '<div class="total-row"><span class="label">Stuck on MM</span><span class="val amber">Rs.'+formatINR(stuckOnMM)+'</span></div>' : '')+
             '</div>' : ''
           )+
-
           '<div class="section">'+
             '<div class="section-header">⚠ Manual Intervention</div>'+
             outliersHTML+
           '</div>'+
-
           weeklyHTML+
-
           '<div class="footer-note">'+
-            (isFriday ? 'Weekly model report included above.' : 'Next weekly model report — Friday 7 PM') +
+            'Reply: MORE STALE | PAID | AWAITING | MISMATCH | UNMATCHED · ' +
+            (isFriday ? 'Weekly model report included above.' : 'Next weekly — Friday 7 PM') +
           '</div>'+
         '</div>'+
       '</div>'+
@@ -2189,8 +2174,6 @@ function buildEODReportHTML(opts) {
   '</body></html>';
   return html;
 }
-
-// Compute weekly matcher stats from match cache (for Friday section)
 function computeWeeklyMatcherStats(cache) {
   if(!cache) cache = loadMatchCache();
   var oneWeekAgo = Date.now() - 7*86400000;
@@ -2207,14 +2190,10 @@ function computeWeeklyMatcherStats(cache) {
     if(m.manuallyConfirmed) stats.manualConfirm++;
     if(m.manuallyRejected) stats.manualReject++;
   });
-  // Cached count: matches that came from cache this week (we approximate by counting all entries)
   stats.cached = Object.keys(cache.matches).length;
-  // AI cost rough estimate (each AI call ~$0.0008 ~Rs 0.07)
   stats.aiCost = (stats.ai * 0.07).toFixed(2);
   return stats;
 }
-
-// Send the EOD report image to SILENT_OBSERVER
 async function sendEODReport(dateStr) {
   if(!waReady){ console.log('[EOD] WA not ready'); return; }
   try {
@@ -2222,35 +2201,33 @@ async function sendEODReport(dateStr) {
     var audit = await buildApprovalAudit(30);
     var rec = await buildReconciliation(30);
     var outliers = await buildOutliers(rec);
-    var dayOfWeek = new Date(d).getDay(); // 0=Sun ... 5=Fri
+    var dayOfWeek = new Date(d).getDay();
     var isFriday = dayOfWeek === 5;
     var weekStats = isFriday ? computeWeeklyMatcherStats() : null;
-
     var html = buildEODReportHTML({ date: d, audit: audit, rec: rec, outliers: outliers, isFriday: isFriday, weekStats: weekStats });
     var img = await htmlToImage(html, 460, 2000);
     var buf = Buffer.isBuffer(img) ? img : Buffer.from(img);
-
     var captionLines = ['📊 Daily Report — '+ new Date(d).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric',timeZone:'Asia/Kolkata'})];
     var todaysCount = (audit.allExpenses || []).filter(function(e){ return e.date.toISOString().split('T')[0] === d; }).length;
     captionLines.push(todaysCount+' requests today · '+(rec.paid.length)+' paid · Rs.'+formatINR(rec.summary.totalAwaiting||0)+' awaiting');
+    if(rec.ledgerWithoutApproval && rec.ledgerWithoutApproval.length > 0){
+      captionLines.push('⚠ '+rec.ledgerWithoutApproval.length+' Ledger payment(s) without approval — reply MORE UNMATCHED');
+    }
     if(outliers.length > 0) captionLines.push(outliers.length+' outlier(s) need your input — reply with command shown in image');
     if(isFriday) captionLines.push('📈 Weekly matcher learning included.');
-
     var jid = getSilentObserverJid();
     await waClient.sendMessage(jid, new MessageMedia('image/png', buf.toString('base64'), 'EOD_'+d+'.png'), { caption: captionLines.join('\n') });
     console.log('[EOD] sent to', jid);
-    // Persist outlier list so user replies can reference by index
     saveDMState(Object.assign(loadDMState(), { lastOutliers: { date: d, items: outliers.map(function(o){
       return { id: o.id, type: o.type, expenseId: o.expense.id, ledgerHash: o.ledger ? ledgerEntryHash(o.ledger) : null };
     })}}));
-    return { success: true, outlierCount: outliers.length };
+    return { success: true, outlierCount: outliers.length, unmatchedLedgerCount: (rec.ledgerWithoutApproval||[]).length };
   } catch(e) {
     console.error('[EOD] failed:', e.message);
     return { error: e.message };
   }
 }
-
-// ── Report HTML ───────────────────────────────────────────────────────────────
+// ── Report HTML (legacy daily MIS report) ─────────────────────────────────────
 async function generateDailyReport(dateStr){
   var entries=await getLedgerData(dateStr);var fp=await getFundPosition();
   var tIn=0,tOut=0,inflows=[],outflows=[];
@@ -2269,9 +2246,8 @@ function buildReportHTML(data){
   data.fundPosition.forEach(function(a){h+='<tr><td>'+a.bankAC+'</td><td class="amt">'+formatINR(a.opening)+'</td><td class="amt gn">'+formatINR(a.todayIn)+'</td><td class="amt rd">'+formatINR(a.todayOut)+'</td><td class="amt">'+formatINR(a.closing)+'</td><td class="amt rd">'+formatINR(a.cheques)+'</td><td class="amt '+(a.netBal<0?'rd':'')+'">'+formatINR(a.netBal)+'</td></tr>';});h+='</table></body></html>';
   return h;
 }
-
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.5',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.6',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -2313,66 +2289,9 @@ app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(awai
 app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.5',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.6',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});var msgId=req.query.msgId;if(!msgId)return res.json({error:'pass ?msgId=...'});var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);var msgs=await chat.fetchMessages({limit:200});var target=null;for(var i=0;i<msgs.length;i++){var sid=msgs[i].id._serialized||msgs[i].id.id;if(sid===msgId){target=msgs[i];break;}}if(!target)return res.json({error:'message not found in last 200'});if(!target.hasMedia)return res.json({error:'no media'});var media=await target.downloadMedia();if(!media)return res.json({error:'failed to download'});visionCache.delete(msgId);var result=await extractFromImage(media,msgId);res.json({msgId:msgId,mimetype:media.mimetype,dataSize:media.data?media.data.length:0,parsed:result});}catch(e){res.json({error:e.message});}});
-
-// ── Crons ─────────────────────────────────────────────────────────────────────
-// 7 PM IST — evening report
-cron.schedule('30 13 * * *',async function(){
-  if(!CONFIG.BOT_ENABLED||!waReady)return;
-  var d=new Date().toISOString().split('T')[0];
-  var silent = loadSilentMode();
-  // When silent: target is the observer (private DM). When not: the Day Book group.
-  var targetJid = silent ? getSilentObserverJid() : CONFIG.WHATSAPP_GROUP_JID;
-  var prefix = silent ? '[SILENT MODE] ' : '';
-  try {
-    var data = await generateDailyReport(d);
-    var staleSection = await buildStalePendingSection();
-    var recSection = await buildReconciliationSection();
-    if(data.entryCount > 0){
-      var img = await htmlToImage(buildReportHTML(data),800,1200);
-      var buf = Buffer.isBuffer(img)?img:Buffer.from(img);
-      var caption = prefix + 'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut) + staleSection + recSection;
-      await waClient.sendMessage(targetJid, new MessageMedia('image/png',buf.toString('base64'),'MIS.png'), {caption:caption});
-    } else if(staleSection || recSection) {
-      await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries today.'+staleSection+recSection);
-    } else if(silent) {
-      // Even with no data, observer should hear from the bot daily so they know it ran
-      await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries and no stale approvals.');
-    }
-  } catch(e) { console.error('Cron evening:',e.message); }
-},{timezone:'Asia/Kolkata'});
-
-// 9 AM IST — morning summary + pending reminders
-cron.schedule('30 3 * * *',function(){
-  if(!CONFIG.BOT_ENABLED||!waReady)return;
-  var y=new Date();y.setDate(y.getDate()-1);var d=y.toISOString().split('T')[0];
-  var silent = loadSilentMode();
-  var targetJid = silent ? getSilentObserverJid() : CONFIG.WHATSAPP_GROUP_JID;
-  var prefix = silent ? '[SILENT MODE] ' : '';
-  generateDailyReport(d).then(function(data){
-    if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var buf=Buffer.isBuffer(img)?img:Buffer.from(img);waClient.sendMessage(targetJid,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:prefix+'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}
-  }).catch(function(e){console.error('Cron morning:',e.message);});
-  // 30s after morning summary, send pending approval reminders. sendPendingReminders is itself silent-mode-aware.
-  setTimeout(function(){sendPendingReminders().catch(function(e){console.error('[Reminders cron]',e.message);});},30000);
-},{timezone:'Asia/Kolkata'});
-
-// Every 10 minutes — scan for pending expenses >= 30 min old, send one reminder each (no repeat)
-cron.schedule('*/10 * * * *',function(){
-  if(!CONFIG.BOT_ENABLED||!waReady)return;
-  scanStalePendings().catch(function(e){console.error('[Cron stale]',e.message);});
-},{timezone:'Asia/Kolkata'});
-
-// 7 PM IST daily — send EOD report image privately to SILENT_OBSERVER (917838537000).
-// On Fridays, the same image includes the weekly matcher learning section.
-// Always fires regardless of silent mode (private DM to one person).
-cron.schedule('0 19 * * *',function(){
-  if(!CONFIG.BOT_ENABLED||!waReady)return;
-  sendEODReport().catch(function(e){console.error('[EOD cron]',e.message);});
-},{timezone:'Asia/Kolkata'});
-
 app.get('/api/whoami',async function(req,res){
-  // Returns the bot's view of recent direct chats so we can debug what JIDs come in
   try {
     if(!waReady) return res.json({error:'not connected'});
     var chats = await waClient.getChats();
@@ -2426,12 +2345,32 @@ app.get('/api/reconciliation',async function(req,res){
         pctDiff: e.matchResult ? e.matchResult.pctDiff : null
       };
     };
+    var fmtLedger = function(le){
+      return {
+        date: le.date.toISOString().split('T')[0],
+        entity: le.entity,
+        description: le.description,
+        head: le.head,
+        tag: le.tag,
+        amount: le.amount,
+        amountFormatted: formatINR(le.amount),
+        bankAC: le.bankAC,
+        person: le.person,
+        notes: le.notes
+      };
+    };
     res.json({
       summary: rec.summary,
       paid: rec.paid.map(fmt),
       paidWithTolerance: rec.paidWithTolerance.map(fmt),
       possibleMatch: rec.possibleMatch.map(fmt),
-      awaitingPayment: rec.awaitingPayment.map(fmt)
+      awaitingPayment: rec.awaitingPayment.map(fmt),
+      ledgerWithoutApproval: (rec.ledgerWithoutApproval||[]).map(fmtLedger),
+      ledgerRecurring: (rec.ledgerRecurring||[]).map(fmtLedger),
+      reverseScanConfig: {
+        windowDays: REVERSE_SCAN_WINDOW_DAYS,
+        minAmount: REVERSE_SCAN_MIN_AMOUNT
+      }
     });
   } catch(e) { res.json({error: e.message}); }
 });
@@ -2459,7 +2398,57 @@ app.get('/api/wa-reset',function(req,res){
     res.json({ok:true, message:'WhatsApp reset triggered. Wait 30-60s, then check /api/pair for new QR.'});
   } catch(e) { res.json({error:e.message}); }
 });
-
+// ── Crons ─────────────────────────────────────────────────────────────────────
+// 7 PM IST — evening report (with v2.6 top-N + reverse-scan sections appended)
+cron.schedule('30 13 * * *',async function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  var d=new Date().toISOString().split('T')[0];
+  var silent = loadSilentMode();
+  var targetJid = silent ? getSilentObserverJid() : CONFIG.WHATSAPP_GROUP_JID;
+  var prefix = silent ? '[SILENT MODE] ' : '';
+  try {
+    var data = await generateDailyReport(d);
+    var staleSection = await buildStalePendingSection();
+    var recSection = await buildReconciliationSection();
+    if(data.entryCount > 0){
+      var img = await htmlToImage(buildReportHTML(data),800,1200);
+      var buf = Buffer.isBuffer(img)?img:Buffer.from(img);
+      var caption = prefix + 'Evening Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut) + staleSection + recSection;
+      await waClient.sendMessage(targetJid, new MessageMedia('image/png',buf.toString('base64'),'MIS.png'), {caption:caption});
+    } else if(staleSection || recSection) {
+      await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries today.'+staleSection+recSection);
+    } else if(silent) {
+      await waClient.sendMessage(targetJid, prefix + 'Evening Report - '+d+'\nNo Ledger entries and no stale approvals.');
+    }
+  } catch(e) { console.error('Cron evening:',e.message); }
+},{timezone:'Asia/Kolkata'});
+// 9 AM IST — morning summary + pending reminders
+cron.schedule('30 3 * * *',function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  var y=new Date();y.setDate(y.getDate()-1);var d=y.toISOString().split('T')[0];
+  var silent = loadSilentMode();
+  var targetJid = silent ? getSilentObserverJid() : CONFIG.WHATSAPP_GROUP_JID;
+  var prefix = silent ? '[SILENT MODE] ' : '';
+  generateDailyReport(d).then(function(data){
+    if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var buf=Buffer.isBuffer(img)?img:Buffer.from(img);waClient.sendMessage(targetJid,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:prefix+'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}
+  }).catch(function(e){console.error('Cron morning:',e.message);});
+  setTimeout(function(){sendPendingReminders().catch(function(e){console.error('[Reminders cron]',e.message);});},30000);
+},{timezone:'Asia/Kolkata'});
+// Every 10 minutes — scan for pending expenses >= 30 min old
+cron.schedule('*/10 * * * *',function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  scanStalePendings().catch(function(e){console.error('[Cron stale]',e.message);});
+},{timezone:'Asia/Kolkata'});
+// 7 PM IST daily — EOD JPEG report privately to SILENT_OBSERVER (with v2.6 reverse-scan section)
+cron.schedule('0 19 * * *',function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  sendEODReport().catch(function(e){console.error('[EOD cron]',e.message);});
+},{timezone:'Asia/Kolkata'});
+// ── Startup ──────────────────────────────────────────────────────────────────
 initGoogleSheets();
 createWhatsAppClient();
-app.listen(CONFIG.PORT,function(){console.log('\nFidato MIS Server v2.5 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');});
+app.listen(CONFIG.PORT,function(){
+  console.log('\nFidato MIS Server v2.6 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
+  console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
+});
