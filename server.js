@@ -316,7 +316,7 @@ async function buildApprovalAudit(days) {
               answer: body,
               answerDate: msgDate,
               answerBy: senderInfo.contactName || rawSender,
-              answerByRole: answerFromOtherPromoter ? (senderInfo.role==='mm' ? 'MM' : 'SM') : 'accountant'
+              answerByRole: answerFromOtherPromoter ? (senderInfo.role==='mm' ? 'M' : 'S') : 'accountant'
             };
             continue;
           }
@@ -437,11 +437,11 @@ function buildReminderText(expense) {
   var queryMM=mm==='question', querySM=sm==='question';
   var queryAnswered = expense.queryAnswer ? true : false;
   var header;
-  if((queryMM||querySM) && queryAnswered) header='[BOT REMINDER] - Query answered - awaiting MM+SM approval';
+  if((queryMM||querySM) && queryAnswered) header='[BOT REMINDER] - Query answered - awaiting M+S approval';
   else if(queryMM||querySM) header='[BOT REMINDER] - Query unanswered - '+getDaysPending(expense.date)+' day(s) pending';
   else if(bothPending) header='[BOT REMINDER] - Approval needed';
-  else if(mmOnly) header='[BOT REMINDER] - MM approval needed';
-  else if(smOnly) header='[BOT REMINDER] - SM approval needed';
+  else if(mmOnly) header='[BOT REMINDER] - M approval needed';
+  else if(smOnly) header='[BOT REMINDER] - S approval needed';
   else return null;
   var lines=[header,''];
   var vendor=expense.vendor||expense.body.substring(0,60);
@@ -461,12 +461,12 @@ function buildReminderText(expense) {
     lines.push('Supporting docs: '+docNames);
   }
   lines.push('');
-  var mmLabel=mm==='yes'?'MM: Ok':mm==='question'?'MM: query raised':'MM: pending';
-  var smLabel=sm==='yes'?'SM: Ok':sm==='question'?'SM: query raised':'SM: pending';
+  var mmLabel=mm==='yes'?'M: Ok':mm==='question'?'M: query raised':'M: pending';
+  var smLabel=sm==='yes'?'S: Ok':sm==='question'?'S: query raised':'S: pending';
   lines.push(mmLabel+' | '+smLabel);
   if((queryMM||querySM) && queryAnswered){
     var ans = expense.queryAnswer;
-    var who = ans.role==='mm'?'MM':'SM';
+    var who = ans.role==='mm'?'M':'S';
     var answerLabel = ans.answerByRole && ans.answerByRole !== 'accountant' ? (ans.answerByRole + ' (' + ans.answerBy + ')') : ans.answerBy;
     lines.push('');
     lines.push(who+' asked:');
@@ -475,10 +475,10 @@ function buildReminderText(expense) {
     lines.push(answerLabel+' answered:');
     lines.push('"'+ans.answer+'"');
     lines.push('');
-    lines.push(who==='MM'?'Madhur sir, please confirm to approve':'Sumit sir, please confirm to approve');
+    lines.push(who==='M'?'Madhur sir, please confirm to approve':'Sumit sir, please confirm to approve');
   }
-  else if(queryMM&&expense.mmApproval){lines.push('');lines.push('MM asked:');lines.push('"'+expense.mmApproval.raw+'"');lines.push('');lines.push('Please answer MM\'s query to proceed');}
-  else if(querySM&&expense.smApproval){lines.push('');lines.push('SM asked:');lines.push('"'+expense.smApproval.raw+'"');lines.push('');lines.push('Please answer SM\'s query to proceed');}
+  else if(queryMM&&expense.mmApproval){lines.push('');lines.push('M asked:');lines.push('"'+expense.mmApproval.raw+'"');lines.push('');lines.push('Please answer M\'s query to proceed');}
+  else if(querySM&&expense.smApproval){lines.push('');lines.push('S asked:');lines.push('"'+expense.smApproval.raw+'"');lines.push('');lines.push('Please answer S\'s query to proceed');}
   else if(mmOnly){lines.push('');lines.push('Madhur sir, please swipe-reply Ok to approve');}
   else if(smOnly){lines.push('');lines.push('Sumit sir, please swipe-reply Ok to approve');}
   else{lines.push('');lines.push('Please swipe-reply Ok to approve');}
@@ -607,7 +607,7 @@ function buildGroupPostFromDM(entry, posterName) {
   if(entry.fromAC) lines.push('From: ' + entry.fromAC);
   lines.push('Posted by: ' + posterName);
   lines.push('');
-  lines.push('MM/SM please review.');
+  lines.push('M/S please review.');
   return lines.join('\n');
 }
 
@@ -848,7 +848,7 @@ async function handleAccountantDM(msg) {
             var total = 0;
             var ls = ['FULL STALE PENDING LIST (' + allStale.length + '):', ''];
             allStale.forEach(function(e){
-              var status = e.status.mm === 'yes' ? 'SM pending' : e.status.sm === 'yes' ? 'MM pending' : e.status.mm === 'question' ? 'Query open' : e.status.sm === 'question' ? 'Query open' : 'Both pending';
+              var status = e.status.mm === 'yes' ? 'S pending' : e.status.sm === 'yes' ? 'M pending' : e.status.mm === 'question' ? 'Query open' : e.status.sm === 'question' ? 'Query open' : 'Both pending';
               var age = Math.floor((Date.now() - e.date.getTime()) / (60*60*1000));
               ls.push('- ' + (e.vendor || e.body.substring(0,40)) + ' Rs.' + formatINR(e.amount) + ' [' + status + ', ' + age + 'h]');
               total += e.amount;
@@ -1027,7 +1027,7 @@ async function handleAccountantDM(msg) {
       await waClient.sendMessage(rawFrom, [
         'I see ' + amtCount + ' amounts in this message.',
         '',
-        'Please send one expense request at a time. This keeps the approval trail clean — MM and SM can review each one separately, and matching to Ledger payments stays unambiguous.',
+        'Please send one expense request at a time. This keeps the approval trail clean — M and S can review each one separately, and matching to Ledger payments stays unambiguous.',
         '',
         'Send the first expense by itself, then send the next one after the first is posted.',
         '',
@@ -1306,7 +1306,7 @@ async function handleAccountantDM(msg) {
       }
       delete state.pending[rawFrom];
       saveDMState(state);
-      await waClient.sendMessage(rawFrom, 'Posted to approval group. MM/SM will review and respond.');
+      await waClient.sendMessage(rawFrom, 'Posted to approval group. M/S will review and respond.');
       console.log('[DM] posted to group from', entry.posterName);
     } catch(e) {
       console.error('[DM] post failed:', e.message);
@@ -1424,10 +1424,10 @@ function buildStaleReminderText(expense, now) {
   var lines = [];
   var header;
   if(queryUnanswered) header = '[BOT REMINDER] Query unanswered - pending ' + minutesPending + ' min';
-  else if(queryMM || querySM) header = '[BOT REMINDER] Query answered - awaiting MM/SM - pending ' + minutesPending + ' min';
+  else if(queryMM || querySM) header = '[BOT REMINDER] Query answered - awaiting M/S - pending ' + minutesPending + ' min';
   else if(bothPending) header = '[BOT REMINDER] Approval needed - pending ' + minutesPending + ' min';
-  else if(mmOnly) header = '[BOT REMINDER] MM approval needed - pending ' + minutesPending + ' min';
-  else if(smOnly) header = '[BOT REMINDER] SM approval needed - pending ' + minutesPending + ' min';
+  else if(mmOnly) header = '[BOT REMINDER] M approval needed - pending ' + minutesPending + ' min';
+  else if(smOnly) header = '[BOT REMINDER] S approval needed - pending ' + minutesPending + ' min';
   else return null;
   lines.push(header);
   lines.push('');
@@ -1448,12 +1448,12 @@ function buildStaleReminderText(expense, now) {
     lines.push('Supporting docs: ' + docNames);
   }
   lines.push('');
-  var mmLabel = mm==='yes'?'MM: Ok':mm==='question'?'MM: query raised':'MM: pending';
-  var smLabel = sm==='yes'?'SM: Ok':sm==='question'?'SM: query raised':'SM: pending';
+  var mmLabel = mm==='yes'?'M: Ok':mm==='question'?'M: query raised':'M: pending';
+  var smLabel = sm==='yes'?'S: Ok':sm==='question'?'S: query raised':'S: pending';
   lines.push(mmLabel + ' | ' + smLabel);
   if((queryMM||querySM) && queryAnswered){
     var ans = expense.queryAnswer;
-    var who = ans.role === 'mm' ? 'MM' : 'SM';
+    var who = ans.role === 'mm' ? 'M' : 'S';
     var answerLabel = ans.answerByRole && ans.answerByRole !== 'accountant' ? (ans.answerByRole + ' (' + ans.answerBy + ')') : ans.answerBy;
     lines.push('');
     lines.push(who + ' asked:');
@@ -1537,7 +1537,7 @@ async function buildStalePendingSection() {
     lines.push('');
     var totalRecent = 0;
     recent.forEach(function(e){
-      var status = e.status.mm === 'yes' ? 'SM pending' : e.status.sm === 'yes' ? 'MM pending' : e.status.mm === 'question' ? 'Query open' : e.status.sm === 'question' ? 'Query open' : 'Both pending';
+      var status = e.status.mm === 'yes' ? 'S pending' : e.status.sm === 'yes' ? 'M pending' : e.status.mm === 'question' ? 'Query open' : e.status.sm === 'question' ? 'Query open' : 'Both pending';
       var age = Math.floor((nowMs - e.date.getTime()) / (60*60*1000));
       lines.push('- ' + (e.vendor || e.body.substring(0,40)) + ' Rs.' + formatINR(e.amount) + ' [' + status + ', ' + age + 'h]');
       totalRecent += e.amount;
@@ -2250,7 +2250,7 @@ function buildEODReportHTML(opts) {
   }).join('') : '';
   if(revExtra > 0) revHTML += '<div class="empty">+ ' + revExtra + ' more — reply MORE UNMATCHED</div>';
   var partialHTML = (audit.partialApproval || []).length ? audit.partialApproval.slice(0, REPORT_TOP_N).map(function(e){
-    var who = e.status.mm==='yes' ? 'MM ✓ · SM pending' : (e.status.sm==='yes' ? 'SM ✓ · MM pending' : 'Both pending');
+    var who = e.status.mm==='yes' ? 'M ✓ · S pending' : (e.status.sm==='yes' ? 'S ✓ · M pending' : 'Both pending');
     var hours = Math.floor((Date.now() - e.date.getTime()) / (60*60*1000));
     var ageStr = hours >= 24 ? Math.floor(hours/24)+'d' : hours+'h';
     var subTag = e.subItems && e.subItems.length>1 ? ' · '+e.subItems.length+' sub-items' : '';
@@ -2263,7 +2263,7 @@ function buildEODReportHTML(opts) {
   var queryHTML = (audit.noApproval || []).filter(function(e){return e.queryAnswer;}).slice(0, REPORT_TOP_N).map(function(e){
     return '<div class="item gray">'+
       '<div class="item-row"><span class="item-name">'+escapeHtml(e.vendor || (e.body||'').substring(0,40))+'</span><span class="item-amount">Rs.'+formatINR(e.amount)+'</span></div>'+
-      '<div class="item-meta">Query answered · awaiting MM + SM</div></div>';
+      '<div class="item-meta">Query answered · awaiting M + S</div></div>';
   }).join('');
   var stuckOnMM = (audit.partialApproval || []).filter(function(e){ return e.status.mm==='pending' && e.status.sm==='yes'; }).reduce(function(s,e){return s+e.amount;},0);
   var outliersHTML = outliers.length ? outliers.map(function(o){
@@ -2407,9 +2407,9 @@ function buildEODReportHTML(opts) {
           )+
           (partialHTML || queryHTML ?
             '<div class="section">'+
-              '<div class="section-header">◐ Partial — Needs MM/SM (top '+REPORT_TOP_N+')</div>'+
+              '<div class="section-header">◐ Partial — Needs M/S (top '+REPORT_TOP_N+')</div>'+
               partialHTML + queryHTML +
-              (stuckOnMM > 0 ? '<div class="total-row"><span class="label">Stuck on MM</span><span class="val amber">Rs.'+formatINR(stuckOnMM)+'</span></div>' : '')+
+              (stuckOnMM > 0 ? '<div class="total-row"><span class="label">Stuck on M</span><span class="val amber">Rs.'+formatINR(stuckOnMM)+'</span></div>' : '')+
             '</div>' : ''
           )+
           '<div class="section">'+
