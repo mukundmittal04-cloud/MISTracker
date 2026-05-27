@@ -1,8 +1,10 @@
 // ============================================================
-// FIDATO MIS SERVER v2.6 — Reverse-scan + Top-N report + MORE commands
-// Adds: reverse Ledger→approval matcher, recurring-pattern suppression,
-//       top-3 per report section with MORE X drill-down DM commands.
-// All v2.5 features preserved unchanged.
+// FIDATO MIS SERVER v2.7 — Smart DM relay + vision confirmation + multi-amount block
+// Adds: smart first-message parsing (extracts company/account from free-form text),
+//       multi-amount detection that forces one-at-a-time discipline,
+//       vision read confirmation before posting (kills filename-misread bugs),
+//       SHOW + EDIT mid-flow commands.
+// All v2.6 features preserved unchanged (reverse-scan, MORE commands, top-N report).
 // ============================================================
 const express = require('express');
 const { google } = require('googleapis');
@@ -608,6 +610,78 @@ function buildGroupPostFromDM(entry, posterName) {
   lines.push('MM/SM please review.');
   return lines.join('\n');
 }
+
+// ── v2.7 NEW: smart free-form parser helpers ─────────────────────────────────
+// Extract company + account references from anywhere in a free-form DM message
+// by matching against the live Fund Position list. Returns { companyMatches, acMatches }.
+// Used to avoid asking the accountant for fields they already mentioned.
+async function smartExtractCompanyAccount(text) {
+  if(!text) return { companyMatches: [], acMatches: [] };
+  var lower = text.toLowerCase();
+  var fp;
+  try { fp = await getFundPosition(); } catch(e) { return { companyMatches: [], acMatches: [] }; }
+  var companies = [];
+  var accounts = [];
+  fp.forEach(function(a){
+    if(a.company && companies.indexOf(a.company) < 0) companies.push(a.company);
+    if(a.bankAC && accounts.indexOf(a.bankAC) < 0) accounts.push(a.bankAC);
+  });
+  // Find companies whose full name appears in the text (case-insensitive)
+  var companyMatches = companies.filter(function(c){
+    return c.length >= 4 && lower.indexOf(c.toLowerCase()) >= 0;
+  });
+  // Find bank accounts whose full name appears in the text
+  var acMatches = accounts.filter(function(a){
+    return a.length >= 4 && lower.indexOf(a.toLowerCase()) >= 0;
+  });
+  // Also try partial matches: any unique 2+ word token from a company/account name found in text
+  // This catches "hansaflon" matching "Hansaflon Buildcon"
+  if(companyMatches.length === 0){
+    companies.forEach(function(c){
+      var firstWord = c.split(/\s+/)[0];
+      if(firstWord && firstWord.length >= 5 && lower.indexOf(firstWord.toLowerCase()) >= 0){
+        companyMatches.push(c);
+      }
+    });
+  }
+  if(acMatches.length === 0){
+    accounts.forEach(function(a){
+      var tokens = a.split(/\s+/).filter(function(t){ return t.length >= 4; });
+      // Match if ALL tokens of the account name appear in the text
+      var allFound = tokens.length > 0 && tokens.every(function(t){ return lower.indexOf(t.toLowerCase()) >= 0; });
+      if(allFound) acMatches.push(a);
+    });
+  }
+  // Dedupe
+  companyMatches = Array.from(new Set(companyMatches));
+  acMatches = Array.from(new Set(acMatches));
+  return { companyMatches: companyMatches, acMatches: acMatches };
+}
+
+// Count how many distinct amount patterns are in a free-form message body.
+// Used to enforce "one expense at a time" — refuses multi-amount requests.
+function countAmountPatterns(body) {
+  if(!body) return 0;
+  var found = [];
+  // Pattern A: <number> lac|lakh|cr|crore|l (with currency unit)
+  var unitMatches = body.match(/\d[\d,]*\.?\d*\s*(?:lac|lakh|lacs|l\b|cr|crore)/gi) || [];
+  unitMatches.forEach(function(m){ found.push(m); });
+  // Pattern B: <number> k (thousand)
+  var kMatches = body.match(/\d[\d,]*\.?\d*\s*k\b/gi) || [];
+  kMatches.forEach(function(m){ found.push(m); });
+  // Pattern C: Rs./INR/₹ prefix
+  var rsMatches = body.match(/(?:rs\.?\s*|inr\s*|\u20B9\s*)\d[\d,]*\.?\d*/gi) || [];
+  rsMatches.forEach(function(m){ found.push(m); });
+  // Pattern D: Indian-format commas (e.g. 7,08,708) — only if not already covered by Rs prefix
+  var commaMatches = body.match(/\b\d{1,3}(?:,\d{2,3}){1,3}\b/g) || [];
+  commaMatches.forEach(function(m){
+    // Skip if this match is part of a Rs-prefixed match we already counted
+    var alreadyCounted = found.some(function(f){ return f.indexOf(m) >= 0; });
+    if(!alreadyCounted) found.push(m);
+  });
+  return found.length;
+}
+
 // ── Handle accountant DM ─────────────────────────────────────────────────────
 async function handleAccountantDM(msg) {
   if(!msg || !waReady) return false;
@@ -890,10 +964,18 @@ async function handleAccountantDM(msg) {
       'Company: Hansaflon Buildcon',
       'From: Hansaflon JKB',
       '',
-      'Or just write naturally and I will ask for whatever is missing.',
-      'Attachments (PDF/image) are optional — vision will read them.',
+      'Or just write naturally — I will pick out company/account names if you mention them, and ask for whatever is missing.',
       '',
-      'Reply "cancel" to clear a pending request.'
+      'IMPORTANT: One expense per message. If you have multiple amounts, send them one at a time.',
+      '',
+      'Attachments (PDF/image): I will read them and confirm the amount with you BEFORE posting — so filename/OCR errors do not slip through.',
+      '',
+      'Commands:',
+      '  show              see your current draft',
+      '  edit <field>: x   change a field (details/amount/company/from)',
+      '  edit from: 7      pick bank A/C #7 from the last list shown',
+      '  cancel            clear and start over',
+      '  yes               post the draft to the group'
     ];
     if(phoneOfSender === SILENT_OBSERVER){
       helpLines.push('');
@@ -911,6 +993,50 @@ async function handleAccountantDM(msg) {
     await waClient.sendMessage(rawFrom, helpLines.join('\n'));
     return true;
   }
+
+  // ── v2.7 NEW: SHOW command — display current draft ────────────────────────
+  if(/^\s*show\s*$/i.test(body)){
+    var draft = state.pending[rawFrom];
+    if(!draft){
+      await waClient.sendMessage(rawFrom, 'No pending draft. Send an expense request to start one.');
+      return true;
+    }
+    var showLines = ['Your current draft:', ''];
+    showLines.push('Details: ' + (draft.details || '(not set)'));
+    showLines.push('Amount:  ' + (draft.amount > 0 ? 'Rs.' + formatINR(draft.amount) : '(not set)'));
+    showLines.push('Company: ' + (draft.company || '(not set)'));
+    showLines.push('From:    ' + (draft.fromAC || '(not set)'));
+    if(draft.mediaFiles && draft.mediaFiles.length) showLines.push('Attachments: ' + draft.mediaFiles.length);
+    if(draft.askedFor) showLines.push('\nWaiting for: ' + draft.askedFor);
+    showLines.push('\nReply yes to post, edit <field>: <value> to change, or cancel to clear.');
+    await waClient.sendMessage(rawFrom, showLines.join('\n'));
+    return true;
+  }
+
+  // ── v2.7 NEW: Multi-amount guard — enforce one expense per request ───────
+  // Only check on fresh new requests (no existing draft + not currently answering a follow-up question
+  // + not a vision-confirmation reply). If body has 2+ distinct amount patterns → reject.
+  var existingDraft = state.pending[rawFrom];
+  var isAnsweringQuestion = existingDraft && existingDraft.askedFor;
+  var isVisionConfirm = existingDraft && existingDraft.awaitingVisionConfirm;
+  var isYesPost = /^\s*(yes|post|send|y)\s*$/i.test(body);
+  var isEditCmd = /^\s*edit\s+/i.test(body);
+  if(!isAnsweringQuestion && !isVisionConfirm && !isYesPost && !isEditCmd && body){
+    var amtCount = countAmountPatterns(body);
+    if(amtCount >= 2){
+      await waClient.sendMessage(rawFrom, [
+        'I see ' + amtCount + ' amounts in this message.',
+        '',
+        'Please send one expense request at a time. This keeps the approval trail clean — MM and SM can review each one separately, and matching to Ledger payments stays unambiguous.',
+        '',
+        'Send the first expense by itself, then send the next one after the first is posted.',
+        '',
+        'Reply cancel if you want to clear and start fresh.'
+      ].join('\n'));
+      return true;
+    }
+  }
+
   if(!state.pending[rawFrom]) state.pending[rawFrom] = { details: '', amount: 0, company: '', fromAC: '', mediaIds: [], lastUpdate: new Date().toISOString(), askedFor: null, posterName: senderInfo.contactName || rawFrom, subItems: null, companyOptions: [], fromACOptions: [] };
   var entry = state.pending[rawFrom];
   entry.lastUpdate = new Date().toISOString();
@@ -955,7 +1081,7 @@ async function handleAccountantDM(msg) {
         entry.amount = pa[0].amount;
         entry.askedFor = null;
       } else {
-        await waClient.sendMessage(rawFrom, 'Could not detect an amount. Please reply with the amount (e.g. "3 lac" or "300000" or "10k").');
+        await waClient.sendMessage(rawFrom, 'I could not read an amount in "' + body.substring(0,50) + '". Try one of these formats:\n  • 3 lac\n  • 3,00,000\n  • 300000\n  • 10k\n  • 1.5 cr');
         saveDMState(state);
         return true;
       }
@@ -981,6 +1107,28 @@ async function handleAccountantDM(msg) {
       entry.askedFor = null;
     }
   } else if(body && !hadAnyStructured && !entry.askedFor){
+    // v2.7: If there's a pendingConfirm (we asked "did you mean X?") and the user just replied with
+    // yes/no/numeric, resolve it here BEFORE doing fresh free-form parse.
+    if(entry.pendingConfirm){
+      var pc = entry.pendingConfirm;
+      var trimmedPC = body.trim().toLowerCase();
+      if(trimmedPC === 'yes' || trimmedPC === 'y' || trimmedPC === 'confirm'){
+        if(pc.type === 'company') entry.company = pc.value;
+        else if(pc.type === 'fromAC') entry.fromAC = pc.value;
+        entry.pendingConfirm = null;
+        saveDMState(state);
+        // Fall through — re-evaluate what's still missing in the next pass
+      } else if(/^\d+$/.test(trimmedPC)){
+        // User typed a number — defer to the standard numbered-pick flow below.
+        // Clear pendingConfirm and let the askedFor logic re-prompt with full list.
+        entry.pendingConfirm = null;
+        // Continue — askedFor logic will kick in once we reach the validate-required-fields stage
+      } else if(trimmedPC === 'no' || trimmedPC === 'n'){
+        entry.pendingConfirm = null;
+        saveDMState(state);
+        // Fall through — will re-prompt below
+      }
+    }
     var parsed = parseExpenseMessage(body);
     if(parsed.length > 1){
       entry.subItems = parsed;
@@ -993,6 +1141,24 @@ async function handleAccountantDM(msg) {
         entry.details = body.substring(0, 250);
       }
     }
+    // v2.7 NEW: smart free-form extraction of company + account from anywhere in the text.
+    // Only pre-fill if the field is currently empty (don't overwrite explicit user input).
+    try {
+      var smart = await smartExtractCompanyAccount(body);
+      if(!entry.company && smart.companyMatches.length === 1){
+        // Single confident match — confirm before locking in
+        if(!entry.pendingConfirm){
+          entry.pendingConfirm = { type: 'company', value: smart.companyMatches[0] };
+        }
+      } else if(!entry.company && smart.companyMatches.length > 1){
+        // Multiple matches — let the standard askedFor flow ask via numbered list
+      }
+      if(!entry.fromAC && smart.acMatches.length === 1){
+        if(!entry.pendingConfirm){
+          entry.pendingConfirm = { type: 'fromAC', value: smart.acMatches[0] };
+        }
+      }
+    } catch(e) { /* smart extract is best-effort */ }
   }
   if(hasMedia){
     try {
@@ -1001,20 +1167,84 @@ async function handleAccountantDM(msg) {
         var visionResult = await extractFromImage(media, thisMsgId);
         if(visionResult){
           entry.mediaIds.push(thisMsgId);
-          if(visionResult.imageType !== 'cheque'){
-            if(entry.amount === 0 && visionResult.amount > 0) entry.amount = visionResult.amount;
+          if(!entry.mediaFiles) entry.mediaFiles = [];
+          entry.mediaFiles.push({ msgId: thisMsgId, filename: body || ('attachment_'+entry.mediaFiles.length+'.'+(media.mimetype||'').split('/')[1]), mimetype: media.mimetype, dataB64: media.data });
+          // Cheques: no expense info to extract; just attach the media
+          if(visionResult.imageType === 'cheque'){
+            // No-op for amount/details from cheques
+          } else {
+            // v2.7 NEW: Vision confirmation step — never auto-fill amount from vision.
+            // Always DM the parsed values back to the accountant and require explicit confirmation.
+            entry.visionParsed = {
+              vendor: visionResult.vendor || '',
+              amount: visionResult.amount || 0,
+              purpose: visionResult.purpose || '',
+              confidence: visionResult.confidence || 'low'
+            };
+            // Purpose/vendor still feed into details (as before) since they're descriptive context.
+            // Amount is the only thing we hold back for human confirmation.
             if(!entry.details && visionResult.confidence !== 'low'){
               var dParts = [];
               if(visionResult.vendor) dParts.push(visionResult.vendor);
               if(visionResult.purpose) dParts.push(visionResult.purpose);
               if(dParts.length > 0) entry.details = dParts.join(' - ').substring(0,250);
             }
+            // If we haven't yet captured an amount AND vision extracted one, hold it for confirmation.
+            if(entry.amount === 0 && visionResult.amount > 0){
+              entry.awaitingVisionConfirm = true;
+              saveDMState(state);
+              var confLines = ['I read this attachment as:'];
+              if(visionResult.vendor) confLines.push('  Vendor: ' + visionResult.vendor);
+              confLines.push('  Amount: Rs.' + formatINR(visionResult.amount));
+              if(visionResult.purpose) confLines.push('  Purpose: ' + visionResult.purpose);
+              if(visionResult.confidence === 'low') confLines.push('  (vision confidence: LOW)');
+              confLines.push('');
+              confLines.push('Confirm the amount before I post:');
+              confLines.push('  • Reply "yes" if Rs.' + formatINR(visionResult.amount) + ' is correct');
+              confLines.push('  • Or reply with the correct amount (e.g. "1.5 lac" or "150000")');
+              await waClient.sendMessage(rawFrom, confLines.join('\n'));
+              return true;
+            }
           }
-          if(!entry.mediaFiles) entry.mediaFiles = [];
-          entry.mediaFiles.push({ msgId: thisMsgId, filename: body || ('attachment_'+entry.mediaFiles.length+'.'+(media.mimetype||'').split('/')[1]), mimetype: media.mimetype, dataB64: media.data });
         }
       }
     } catch(e) { console.error('[DM] media download failed:', e.message); }
+  }
+  // v2.7 NEW: handle response to vision confirmation
+  if(entry.awaitingVisionConfirm && body){
+    var trimmedVC = body.trim().toLowerCase();
+    if(trimmedVC === 'yes' || trimmedVC === 'y' || trimmedVC === 'confirm' || trimmedVC === 'ok'){
+      // Accept vision's amount as-is
+      if(entry.visionParsed && entry.visionParsed.amount > 0){
+        entry.amount = entry.visionParsed.amount;
+      }
+      entry.awaitingVisionConfirm = false;
+      saveDMState(state);
+      await waClient.sendMessage(rawFrom, 'Confirmed Rs.' + formatINR(entry.amount) + '. Continuing...');
+      // Fall through — required-fields validation will pick up next
+    } else {
+      // Try parsing a corrected amount
+      var pcVC = parseExpenseMessage(body);
+      if(pcVC[0].amount > 0){
+        entry.amount = pcVC[0].amount;
+        entry.awaitingVisionConfirm = false;
+        saveDMState(state);
+        await waClient.sendMessage(rawFrom, 'Updated amount to Rs.' + formatINR(entry.amount) + '. Continuing...');
+        // Fall through
+      } else {
+        await waClient.sendMessage(rawFrom, 'I could not read an amount in "' + body.substring(0,50) + '". Reply "yes" to accept Rs.' + formatINR(entry.visionParsed.amount) + ' or send the correct amount (e.g. "1.5 lac").');
+        saveDMState(state);
+        return true;
+      }
+    }
+  }
+  // v2.7 NEW: if we have a pendingConfirm (smart-detected company/account), ask before list-ask
+  if(entry.pendingConfirm && !entry.askedFor){
+    var pcEntry = entry.pendingConfirm;
+    saveDMState(state);
+    var label = pcEntry.type === 'company' ? 'company' : 'bank A/C';
+    await waClient.sendMessage(rawFrom, 'Did you mean ' + label + ': *' + pcEntry.value + '*?\n\nReply "yes" to confirm, "no" to pick from the full list, or just type the correct name.');
+    return true;
   }
   if(!entry.details){
     entry.askedFor = 'details';
@@ -1057,7 +1287,7 @@ async function handleAccountantDM(msg) {
     return true;
   }
   var preview = buildGroupPostFromDM(entry, entry.posterName);
-  var confirmText = 'Ready to post:\n\n' + preview + '\n\nReply "yes" to post, "edit reason: <text>" to add reason, or "cancel" to clear.';
+  var confirmText = 'Ready to post in the approval group:\n\n' + preview + '\n\nReply:\n  yes                          to post\n  edit <field>: <new value>    to change details/amount/company/from\n  show                         to see this draft again\n  cancel                       to clear and start over';
   if(body.toLowerCase() === 'yes' || body.toLowerCase() === 'post' || body.toLowerCase() === 'send'){
     try {
       var groupText = buildGroupPostFromDM(entry, entry.posterName);
@@ -1092,11 +1322,34 @@ async function handleAccountantDM(msg) {
     else if(fld === 'amount'){
       var pe = parseExpenseMessage(val);
       if(pe[0].amount > 0) entry.amount = pe[0].amount;
+      else {
+        await waClient.sendMessage(rawFrom, 'I could not read an amount in "' + val.substring(0,50) + '". Try "3 lac", "3,00,000", or "300000".');
+        saveDMState(state);
+        return true;
+      }
     }
-    else if(fld === 'company') entry.company = val;
-    else if(fld === 'from' || fld === 'account') entry.fromAC = val;
+    else if(fld === 'company'){
+      // v2.7 NEW: support serial-number pick (e.g. "edit company: 3")
+      if(/^\d+$/.test(val) && entry.companyOptions && entry.companyOptions.length){
+        var ci = parseInt(val) - 1;
+        if(ci >= 0 && ci < entry.companyOptions.length) entry.company = entry.companyOptions[ci];
+        else entry.company = val;
+      } else {
+        entry.company = val;
+      }
+    }
+    else if(fld === 'from' || fld === 'account'){
+      // v2.7 NEW: support serial-number pick (e.g. "edit from: 7")
+      if(/^\d+$/.test(val) && entry.fromACOptions && entry.fromACOptions.length){
+        var fi = parseInt(val) - 1;
+        if(fi >= 0 && fi < entry.fromACOptions.length) entry.fromAC = entry.fromACOptions[fi];
+        else entry.fromAC = val;
+      } else {
+        entry.fromAC = val;
+      }
+    }
     saveDMState(state);
-    await waClient.sendMessage(rawFrom, 'Updated. ' + buildGroupPostFromDM(entry, entry.posterName) + '\n\nReply "yes" to post.');
+    await waClient.sendMessage(rawFrom, 'Updated. Here is the current draft:\n\n' + buildGroupPostFromDM(entry, entry.posterName) + '\n\nReply "yes" to post, or "edit <field>: <value>" to keep editing.');
     return true;
   }
   saveDMState(state);
@@ -2247,7 +2500,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.6',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.7',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -2289,7 +2542,7 @@ app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(awai
 app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.6',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.7',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});var msgId=req.query.msgId;if(!msgId)return res.json({error:'pass ?msgId=...'});var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);var msgs=await chat.fetchMessages({limit:200});var target=null;for(var i=0;i<msgs.length;i++){var sid=msgs[i].id._serialized||msgs[i].id.id;if(sid===msgId){target=msgs[i];break;}}if(!target)return res.json({error:'message not found in last 200'});if(!target.hasMedia)return res.json({error:'no media'});var media=await target.downloadMedia();if(!media)return res.json({error:'failed to download'});visionCache.delete(msgId);var result=await extractFromImage(media,msgId);res.json({msgId:msgId,mimetype:media.mimetype,dataSize:media.data?media.data.length:0,parsed:result});}catch(e){res.json({error:e.message});}});
 app.get('/api/whoami',async function(req,res){
   try {
@@ -2448,7 +2701,8 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.6 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.7 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
+  console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
 });
