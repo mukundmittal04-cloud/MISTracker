@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.7 — Smart DM relay + vision confirmation + multi-amount block
+// FIDATO MIS SERVER v2.7.2 — twice-daily digests + urgent trigger + AI multi-amount arbiter + image guard
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
 //       vision read confirmation before posting (kills filename-misread bugs),
@@ -226,6 +226,45 @@ function extractLineVendor(line) {
     .replace(/^\s*(please approve|kindly approve|approve|for|to|on account of|on account|payment to|pay to)\s*/i, '')
     .replace(/\s+/g,' ').trim();
 }
+// v2.7 NEW: clean up a free-form expense message into a tidy "Details" string.
+// Drops field-prefix lines (Amount:/Company:/From:/etc), strips the approval
+// preamble ("kindly approve 10 lakh rs for"), removes leftover amount/currency
+// tokens, and collapses whitespace. Keeps the meaningful purpose text.
+function cleanDetails(body) {
+  if(!body) return '';
+  var lines = body.split('\n').map(function(l){ return l.trim(); }).filter(Boolean);
+  var kept = [];
+  lines.forEach(function(line){
+    // Skip lines that are purely a structured field we capture elsewhere
+    if(/^\s*(amount|company|from|account|a\/c|bank)\s*[:\-]/i.test(line)) return;
+    kept.push(line);
+  });
+  var text = kept.join(' ');
+  // Strip leading approval-request phrases (repeat to catch "please kindly approve")
+  for(var i=0;i<3;i++){
+    text = text.replace(/^\s*(please|kindly|pls|plz|request(?:ing)?(?:\s+(?:you|u))?|i\s+request|sir|ji)\s+/i, '');
+    text = text.replace(/^\s*(approve|approval|pay|payment|release|sanction)\s+/i, '');
+  }
+  // Remove amount + unit tokens (10 lakh, 10 lac, 1.5 cr, 50k, 2.5L, Rs.10,00,000, 10,00,000/-)
+  text = text
+    .replace(/(?:rs\.?|inr|\u20B9)\s*\d[\d,]*\.?\d*\s*(?:lac|lakh|lacs|cr|crore|k|l)?\/?\-?/gi, '')
+    .replace(/\b\d[\d,]*\.?\d*\s*(?:lac|lakh|lacs|cr|crore)\b/gi, '')
+    .replace(/\b\d+\.?\d*\s*l\b/gi, '')
+    .replace(/\b\d[\d,]*\.?\d*\s*k\b/gi, '')
+    .replace(/\b\d{1,3}(?:,\d{2,3}){1,3}\s*\/?\-?/g, '')
+    .replace(/\b\d{4,9}\b\s*\/?\-?/g, '')
+    .replace(/\brs\b\.?/gi, '');
+  // Tidy connector words left dangling at the start ("for legal expenses" -> "legal expenses")
+  for(var j=0;j<3;j++){
+    text = text.replace(/^\s*(payment|paid|pay)\s+/i, '');
+    text = text.replace(/^\s*(for|to|towards|of|on account of|on account|against)\s+/i, '');
+  }
+  // Collapse whitespace and stray punctuation
+  text = text.replace(/\s{2,}/g, ' ').replace(/\s+([,.])/g, '$1').replace(/^[\s,.\-]+|[\s,.\-]+$/g, '').trim();
+  // Capitalize first letter for a tidy look
+  if(text.length > 0) text = text.charAt(0).toUpperCase() + text.slice(1);
+  return text.substring(0, 250);
+}
 function parseExpenseMessage(body) {
   if(!body) return [{vendor:'',amount:0}];
   var lines=body.split('\n').map(function(l){return l.trim();}).filter(Boolean);
@@ -253,8 +292,8 @@ async function extractFromImage(media, msgId) {
       ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: media.data } }
       : { type: 'image', source: { type: 'base64', media_type: mime, data: media.data } };
     var prompt = isPDF
-      ? 'This PDF is attached to an expense approval request. It is likely an invoice, PO, bill, or payment challan. Extract: (1) vendor/payee name, (2) total amount in INR as a number, (3) brief purpose max 10 words. Reply ONLY with JSON on one line: {"vendor":"","amount":0,"purpose":"","imageType":"invoice","confidence":"high"}.'
-      : 'This image is attached to an expense approval request. Classify it: imageType = "cheque" (any bank cheque even cancelled), "invoice" (printed bill), "receipt", "screenshot", or "other". For CHEQUES: set vendor to "" and amount to 0 — they are shared as bank reference only, not expense amounts. For printed INVOICES/RECEIPTS: extract vendor, total amount in INR, and purpose. Set confidence to "high" if clearly printed, "low" if handwritten or blurry. Reply ONLY with JSON on one line: {"vendor":"","amount":0,"purpose":"","imageType":"cheque","confidence":"low"}.';
+      ? 'This PDF is attached to an expense approval request. It is likely an invoice, PO, bill, or payment challan. Extract: (1) vendor/payee name, (2) total amount in INR as a number, (3) brief purpose max 10 words, (4) amountCount = how many DISTINCT separate payable amounts/invoices appear (1 for a single bill, 2+ if multiple separate bills or payment items). Do NOT treat a single itemized invoice as multiple — that is amountCount 1 with the grand total. Reply ONLY with JSON on one line: {"vendor":"","amount":0,"purpose":"","imageType":"invoice","confidence":"high","amountCount":1}.'
+      : 'This image is attached to an expense approval request. Classify it: imageType = "cheque" (any bank cheque even cancelled), "invoice" (printed bill), "receipt", "screenshot", or "other". For CHEQUES: set vendor to "" and amount to 0 — they are shared as bank reference only, not expense amounts. For printed INVOICES/RECEIPTS: extract vendor, total amount in INR, and purpose. Also set amountCount = how many DISTINCT separate payable amounts/invoices appear in the image (1 for a single bill, 2+ if it shows multiple separate bills or a list of multiple payments). A single itemized invoice with line items is amountCount 1 (the grand total). Set confidence to "high" if clearly printed, "low" if handwritten or blurry. Reply ONLY with JSON on one line: {"vendor":"","amount":0,"purpose":"","imageType":"cheque","confidence":"low","amountCount":1}.';
     var resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
@@ -267,7 +306,7 @@ async function extractFromImage(media, msgId) {
     if (!text) return null;
     text = text.replace(/```json|```/g, '').trim();
     var parsed; try { parsed = JSON.parse(text); } catch(e) { var m=text.match(/\{[^}]*\}/); if(m){try{parsed=JSON.parse(m[0]);}catch(e2){return null;}} else return null; }
-    var result = { vendor:(parsed.vendor||'').toString().substring(0,150), amount:parseAmount(parsed.amount), purpose:(parsed.purpose||'').toString().substring(0,200), imageType:parsed.imageType||'other', confidence:parsed.confidence||'low' };
+    var result = { vendor:(parsed.vendor||'').toString().substring(0,150), amount:parseAmount(parsed.amount), purpose:(parsed.purpose||'').toString().substring(0,200), imageType:parsed.imageType||'other', confidence:parsed.confidence||'low', amountCount:parseInt(parsed.amountCount)||1 };
     if (msgId) visionCache.set(msgId, result);
     console.log('[Vision] Parsed', msgId, '->', JSON.stringify(result));
     return result;
@@ -504,6 +543,66 @@ async function sendPendingReminders() {
     return toRemind.length;
   } catch(e){console.error('[Reminders] Error:',e.message);return 0;}
 }
+
+// ── v2.7.2 NEW: twice-daily consolidated approval reminder digest ────────────
+// Posts ONE message to the approval group listing all pending approvals that are
+// 0–14 days old with a real amount. Tags M and S once at the bottom.
+// Bypasses silent mode (these are the scheduled digests the user explicitly wants).
+var REMINDER_MAX_AGE_DAYS = parseInt(process.env.REMINDER_MAX_AGE_DAYS) || 14;
+async function buildApprovalReminderDigest() {
+  var audit = await buildApprovalAudit(REMINDER_MAX_AGE_DAYS + 1);
+  var nowMs = Date.now();
+  var cutoffMs = REMINDER_MAX_AGE_DAYS * 86400000;
+  // Pending = partial or no-approval, with a real amount, within the age window
+  var pending = audit.partialApproval.concat(audit.noApproval).filter(function(e){
+    var hasAmt = e.amount > 0 || (e.subItems && e.subItems.length > 0);
+    var ageOk = (nowMs - e.date.getTime()) <= cutoffMs;
+    return hasAmt && ageOk;
+  });
+  if(pending.length === 0) return null;
+  // Newest first
+  pending.sort(function(a,b){ return b.date.getTime() - a.date.getTime(); });
+  var lines = ['*PENDING APPROVALS — needs M / S*', ''];
+  var total = 0;
+  var needM = false, needS = false;
+  pending.forEach(function(e, i){
+    var ageHrs = Math.floor((nowMs - e.date.getTime())/(60*60*1000));
+    var ageStr = ageHrs >= 24 ? Math.floor(ageHrs/24)+'d' : ageHrs+'h';
+    var who;
+    if(e.status.mm==='yes' && e.status.sm!=='yes'){ who='S ✓ done, M pending'; needM=true; }
+    else if(e.status.sm==='yes' && e.status.mm!=='yes'){ who='M ✓ done, S pending'; needS=true; }
+    else if(e.status.mm==='question'||e.status.sm==='question'){ who='query open'; needM=true; needS=true; }
+    else { who='both pending'; needM=true; needS=true; }
+    var label = e.vendor || (e.body||'').substring(0,40);
+    lines.push((i+1)+'. '+label+' — Rs.'+formatINR(e.amount));
+    lines.push('   posted '+ageStr+' ago · '+who);
+    total += e.amount;
+  });
+  lines.push('');
+  lines.push(pending.length+' pending · Rs.'+formatINR(total)+' total');
+  lines.push('');
+  // Tag whoever is needed
+  var tags = [];
+  if(needM) tags.push('@'+CONFIG.MM_PHONE);
+  if(needS) tags.push('@'+CONFIG.SM_PHONE);
+  var mentionJids = [];
+  if(needM) mentionJids.push(CONFIG.MM_PHONE+'@c.us');
+  if(needS) mentionJids.push(CONFIG.SM_PHONE+'@c.us');
+  lines.push(tags.join(' ')+' please review and reply Yes / No / Hold.');
+  return { text: lines.join('\n'), mentionJids: mentionJids, count: pending.length };
+}
+async function sendApprovalReminderDigest() {
+  if(!waReady){ console.log('[Digest] WA not connected'); return 0; }
+  if(!CONFIG.BOT_ENABLED){ console.log('[Digest] bot disabled'); return 0; }
+  try {
+    var digest = await buildApprovalReminderDigest();
+    if(!digest){ console.log('[Digest] nothing pending in window'); return 0; }
+    // Bypasses silent mode by design — always posts to approval group.
+    await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, digest.text, { mentions: digest.mentionJids });
+    console.log('[Digest] posted', digest.count, 'pending to approval group');
+    return digest.count;
+  } catch(e){ console.error('[Digest] error:', e.message); return 0; }
+}
 // ── DM Relay state ───────────────────────────────────────────────────────────
 var DM_STATE_FILE = './wa_auth/dm_state.json';
 function loadDMState() {
@@ -680,6 +779,51 @@ function countAmountPatterns(body) {
     if(!alreadyCounted) found.push(m);
   });
   return found.length;
+}
+
+// ── v2.7.2 NEW: AI arbiter for multi-amount messages ─────────────────────────
+// Distinguishes a single approval request that happens to mention several numbers
+// (cost breakdown / payment plan — e.g. Umesh's granite message) from a genuine
+// multi-payment request (e.g. "one cheque for Ajit Singh Rs.X and one for Suresh Rs.Y").
+// Returns one of:
+//   { kind:'single', approvalAmount:<n>, details:'<clean context summary>' }
+//   { kind:'multiple', count:<n> }
+//   { kind:'unclear' }                      (fall back to the blunt block)
+// Best-effort: any error → 'unclear'.
+async function aiParseExpenseIntent(body) {
+  if(!CONFIG.CLAUDE_API_KEY || !body) return { kind: 'unclear' };
+  var prompt = 'An accountant sent this expense message in a real-estate firm. It may contain several numbers (totals, amounts already paid, balances, instalment splits) but usually only ONE amount is actually being requested for approval right now.\n\n' +
+    'MESSAGE:\n"""\n' + body.substring(0, 1500) + '\n"""\n\n' +
+    'Decide:\n' +
+    '- If this is ONE approval request (even if it lists cost breakdown / payment plan / past payments as context), return the single amount being requested for approval NOW, plus a clean one-line context summary preserving the useful details (vendor, total, paid, balance, instalment plan).\n' +
+    '- If this is genuinely MULTIPLE separate payment requests (e.g. distinct cheques to different parties each needing approval), return kind "multiple" with the count.\n\n' +
+    'The amount being requested is usually the one attached to words like "approve", "pay", "release", "kindly approve". Totals, amounts already paid, and balances are context, NOT the ask.\n\n' +
+    'Reply ONLY with strict JSON on one line:\n' +
+    '{"kind":"single","approvalAmount":<number>,"details":"<clean summary>"}  OR  {"kind":"multiple","count":<number>}';
+  try {
+    var resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 400, messages: [{ role: 'user', content: prompt }] })
+    });
+    if(!resp.ok){ console.error('[AI parse] HTTP', resp.status); return { kind: 'unclear' }; }
+    var data = await resp.json();
+    var text = '';
+    if(data.content){ for(var i=0;i<data.content.length;i++){ if(data.content[i].type==='text'){ text=data.content[i].text; break; } } }
+    if(!text) return { kind: 'unclear' };
+    text = text.replace(/```json|```/g,'').trim();
+    var parsed;
+    try { parsed = JSON.parse(text); } catch(e){ var m=text.match(/\{[\s\S]*\}/); if(m){ try{ parsed=JSON.parse(m[0]); }catch(e2){ return { kind:'unclear' }; } } else return { kind:'unclear' }; }
+    if(parsed.kind === 'single'){
+      var amt = parseAmount(parsed.approvalAmount);
+      if(amt > 0) return { kind:'single', approvalAmount: amt, details: (parsed.details||'').toString().substring(0,250) };
+      return { kind:'unclear' };
+    }
+    if(parsed.kind === 'multiple'){
+      return { kind:'multiple', count: parseInt(parsed.count) || 2 };
+    }
+    return { kind:'unclear' };
+  } catch(e){ console.error('[AI parse] exception:', e.message); return { kind:'unclear' }; }
 }
 
 // ── Handle accountant DM ─────────────────────────────────────────────────────
@@ -975,7 +1119,10 @@ async function handleAccountantDM(msg) {
       '  edit <field>: x   change a field (details/amount/company/from)',
       '  edit from: 7      pick bank A/C #7 from the last list shown',
       '  cancel            clear and start over',
-      '  yes               post the draft to the group'
+      '  yes               post the draft to the group',
+      '  show              see your current draft',
+      '  urgent            list your pending requests',
+      '  urgent <n>        push request #n to the group urgently (tags M/S)'
     ];
     if(phoneOfSender === SILENT_OBSERVER){
       helpLines.push('');
@@ -1013,27 +1160,163 @@ async function handleAccountantDM(msg) {
     return true;
   }
 
-  // ── v2.7 NEW: Multi-amount guard — enforce one expense per request ───────
-  // Only check on fresh new requests (no existing draft + not currently answering a follow-up question
-  // + not a vision-confirmation reply). If body has 2+ distinct amount patterns → reject.
+  // ── v2.7.2 NEW: URGENT trigger — re-notify a pending request before scheduled digests ──
+  // `urgent`        → list this accountant's pending requests (0–14 days), numbered
+  // `urgent <n>`    → immediately post that item to the approval group as URGENT,
+  //                   tagging whoever hasn't approved. 2-hour cooldown per expense.
+  var urgentMatch = body.match(/^\s*urgent\s*(\d+)?\s*$/i);
+  if(urgentMatch){
+    var myName = (senderInfo.contactName || '').toLowerCase();
+    var uAudit = await buildApprovalAudit(REMINDER_MAX_AGE_DAYS + 1);
+    var nowU = Date.now();
+    var cutoffU = REMINDER_MAX_AGE_DAYS * 86400000;
+    // This accountant's own pending requests, within window, real amount
+    var myPending = uAudit.partialApproval.concat(uAudit.noApproval).filter(function(e){
+      var mine = (e.sender||'').toLowerCase() === myName;
+      var hasAmt = e.amount > 0 || (e.subItems && e.subItems.length > 0);
+      var ageOk = (nowU - e.date.getTime()) <= cutoffU;
+      return mine && hasAmt && ageOk;
+    });
+    myPending.sort(function(a,b){ return b.date.getTime() - a.date.getTime(); });
+    if(myPending.length === 0){
+      await waClient.sendMessage(rawFrom, 'You have no pending requests in the last '+REMINDER_MAX_AGE_DAYS+' days. (If a request is older, please post it again as a fresh request.)');
+      return true;
+    }
+    var pickNum = urgentMatch[1] ? parseInt(urgentMatch[1]) : null;
+    if(!pickNum){
+      // List them
+      var ulines = ['Your pending requests — reply "urgent <number>" to push one now:', ''];
+      myPending.forEach(function(e, i){
+        var ageHrs = Math.floor((nowU - e.date.getTime())/(60*60*1000));
+        var ageStr = ageHrs >= 24 ? Math.floor(ageHrs/24)+'d' : ageHrs+'h';
+        var who = e.status.mm==='yes' ? 'S pending' : e.status.sm==='yes' ? 'M pending' : 'both pending';
+        ulines.push((i+1)+'. '+(e.vendor||(e.body||'').substring(0,40))+' — Rs.'+formatINR(e.amount)+' ('+who+', '+ageStr+')');
+      });
+      await waClient.sendMessage(rawFrom, ulines.join('\n'));
+      return true;
+    }
+    // urgent <n> → push that item
+    if(pickNum < 1 || pickNum > myPending.length){
+      await waClient.sendMessage(rawFrom, 'No item #'+pickNum+'. Reply "urgent" to see your list.');
+      return true;
+    }
+    var target = myPending[pickNum - 1];
+    // 2-hour cooldown per expense
+    var urgState = loadDMState();
+    if(!urgState.urgentCooldown) urgState.urgentCooldown = {};
+    var lastUrgent = urgState.urgentCooldown[target.id];
+    if(lastUrgent && (nowU - new Date(lastUrgent).getTime()) < 2*60*60*1000){
+      var mins = Math.ceil((2*60*60*1000 - (nowU - new Date(lastUrgent).getTime()))/60000);
+      await waClient.sendMessage(rawFrom, 'I already pushed this one recently. Please wait '+mins+' more minutes before pushing it again.');
+      return true;
+    }
+    // Build the urgent post
+    var needMu = target.status.mm !== 'yes';
+    var needSu = target.status.sm !== 'yes';
+    var uTags = [], uMentions = [];
+    if(needMu){ uTags.push('@'+CONFIG.MM_PHONE); uMentions.push(CONFIG.MM_PHONE+'@c.us'); }
+    if(needSu){ uTags.push('@'+CONFIG.SM_PHONE); uMentions.push(CONFIG.SM_PHONE+'@c.us'); }
+    var ageHrsU = Math.floor((nowU - target.date.getTime())/(60*60*1000));
+    var ageStrU = ageHrsU >= 24 ? Math.floor(ageHrsU/24)+'d' : ageHrsU+'h';
+    var upost = ['*⚡ URGENT — approval needed*', ''];
+    upost.push((target.vendor || (target.body||'').substring(0,60)));
+    upost.push('Amount: Rs.'+formatINR(target.amount));
+    upost.push('Pending '+ageStrU+' · requested by '+target.sender);
+    upost.push('');
+    upost.push(uTags.join(' ')+' please review urgently.');
+    try {
+      await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, upost.join('\n'), { mentions: uMentions });
+      urgState.urgentCooldown[target.id] = new Date().toISOString();
+      saveDMState(urgState);
+      await waClient.sendMessage(rawFrom, 'Pushed as urgent to the approval group, tagging '+(needMu&&needSu?'M and S':needMu?'M':'S')+'.');
+    } catch(e){
+      await waClient.sendMessage(rawFrom, 'Could not post: '+e.message);
+    }
+    return true;
+  }
+
+  // 2+ amount patterns no longer auto-reject. AI decides: single ask with context
+  // (Umesh's payment-plan style) vs genuine multiple requests (Ajit Singh style).
   var existingDraft = state.pending[rawFrom];
   var isAnsweringQuestion = existingDraft && existingDraft.askedFor;
   var isVisionConfirm = existingDraft && existingDraft.awaitingVisionConfirm;
   var isYesPost = /^\s*(yes|post|send|y)\s*$/i.test(body);
   var isEditCmd = /^\s*edit\s+/i.test(body);
-  if(!isAnsweringQuestion && !isVisionConfirm && !isYesPost && !isEditCmd && body){
+  var isAiAmountConfirm = existingDraft && existingDraft.awaitingAiAmountConfirm;
+  if(!isAnsweringQuestion && !isVisionConfirm && !isYesPost && !isEditCmd && !isAiAmountConfirm && body){
     var amtCount = countAmountPatterns(body);
     if(amtCount >= 2){
-      await waClient.sendMessage(rawFrom, [
-        'I see ' + amtCount + ' amounts in this message.',
-        '',
-        'Please send one expense request at a time. This keeps the approval trail clean — M and S can review each one separately, and matching to Ledger payments stays unambiguous.',
-        '',
-        'Send the first expense by itself, then send the next one after the first is posted.',
-        '',
-        'Reply cancel if you want to clear and start fresh.'
-      ].join('\n'));
-      return true;
+      var intent = await aiParseExpenseIntent(body);
+      if(intent.kind === 'multiple'){
+        await waClient.sendMessage(rawFrom, [
+          'This looks like ' + intent.count + ' separate payment requests.',
+          '',
+          'Please send one expense request at a time. M and S review each separately, and Ledger matching stays clean.',
+          '',
+          'Send the first one by itself, then the next after it is posted.',
+          '',
+          'Reply cancel to clear.'
+        ].join('\n'));
+        return true;
+      } else if(intent.kind === 'single'){
+        // One ask + context. Pre-fill the draft and confirm the amount before posting.
+        if(!state.pending[rawFrom]) state.pending[rawFrom] = { details: '', amount: 0, company: '', fromAC: '', mediaIds: [], lastUpdate: new Date().toISOString(), askedFor: null, posterName: senderInfo.contactName || rawFrom, subItems: null, companyOptions: [], fromACOptions: [] };
+        var d0 = state.pending[rawFrom];
+        d0.lastUpdate = new Date().toISOString();
+        d0.posterName = senderInfo.contactName || d0.posterName;
+        if(intent.details && !d0.details) d0.details = intent.details;
+        d0.amount = intent.approvalAmount;
+        d0.awaitingAiAmountConfirm = true;
+        // Pull company/account out of the text if mentioned
+        try {
+          var sm0 = await smartExtractCompanyAccount(body);
+          if(sm0.companyMatches.length === 1 && !d0.company) d0.company = sm0.companyMatches[0];
+          if(sm0.acMatches.length === 1 && !d0.fromAC) d0.fromAC = sm0.acMatches[0];
+        } catch(e){}
+        saveDMState(state);
+        var aiLines = ['I read this as ONE request for approval:'];
+        aiLines.push('  Amount: Rs.' + formatINR(intent.approvalAmount));
+        if(intent.details) aiLines.push('  Details: ' + intent.details);
+        aiLines.push('');
+        aiLines.push('The full breakdown will be included for M/S.');
+        aiLines.push('');
+        aiLines.push('Confirm: reply "yes" if Rs.' + formatINR(intent.approvalAmount) + ' is the amount to approve, or send the correct amount.');
+        await waClient.sendMessage(rawFrom, aiLines.join('\n'));
+        return true;
+      } else {
+        // unclear → safe fallback: block, ask to simplify
+        await waClient.sendMessage(rawFrom, [
+          'I see ' + amtCount + ' amounts here and I am not sure which one needs approval.',
+          '',
+          'Please send just the amount to approve, like: "approve 46,200 for granite balance freight".',
+          '',
+          'Reply cancel to clear.'
+        ].join('\n'));
+        return true;
+      }
+    }
+  }
+
+  // ── v2.7.2: handle reply to AI amount confirmation ──────────────────────
+  if(existingDraft && existingDraft.awaitingAiAmountConfirm){
+    var d1 = existingDraft;
+    if(/^\s*(yes|y|ok|correct|sahi)\s*$/i.test(body)){
+      d1.awaitingAiAmountConfirm = false;
+      saveDMState(state);
+      // fall through to normal validate-required-fields flow below
+    } else {
+      // Try to parse a corrected amount from their reply
+      var corr = parseExpenseMessage(body);
+      if(corr[0].amount > 0){
+        d1.amount = corr[0].amount;
+        d1.awaitingAiAmountConfirm = false;
+        saveDMState(state);
+        await waClient.sendMessage(rawFrom, 'Updated to Rs.' + formatINR(d1.amount) + '.');
+        // fall through
+      } else {
+        await waClient.sendMessage(rawFrom, 'Reply "yes" to confirm Rs.' + formatINR(d1.amount) + ', or send the correct amount (e.g. "46,200" or "46200").');
+        return true;
+      }
     }
   }
 
@@ -1062,7 +1345,7 @@ async function handleAccountantDM(msg) {
     return result;
   }
   var structured = parseStructuredFields(body);
-  if(structured.details && !entry.details) entry.details = structured.details;
+  if(structured.details && !entry.details) entry.details = cleanDetails(structured.details) || structured.details;
   if(structured.amount && entry.amount === 0) entry.amount = structured.amount;
   if(structured.company && !entry.company) entry.company = structured.company;
   if(structured.fromAC && !entry.fromAC) entry.fromAC = structured.fromAC;
@@ -1138,7 +1421,8 @@ async function handleAccountantDM(msg) {
       var p = parsed[0];
       if(p.amount > 0 && entry.amount === 0) entry.amount = p.amount;
       if(!entry.details && body.length > 0){
-        entry.details = body.substring(0, 250);
+        var cleaned = cleanDetails(body);
+        entry.details = cleaned.length > 1 ? cleaned : body.substring(0, 250);
       }
     }
     // v2.7 NEW: smart free-form extraction of company + account from anywhere in the text.
@@ -1166,6 +1450,19 @@ async function handleAccountantDM(msg) {
       if(media && media.data){
         var visionResult = await extractFromImage(media, thisMsgId);
         if(visionResult){
+          // v2.7.2 NEW: multi-amount image guard — mirror the text rule.
+          // If the image shows 2+ distinct payable amounts, refuse and ask for one at a time.
+          // Cheques are exempt (they carry no expense amount).
+          if(visionResult.imageType !== 'cheque' && visionResult.amountCount >= 2){
+            await waClient.sendMessage(rawFrom, [
+              'This image looks like it has ' + visionResult.amountCount + ' separate payments in it.',
+              '',
+              'Please send one expense per image — one bill/invoice at a time. Send the first one on its own, then the next after it is posted.',
+              '',
+              'Reply cancel to clear.'
+            ].join('\n'));
+            return true;
+          }
           entry.mediaIds.push(thisMsgId);
           if(!entry.mediaFiles) entry.mediaFiles = [];
           entry.mediaFiles.push({ msgId: thisMsgId, filename: body || ('attachment_'+entry.mediaFiles.length+'.'+(media.mimetype||'').split('/')[1]), mimetype: media.mimetype, dataB64: media.data });
@@ -2500,7 +2797,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.7',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.7.2',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -2521,6 +2818,8 @@ app.get('/api/approval-audit',async function(req,res){
   }catch(e){res.json({error:e.message});}
 });
 app.get('/api/send-reminders',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await sendPendingReminders();res.json({success:true,remindersSent:count});}catch(e){res.json({error:e.message});}});
+app.get('/api/reminder-digest-send',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await sendApprovalReminderDigest();res.json({success:true,pendingPosted:count});}catch(e){res.json({error:e.message});}});
+app.get('/api/reminder-digest-preview',async function(req,res){try{var d=await buildApprovalReminderDigest();res.json(d||{empty:true,message:'No pending approvals in the '+REMINDER_MAX_AGE_DAYS+'-day window'});}catch(e){res.json({error:e.message});}});
 app.get('/api/send-reminder-test',async function(req,res){
   try{
     if(!waReady)return res.json({error:'WhatsApp not connected'});
@@ -2542,7 +2841,7 @@ app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(awai
 app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.7',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.7.2',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});var msgId=req.query.msgId;if(!msgId)return res.json({error:'pass ?msgId=...'});var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);var msgs=await chat.fetchMessages({limit:200});var target=null;for(var i=0;i<msgs.length;i++){var sid=msgs[i].id._serialized||msgs[i].id.id;if(sid===msgId){target=msgs[i];break;}}if(!target)return res.json({error:'message not found in last 200'});if(!target.hasMedia)return res.json({error:'no media'});var media=await target.downloadMedia();if(!media)return res.json({error:'failed to download'});visionCache.delete(msgId);var result=await extractFromImage(media,msgId);res.json({msgId:msgId,mimetype:media.mimetype,dataSize:media.data?media.data.length:0,parsed:result});}catch(e){res.json({error:e.message});}});
 app.get('/api/whoami',async function(req,res){
   try {
@@ -2685,7 +2984,17 @@ cron.schedule('30 3 * * *',function(){
   generateDailyReport(d).then(function(data){
     if(data.entryCount>0){htmlToImage(buildReportHTML(data),800,1200).then(function(img){var buf=Buffer.isBuffer(img)?img:Buffer.from(img);waClient.sendMessage(targetJid,new MessageMedia('image/png',buf.toString('base64'),'MIS.png'),{caption:prefix+'Morning Summary - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)});});}
   }).catch(function(e){console.error('Cron morning:',e.message);});
-  setTimeout(function(){sendPendingReminders().catch(function(e){console.error('[Reminders cron]',e.message);});},30000);
+  // v2.7.2: pending-approval reminders moved to dedicated 10 AM + 7 PM digests (below).
+},{timezone:'Asia/Kolkata'});
+// v2.7.2: Approval reminder digests — 10:00 AM and 7:00 PM IST.
+// Consolidated single message to the approval group, 14-day window, bypasses silent mode.
+cron.schedule('0 10 * * *',function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  sendApprovalReminderDigest().catch(function(e){console.error('[Digest 10AM]',e.message);});
+},{timezone:'Asia/Kolkata'});
+cron.schedule('0 19 * * *',function(){
+  if(!CONFIG.BOT_ENABLED||!waReady)return;
+  sendApprovalReminderDigest().catch(function(e){console.error('[Digest 7PM]',e.message);});
 },{timezone:'Asia/Kolkata'});
 // Every 10 minutes — scan for pending expenses >= 30 min old
 cron.schedule('*/10 * * * *',function(){
@@ -2701,7 +3010,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.7 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.7.2 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
