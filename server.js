@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.8.4 — parse accountant-bot EXPENSE REQUEST format; skip bot's own digest/urgent/reminder posts in audit
+// FIDATO MIS SERVER v2.8.6 — recover swipe-ok replies that quoted a digest/reminder; /api/debug-replies diagnostic
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
 //       vision read confirmation before posting (kills filename-misread bugs),
@@ -376,8 +376,32 @@ async function buildApprovalAudit(days) {
     var hasMedia=msg.hasMedia||false;
     var senderInfo = await identifySender(rawSender);
     var thisMsgId = msg.id._serialized||msg.id.id;
-    var quotedMsgId=null;
-    if(msg.hasQuotedMsg){try{var q=await msg.getQuotedMessage();quotedMsgId=q.id._serialized||q.id.id;}catch(e){}}
+    var quotedMsgId=null, quotedBody=null;
+    if(msg.hasQuotedMsg){try{var q=await msg.getQuotedMessage();quotedMsgId=q.id._serialized||q.id.id;quotedBody=q.body||'';}catch(e){}}
+    // v2.8.5: if the reply quotes one of the bot's own digest/reminder messages, the
+    // promoter is approving the expense(s) that message was ABOUT — redirect the
+    // quotedMsgId to the real expense id so a swipe-"ok" on the reminder registers.
+    if(quotedMsgId && quotedBody && /PENDING APPROVALS|🔔|\[BOT REMINDER\]/i.test(quotedBody)){
+      var dmap = loadDigestMap();
+      var resolved = null;
+      if(dmap && dmap.items && dmap.items.length){
+        // Prefer an exact msgId match (the reply quoted the exact digest we saved).
+        var sameDigest = dmap.msgId && quotedMsgId===dmap.msgId;
+        if(dmap.items.length===1 && (sameDigest || true)){
+          resolved = dmap.items[0].id;
+        } else {
+          // Multi-item digest: match the quoted reminder's text to one item's label.
+          // Only resolve when EXACTLY ONE item's label words appear in the quoted body,
+          // so we never guess between two similar items.
+          var hits = dmap.items.filter(function(it){
+            var w = (it.label||'').toLowerCase().split(/[^a-z0-9]+/).filter(function(x){return x.length>=4;});
+            return w.length && w.some(function(word){ return quotedBody.toLowerCase().indexOf(word)>=0; });
+          });
+          if(hits.length===1) resolved = hits[0].id;
+        }
+      }
+      quotedMsgId = resolved; // null if we can't safely resolve → reply is ignored, not misapplied
+    }
     if(quotedMsgId){
       var resp=parseResponse(body);
       if(questionMessages[quotedMsgId]){
@@ -767,8 +791,9 @@ async function sendApprovalReminderDigest() {
   try {
     var digest = await buildApprovalReminderDigest();
     if(!digest){ console.log('[Digest] nothing pending in window'); return 0; }
-    await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, digest.text, { mentions: digest.mentionJids });
-    saveDigestMap({ at: new Date().toISOString(), items: digest.items });
+    var sentMsg = await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, digest.text, { mentions: digest.mentionJids });
+    var digestMsgId = sentMsg && sentMsg.id ? (sentMsg.id._serialized || sentMsg.id.id) : null;
+    saveDigestMap({ at: new Date().toISOString(), msgId: digestMsgId, items: digest.items });
     console.log('[Digest] posted', digest.count, 'pending; map saved with', digest.items.length, 'items');
     return digest.count;
   } catch(e){ console.error('[Digest] error:', e.message); return 0; }
@@ -843,6 +868,29 @@ async function handlePromoterVerdicts(msg){
     var map = loadDigestMap();
     if(!map || !map.items || !map.items.length) return false;
     var verdicts = parseVerdictMessage(body, map.items.length);
+    // v2.8.5: M/S swipe-reply the DIGEST itself with a bare "ok/yes/no/hold" (no number).
+    // If they quoted the bot's digest message, map it: one pending item → that item;
+    // "all ok" → every item; ambiguous (many items, no number) → ask for a number.
+    if(!verdicts){
+      var quotedId=null;
+      if(msg.hasQuotedMsg){ try{ var q=await msg.getQuotedMessage(); quotedId=q.id._serialized||q.id.id; }catch(e){} }
+      var repliedToDigest = quotedId && map.msgId && quotedId===map.msgId;
+      var bare = body.toLowerCase().trim();
+      var bareVerdict = /^(yes|ok|okay|approved?|approve|done|haan|theek)$/.test(bare) ? 'yes'
+                      : /^(no|reject(ed)?|nahi)$/.test(bare) ? 'no'
+                      : /^hold$/.test(bare) ? 'hold' : null;
+      var allVerdict = /^all\s+(yes|ok|okay|approved?|approve)$/.test(bare) ? 'yes'
+                      : /^all\s+(no|reject(ed)?)$/.test(bare) ? 'no' : null;
+      if(repliedToDigest && allVerdict){
+        verdicts = map.items.map(function(it){ return {n:it.n, verdict:allVerdict, amount:0}; });
+      } else if(repliedToDigest && bareVerdict){
+        if(map.items.length===1){ verdicts=[{n:1, verdict:bareVerdict, amount:0}]; }
+        else {
+          await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, 'There are '+map.items.length+' pending items — please reply with the number, e.g. "1 '+bareVerdict+'". Or "all '+bareVerdict+'" for every item.');
+          return true;
+        }
+      }
+    }
     if(!verdicts && /\d/.test(body) && /(yes|ok|no|hold|why|reason|approve|reject)/i.test(body)){
       verdicts = await aiParseVerdicts(body, map.items);
     }
@@ -3125,7 +3173,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.4',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.6',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -3166,11 +3214,28 @@ app.get('/api/send-reminder-test',async function(req,res){
   }catch(e){res.json({error:e.message});}
 });
 app.get('/api/debug-messages',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);var msgs=await chat.fetchMessages({limit:50});var result=[];for(var i=0;i<msgs.length;i++){var m=msgs[i];var info=await identifySender(m.author||m.from||'');result.push({rawSender:m.author||m.from||'',contactName:info.contactName,role:info.role,isReply:m.hasQuotedMsg,hasMedia:m.hasMedia,body:(m.body||'').substring(0,100),time:new Date(m.timestamp*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})});}res.json({totalMessages:result.length,mmNames:CONFIG.MM_NAMES,smNames:CONFIG.SM_NAMES,messages:result});}catch(e){res.json({error:e.message});}});
+// v2.8.5 diagnostic: show M/S replies WITH the body of the message each one quoted,
+// so a past swipe-"ok" can be matched to the expense it was actually replying to.
+app.get('/api/debug-replies',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});
+  var limit=parseInt(req.query.limit)||80;
+  var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
+  var msgs=await chat.fetchMessages({limit:limit});
+  var out=[];
+  for(var i=0;i<msgs.length;i++){
+    var m=msgs[i];
+    var info=await identifySender(m.author||m.from||'');
+    if(info.role!=='mm'&&info.role!=='sm') continue;
+    var rec={role:info.role,who:info.contactName,body:(m.body||'').trim(),msgId:(m.id&&(m.id._serialized||m.id.id))||null,isReply:!!m.hasQuotedMsg,time:new Date(m.timestamp*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}),quoted:null};
+    if(m.hasQuotedMsg){try{var q=await m.getQuotedMessage();rec.quoted={msgId:(q.id&&(q.id._serialized||q.id.id))||null,body:(q.body||'').substring(0,160),fromBot:/PENDING APPROVALS|\[BOT REMINDER\]|EXPENSE REQUEST|🔔/i.test(q.body||'')};}catch(e){rec.quoted={error:e.message};}}
+    out.push(rec);
+  }
+  res.json({count:out.length,replies:out});
+}catch(e){res.json({error:e.message});}});
 app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])));}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.4',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.6',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});var msgId=req.query.msgId;if(!msgId)return res.json({error:'pass ?msgId=...'});var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);var msgs=await chat.fetchMessages({limit:200});var target=null;for(var i=0;i<msgs.length;i++){var sid=msgs[i].id._serialized||msgs[i].id.id;if(sid===msgId){target=msgs[i];break;}}if(!target)return res.json({error:'message not found in last 200'});if(!target.hasMedia)return res.json({error:'no media'});var media=await target.downloadMedia();if(!media)return res.json({error:'failed to download'});visionCache.delete(msgId);var result=await extractFromImage(media,msgId);res.json({msgId:msgId,mimetype:media.mimetype,dataSize:media.data?media.data.length:0,parsed:result});}catch(e){res.json({error:e.message});}});
 app.get('/api/whoami',async function(req,res){
   try {
@@ -3342,7 +3407,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.8.4 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.8.6 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
