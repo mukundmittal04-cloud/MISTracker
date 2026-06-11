@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.8.9 — bare ok/yes/no/hold on digest approves ALL items; numbers for specifics
+// FIDATO MIS SERVER v2.8.11 — unified bot-post reply handling: ok/yes/no/hold on digest, [BOT REMINDER], or URGENT resolves per-item; single posts never blanket-approve
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
 //       vision read confirmation before posting (kills filename-misread bugs),
@@ -382,7 +382,7 @@ async function buildApprovalAudit(days) {
     // v2.8.5: if the reply quotes one of the bot's own digest/reminder messages, the
     // promoter is approving the expense(s) that message was ABOUT — redirect the
     // quotedMsgId to the real expense id so a swipe-"ok" on the reminder registers.
-    if(quotedMsgId && quotedBody && /PENDING APPROVALS|🔔|\[BOT REMINDER\]/i.test(quotedBody)){
+    if(quotedMsgId && quotedBody && /PENDING APPROVALS|🔔|\[BOT REMINDER\]|⚡\s*URGENT|URGENT\s*—\s*approval needed/i.test(quotedBody)){
       // Defer resolution: stash the approval with the quoted digest text, and after all
       // expenses are built, match it to a live expense by content (id-drift safe).
       digestQuotedApprovals.push({ role: senderInfo.role, resp: parseResponse(body), raw: body, date: msgDate, name: senderInfo.contactName, quotedBody: quotedBody });
@@ -457,34 +457,59 @@ async function buildApprovalAudit(days) {
       }
     }
   }
-  // v2.8.6: resolve digest/reminder-quoted approvals against the actual expenses now
-  // that they're all built. Match the quoted digest text to expense vendor/body; only
-  // apply when EXACTLY ONE expense matches (never guess between similar items).
-  var DQ_STOP = ['the','and','for','with','from','this','that','please','approve','kindly','payment','amount','pending','approvals','request','requests','needs','reply','number','yes','hold','later','reject','rs','inr','total','both'];
+  // v2.8.11: resolve bot-post-quoted replies against the actual expenses now that
+  // they're all built. Parse the quoted post into its item(s); resolve each item by
+  // label words + amount. Digest quotes apply to every item they listed; single-item
+  // posts (reminder/urgent) must resolve to exactly one expense or are skipped.
+  // Only clear verdicts (yes/no/hold) are applied retroactively from history.
+  var DQ_STOP = ['the','and','for','with','from','this','that','please','approve','kindly','payment','amount','pending','approvals','approval','request','requests','needs','reply','number','yes','hold','later','reject','rs','inr','total','both'];
+  function dqMatchExpenses(label, amount){
+    var w = (label||'').toLowerCase().replace(/…\s*$/,'').split(/[^a-z0-9]+/).filter(function(x){ return x.length>=4 && DQ_STOP.indexOf(x)<0; });
+    if(!w.length) return [];
+    var cands = expenses.filter(function(e){
+      var ev = ((e.vendor||'')+' '+(e.body||'')).toLowerCase();
+      return w.some(function(word){ return ev.indexOf(word)>=0; });
+    });
+    if(cands.length>1 && amount>0){
+      var nar = cands.filter(function(e){ return e.amount===amount; });
+      if(nar.length) cands = nar;
+    }
+    return cands;
+  }
   digestQuotedApprovals.forEach(function(dq){
     if(dq.role!=='mm' && dq.role!=='sm') return;
-    var qWords = (dq.quotedBody||'').toLowerCase().split(/[^a-z0-9]+/).filter(function(w){ return w.length>=4 && DQ_STOP.indexOf(w)<0; });
-    if(!qWords.length) return;
-    var matches = expenses.filter(function(e){
-      var ev = ((e.vendor||'')+' '+(e.body||'')).toLowerCase();
-      return qWords.some(function(w){ return ev.indexOf(w)>=0; });
-    });
-    // v2.8.8: if word-matching is ambiguous, disambiguate by the amount shown in the
-    // quoted digest (e.g. "Rs.1,00,000") — picks the right diesel out of two.
-    if(matches.length>1){
-      var amtMatches = (dq.quotedBody||'').match(/rs\.?\s*([\d,]+)/ig) || [];
-      var qAmts = amtMatches.map(function(s){ return parseAmount(s); }).filter(function(n){ return n>0; });
-      if(qAmts.length){
-        var narrowed = matches.filter(function(e){ return qAmts.indexOf(e.amount)>=0; });
-        if(narrowed.length===1) matches = narrowed;
+    if(dq.resp!=='yes' && dq.resp!=='no' && dq.resp!=='hold') return;
+    var post = parseBotPostItems(dq.quotedBody);
+    var resolvedIds = [];
+    if(post && post.items && post.items.length){
+      post.items.forEach(function(qi){
+        var c = dqMatchExpenses(qi.label, qi.amount);
+        if(c.length===1 && resolvedIds.indexOf(c[0].id)<0) resolvedIds.push(c[0].id);
+      });
+    } else {
+      // Fallback (unparseable bot post): whole-body words, require exactly one match.
+      var qWords = (dq.quotedBody||'').toLowerCase().split(/[^a-z0-9]+/).filter(function(w){ return w.length>=4 && DQ_STOP.indexOf(w)<0; });
+      if(qWords.length){
+        var matches = expenses.filter(function(e){
+          var ev = ((e.vendor||'')+' '+(e.body||'')).toLowerCase();
+          return qWords.some(function(w){ return ev.indexOf(w)>=0; });
+        });
+        if(matches.length>1){
+          var amtM = (dq.quotedBody||'').match(/rs\.?\s*([\d,]+)/ig) || [];
+          var qAmts = amtM.map(function(s){ return parseAmount(s); }).filter(function(n){ return n>0; });
+          if(qAmts.length){
+            var narrowed = matches.filter(function(e){ return qAmts.indexOf(e.amount)>=0; });
+            if(narrowed.length===1) matches = narrowed;
+          }
+        }
+        if(matches.length===1) resolvedIds.push(matches[0].id);
       }
     }
-    if(matches.length===1){
-      var eid = matches[0].id;
+    resolvedIds.forEach(function(eid){
       if(!replyMap[eid]) replyMap[eid]={mm:null,sm:null};
       if(dq.role==='mm' && !replyMap[eid].mm) replyMap[eid].mm={response:dq.resp,date:dq.date,raw:dq.raw,name:dq.name,viaDigest:true};
       if(dq.role==='sm' && !replyMap[eid].sm) replyMap[eid].sm={response:dq.resp,date:dq.date,raw:dq.raw,name:dq.name,viaDigest:true};
-    }
+    });
   });
   for(var j=0;j<expenses.length;j++){
     var rep=replyMap[expenses[j].id];
@@ -657,6 +682,39 @@ function loadVerdicts(){ try{ if(fs.existsSync(VERDICT_FILE)) return JSON.parse(
 function saveVerdicts(v){ try{ fs.writeFileSync(VERDICT_FILE, JSON.stringify(v,null,1)); }catch(e){ console.error('[Verdicts] save:',e.message);} }
 function loadDigestMap(){ try{ if(fs.existsSync(DIGEST_MAP_FILE)) return JSON.parse(fs.readFileSync(DIGEST_MAP_FILE,'utf8')); }catch(e){} return null; }
 function saveDigestMap(m){ try{ fs.writeFileSync(DIGEST_MAP_FILE, JSON.stringify(m,null,1)); }catch(e){ console.error('[DigestMap] save:',e.message);} }
+
+// v2.8.11: parse any of the bot's own posts into the item(s) it was about.
+// Returns {kind:'digest'|'single', items:[{label,amount}]} or null if not a bot post.
+// - digest: '🔔 *PENDING APPROVALS*' with numbered '*N.* label' lines + '*Rs.X*' lines
+// - single: '[BOT REMINDER] - ...' or '*⚡ URGENT — approval needed*' (one expense:
+//   vendor line after header + 'Amount: Rs.X')
+function parseBotPostItems(text){
+  if(!text) return null;
+  if(/PENDING APPROVALS|🔔/i.test(text)){
+    var items=[]; var lines=text.split('\n');
+    for(var i=0;i<lines.length;i++){
+      var m=lines[i].match(/^\s*\*?(\d+)\.\*?\s+(.+)$/);
+      if(m){
+        var amt=0;
+        var am=(lines[i+1]||'').match(/rs\.?\s*([\d,]+)/i);
+        if(am) amt=parseAmount(am[1]);
+        items.push({label:m[2].replace(/…\s*$/,'').trim(), amount:amt});
+      }
+    }
+    return items.length ? {kind:'digest', items:items} : {kind:'digest', items:[]};
+  }
+  if(/^\s*\[BOT REMINDER\]/i.test(text) || /⚡\s*URGENT|URGENT\s*—\s*approval needed/i.test(text)){
+    var ls=text.split('\n').map(function(x){return x.trim();}).filter(Boolean);
+    var label=ls[1]||'';
+    var amt2=0;
+    for(var j=0;j<ls.length;j++){
+      var am2=ls[j].match(/^Amount:\s*rs\.?\s*([\d,]+)/i);
+      if(am2){ amt2=parseAmount(am2[1]); break; }
+    }
+    return {kind:'single', items:[{label:label.replace(/…\s*$/,'').trim(), amount:amt2}]};
+  }
+  return null;
+}
 
 // Overlay numbered-reply verdicts onto audit expenses + compute state/approvedAmount.
 // Rule A: an amend counts as that person's yes at the amended amount; the other
@@ -883,26 +941,54 @@ async function handlePromoterVerdicts(msg){
     var map = loadDigestMap();
     if(!map || !map.items || !map.items.length) return false;
     var verdicts = parseVerdictMessage(body, map.items.length);
-    // v2.8.5: M/S swipe-reply the DIGEST itself with a bare "ok/yes/no/hold" (no number).
-    // If they quoted the bot's digest message, map it: one pending item → that item;
-    // "all ok" → every item; ambiguous (many items, no number) → ask for a number.
+    // v2.8.11: M/S swipe-reply ANY bot post (digest, [BOT REMINDER], ⚡ URGENT) with a
+    // bare "ok/yes/no/hold". Resolve per item the quoted post actually listed:
+    // digest → every listed item; reminder/urgent → exactly that one expense.
+    // A single-item post can NEVER blanket-approve the whole list.
     if(!verdicts){
-      var quotedId=null;
-      if(msg.hasQuotedMsg){ try{ var q=await msg.getQuotedMessage(); quotedId=q.id._serialized||q.id.id; }catch(e){} }
-      var repliedToDigest = quotedId && map.msgId && quotedId===map.msgId;
+      var quotedId=null, quotedBodyV=null;
+      if(msg.hasQuotedMsg){ try{ var q=await msg.getQuotedMessage(); quotedId=q.id._serialized||q.id.id; quotedBodyV=q.body||''; }catch(e){} }
+      var botPost = parseBotPostItems(quotedBodyV);
+      var repliedToBotPost = quotedId && (botPost || (map.msgId && quotedId===map.msgId));
       var bare = body.toLowerCase().trim();
       var bareVerdict = /^(yes|ok|okay|approved?|approve|done|haan|theek)$/.test(bare) ? 'yes'
                       : /^(no|reject(ed)?|nahi)$/.test(bare) ? 'no'
                       : /^hold$/.test(bare) ? 'hold' : null;
       var allVerdict = /^all\s+(yes|ok|okay|approved?|approve)$/.test(bare) ? 'yes'
                       : /^all\s+(no|reject(ed)?)$/.test(bare) ? 'no' : null;
-      if(repliedToDigest && allVerdict){
-        verdicts = map.items.map(function(it){ return {n:it.n, verdict:allVerdict, amount:0}; });
-      } else if(repliedToDigest && bareVerdict){
-        // v2.8.9: a bare ok/yes/no/hold on the digest applies to ALL items —
-        // single item or many. Numbers are only needed to act on specifics
-        // (e.g. approve some, reject others, or amend an amount).
-        verdicts = map.items.map(function(it){ return {n:it.n, verdict:bareVerdict, amount:0}; });
+      if(repliedToBotPost && (allVerdict || bareVerdict)){
+        var vd = allVerdict || bareVerdict;
+        function normLabel(s){ return (s||'').toLowerCase().replace(/…\s*$/,'').trim(); }
+        function resolveQuotedItem(qi){
+          // exact label first (digest labels are generated by the same code as the map)
+          var exact = map.items.filter(function(it){ return normLabel(it.label)===normLabel(qi.label); });
+          var cands = exact.length ? exact : map.items.filter(function(it){
+            var w = normLabel(qi.label).split(/[^a-z0-9]+/).filter(function(x){return x.length>=4;});
+            var il = normLabel(it.label);
+            return w.length && w.some(function(word){ return il.indexOf(word)>=0; });
+          });
+          if(cands.length>1 && qi.amount>0){
+            var nar = cands.filter(function(it){ return it.amount===qi.amount; });
+            if(nar.length) cands = nar;
+          }
+          return cands.length===1 ? cands[0] : null;
+        }
+        var targets = [];
+        if(botPost && botPost.items.length){
+          botPost.items.forEach(function(qi){
+            var hit = resolveQuotedItem(qi);
+            if(hit && targets.indexOf(hit)<0) targets.push(hit);
+          });
+        } else if(map.msgId && quotedId===map.msgId){
+          targets = map.items.slice(); // reply to the exact latest digest, quoted body unavailable
+        }
+        if(targets.length){
+          verdicts = targets.map(function(it){ return {n:it.n, verdict:vd, amount:0}; });
+        } else {
+          // Quoted a bot post but nothing safely resolved — never guess, never blanket-apply.
+          await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, "Couldn't match that "+(botPost&&botPost.kind==='single'?'reminder':'digest')+" to the current pending list. Please reply on the latest digest with the number, e.g. \"1 "+vd+"\".");
+          return true;
+        }
       }
     }
     if(!verdicts && /\d/.test(body) && /(yes|ok|no|hold|why|reason|approve|reject)/i.test(body)){
@@ -3187,7 +3273,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.9',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.11',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -3249,7 +3335,7 @@ app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(awai
 app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.9',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.11',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});var msgId=req.query.msgId;if(!msgId)return res.json({error:'pass ?msgId=...'});var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);var msgs=await chat.fetchMessages({limit:200});var target=null;for(var i=0;i<msgs.length;i++){var sid=msgs[i].id._serialized||msgs[i].id.id;if(sid===msgId){target=msgs[i];break;}}if(!target)return res.json({error:'message not found in last 200'});if(!target.hasMedia)return res.json({error:'no media'});var media=await target.downloadMedia();if(!media)return res.json({error:'failed to download'});visionCache.delete(msgId);var result=await extractFromImage(media,msgId);res.json({msgId:msgId,mimetype:media.mimetype,dataSize:media.data?media.data.length:0,parsed:result});}catch(e){res.json({error:e.message});}});
 app.get('/api/whoami',async function(req,res){
   try {
@@ -3421,7 +3507,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.8.9 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.8.11 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
