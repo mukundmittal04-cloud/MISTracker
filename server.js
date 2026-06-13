@@ -1,5 +1,6 @@
 // ============================================================
-// FIDATO MIS SERVER v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
+// FIDATO MIS SERVER v2.8.17 — (1) echo fires only on FULL M+S approval (no per-reply noise); (2) intake gate: capture only EXPENSE REQUEST / real-amount / vision-parsed media (drops leave notes, orphan lines, bare zero-amount images).
+// v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
 //       vision read confirmation before posting (kills filename-misread bugs),
@@ -484,9 +485,14 @@ async function buildApprovalAudit(days) {
             }
           }catch(e){console.error('[Vision] Failed for',msgId,e.message);}
         }
-        var isJunk = (!body) && !hasMedia && amount === 0;
-        if(!isJunk && body && body.length < 4 && !hasMedia && amount === 0) isJunk = true;
-        if(!isJunk){
+        // v2.8.17: only capture as an expense if it is a structured EXPENSE REQUEST,
+        // OR carries a real amount, OR is media that vision parsed into an amount.
+        // Zero-amount free text (leave notes, "From X account" orphans, bare images
+        // with no parse) is NOT an expense and is skipped at intake.
+        var isExpenseRequest = /^\s*\*?EXPENSE REQUEST\*?/i.test(body);
+        var hasParsedMediaAmount = hasMedia && visionResult && visionResult.amount > 0;
+        var capture = isExpenseRequest || amount > 0 || hasParsedMediaAmount;
+        if(capture){
           expenses.push({id:msgId,date:msgDate,body:body||(hasMedia?'[Image attached]':'[Empty]'),sender:senderInfo.contactName||rawSender,vendor:vendor||(hasMedia?'[See image]':''),amount:amount,purpose:purpose,subItems:subItems,hasMedia:hasMedia,visionParsed:visionResult?true:false,mmApproval:null,smApproval:null,status:{mm:'pending',sm:'pending'},queryAnswer:null});
         }
       }
@@ -1067,26 +1073,34 @@ async function handlePromoterVerdicts(msg){
     if(!verdicts || !verdicts.length) return false;
     var store = loadVerdicts();
     var who = role==='mm' ? 'M' : 'S';
-    var echo = ['Recorded from '+who+':'];
+    // v2.8.17: no per-reply echo. Record verdicts silently; only announce an item
+    // once BOTH M and S have approved it. Partial/hold/reject/query states are
+    // reported by the 10 AM / 7 PM digests, so they need no real-time echo.
+    var nowApproved = [];   // items that reached full M+S approval on THIS reply
     verdicts.forEach(function(v){
       var item = map.items[v.n-1];
       if(!item || item.n!==v.n){ item = null; map.items.forEach(function(it){ if(it.n===v.n) item=it; }); }
-      if(!item){ echo.push(v.n+' — not on the current list, skipped'); return; }
+      if(!item){ return; }
       if(!store[item.id]) store[item.id] = {};
       store[item.id]._label = item.label;   // v2.8.12: enable id-drift-safe reconciliation
       store[item.id]._amount = item.amount;
       store[item.id][role] = { verdict:v.verdict, amount:v.amount||0, raw:body.substring(0,200), at:new Date().toISOString() };
-      var line = v.n+' '+item.label+' Rs.'+formatINR(item.amount)+' — ';
-      if(v.verdict==='yes') line += '✓ approved';
-      else if(v.verdict==='no') line += '✗ rejected';
-      else if(v.verdict==='hold') line += 'on hold';
-      else if(v.verdict==='amend') line += '✓ approved at Rs.'+formatINR(v.amount);
-      else if(v.verdict==='question') line += 'query — '+item.sender+' please answer in the group';
-      echo.push(line);
+      // Is this item now approved by BOTH parties (per the verdict store)?
+      var mmV = store[item.id].mm, smV = store[item.id].sm;
+      var isYes = function(x){ return x && (x.verdict==='yes' || x.verdict==='amend'); };
+      if(isYes(mmV) && isYes(smV)){
+        var amt = item.amount;
+        if(mmV.verdict==='amend' && mmV.amount>0) amt = mmV.amount;
+        if(smV.verdict==='amend' && smV.amount>0 && (!amt || smV.amount<amt)) amt = smV.amount;
+        nowApproved.push({ label:item.label, amount:amt });
+      }
     });
     saveVerdicts(store);
-    await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, echo.join('\n'));
-    console.log('[Verdicts]', who, 'recorded', verdicts.length, 'item(s)');
+    if(nowApproved.length){
+      var conf = nowApproved.map(function(a){ return '✓ Approved (M+S): '+a.label+' Rs.'+formatINR(a.amount); });
+      await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, conf.join('\n'));
+    }
+    console.log('[Verdicts]', who, 'recorded', verdicts.length, 'item(s);', nowApproved.length, 'now fully approved');
     return true;
   }catch(e){ console.error('[Verdicts]', e.message); return false; }
 }
@@ -3345,7 +3359,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.16',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.17',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -3422,7 +3436,7 @@ app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(awai
 app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
-app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.16',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.17',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});var msgId=req.query.msgId;if(!msgId)return res.json({error:'pass ?msgId=...'});var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);var msgs=await chat.fetchMessages({limit:200});var target=null;for(var i=0;i<msgs.length;i++){var sid=msgs[i].id._serialized||msgs[i].id.id;if(sid===msgId){target=msgs[i];break;}}if(!target)return res.json({error:'message not found in last 200'});if(!target.hasMedia)return res.json({error:'no media'});var media=await target.downloadMedia();if(!media)return res.json({error:'failed to download'});visionCache.delete(msgId);var result=await extractFromImage(media,msgId);res.json({msgId:msgId,mimetype:media.mimetype,dataSize:media.data?media.data.length:0,parsed:result});}catch(e){res.json({error:e.message});}});
 app.get('/api/whoami',async function(req,res){
   try {
@@ -3594,7 +3608,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.8.16 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.8.17 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
