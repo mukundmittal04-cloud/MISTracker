@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.8.17 — (1) echo fires only on FULL M+S approval (no per-reply noise); (2) intake gate: capture only EXPENSE REQUEST / real-amount / vision-parsed media (drops leave notes, orphan lines, bare zero-amount images).
+// FIDATO MIS SERVER v2.8.18 — endpoint lock: HTTP Basic Auth on all /api/* (/health open), fail-closed if unset, per-IP rate limiting. Base: v2.8.17 (echo-on-full-approval + intake gate).
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -3359,7 +3359,62 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.17',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.18',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+// ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
+var _crypto = require('crypto');
+var PANEL_USER = process.env.PANEL_USER || '';
+var PANEL_PASSWORD = process.env.PANEL_PASSWORD || '';
+if (!PANEL_USER || !PANEL_PASSWORD) {
+  console.warn('[AUTH] WARNING: PANEL_USER/PANEL_PASSWORD not set — all /api/* endpoints are LOCKED (fail-closed). Set them in Railway env vars.');
+}
+// per-IP failed-attempt tracker (in-memory; resets on restart)
+var _authFails = {};
+var AUTH_MAX_FAILS = 5;
+var AUTH_LOCK_MS = 5 * 60 * 1000; // 5 min lockout after MAX_FAILS
+function _safeEq(a, b) {
+  var ba = Buffer.from(String(a)); var bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) return false;
+  try { return _crypto.timingSafeEqual(ba, bb); } catch (e) { return false; }
+}
+function authGate(req, res, next) {
+  var ip = (req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress || 'unknown').split(',')[0].trim();
+  var now = Date.now();
+  var rec = _authFails[ip];
+  if (rec && rec.lockUntil && now < rec.lockUntil) {
+    var secs = Math.ceil((rec.lockUntil - now) / 1000);
+    res.set('Retry-After', String(secs));
+    return res.status(429).json({ error: 'Too many failed attempts. Locked for ' + secs + 's.' });
+  }
+  // fail closed if not configured
+  if (!PANEL_USER || !PANEL_PASSWORD) {
+    res.set('WWW-Authenticate', 'Basic realm="Fidato MIS", charset="UTF-8"');
+    return res.status(503).json({ error: 'Auth not configured on server.' });
+  }
+  var hdr = req.headers.authorization || '';
+  var m = /^Basic\s+(.+)$/i.exec(hdr);
+  if (m) {
+    var decoded = '';
+    try { decoded = Buffer.from(m[1], 'base64').toString('utf8'); } catch (e) { decoded = ''; }
+    var idx = decoded.indexOf(':');
+    var u = idx >= 0 ? decoded.slice(0, idx) : '';
+    var p = idx >= 0 ? decoded.slice(idx + 1) : '';
+    var okU = _safeEq(u, PANEL_USER);
+    var okP = _safeEq(p, PANEL_PASSWORD);
+    if (okU && okP) {
+      if (_authFails[ip]) delete _authFails[ip]; // clear on success
+      return next();
+    }
+    // failed credentials
+    rec = _authFails[ip] || { count: 0, lockUntil: 0 };
+    rec.count += 1;
+    if (rec.count >= AUTH_MAX_FAILS) { rec.lockUntil = now + AUTH_LOCK_MS; rec.count = 0; }
+    _authFails[ip] = rec;
+  }
+  res.set('WWW-Authenticate', 'Basic realm="Fidato MIS", charset="UTF-8"');
+  return res.status(401).json({ error: 'Authentication required.' });
+}
+// gate everything below this line (all /api/*). /health is registered ABOVE and stays open.
+app.use('/api', authGate);
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -3608,8 +3663,9 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.8.17 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.8.18 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
+  console.log('  Endpoint lock: '+((PANEL_USER&&PANEL_PASSWORD)?'ON (Basic Auth on /api/*)':'FAIL-CLOSED (PANEL_USER/PANEL_PASSWORD unset)'));
 });
