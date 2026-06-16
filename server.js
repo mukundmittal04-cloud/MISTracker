@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.10.0-s5.8 — Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
+// FIDATO MIS SERVER v2.10.0-s5.11 — entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -817,6 +817,11 @@ var LEDGER_TAGS = ['Other','Office','Legal','Salary','Directors-SM','Directors-M
 var LEDGER_MODES = ['Chq','Cash','RTGS','NEFT','PDC','Auto'];
 // Tags shown as quick numbered picks (the common ones); full list available by typing.
 var TAG_QUICK = ['Directors-SM','Directors-MM','Office','Legal','Salary','Other'];
+// v2.10.0-s5.9: paying-account list — exact order/contents of the Ledger Bank A/C dropdown.
+// Used both for the numbered menu (step 6) and to validate a typed account.
+var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','—','MM PDC','SM PDC','PDC'];
+// v2.10.0-s5.11: entity/company list — exact order/contents of the Ledger Entity dropdown (verified).
+var LEDGER_ENTITIES = ['Fidatocity - 70%','Fidatocity - 30%','Fidato City Homes','Fidatocity Homes','Trinity Landspace','Pitam','Hansaflon Buildcon','Hansaflon Buildwell','Dholpur Developers','Trinity Tulsivan','Beatific Hospitality','Chahat Garments','Fidato Buildcon','Fidato Maintenance','Maximal Infrastructure','Others (combined)','MM PDC','SM PDC','PDC','MM','SM'];
 
 // Rule-based Tag pre-guess from a description. Returns {tag, person} or null.
 function guessTagAndPerson(desc){
@@ -909,7 +914,7 @@ async function aiGuessTag(desc, entity){
 function assemblePaymentRow(item, answers){
   return {
     date: toLedgerWriteDate(answers.date),       // dd/mm/yyyy real date (so SUMIFS day-totals match)
-    entity: item.entity || '',                   // from EXPENSE REQUEST Company
+    entity: answers.entity || item.entity || '', // prefer the entity captured at payment time (request Company is often a placeholder)
     head: answers.head || '',                    // AI-guessed, confirmed
     description: item.description || item.label || '', // auto from request
     tag: answers.tag || '',                      // guessed, confirmed
@@ -917,7 +922,7 @@ function assemblePaymentRow(item, answers){
     amount: answers.amount,                      // confirmed paid amount
     mode: answers.mode || '',                    // Chq/Cash/RTGS/NEFT/PDC/Auto
     person: answers.person || '',                // derived from Tag (Directors-SM→SM)
-    bankAc: item.bankAc || '',                   // from EXPENSE REQUEST From
+    bankAc: answers.bankAc || item.bankAc || '', // prefer the account captured at payment time (request 'From' is often just the company)
     transferTo: '',                              // always blank (internal transfers manual)
     notes: '[bot:'+(item.id||'')+']'             // tag bot rows for reconciliation/undo
   };
@@ -1237,9 +1242,23 @@ async function resolveAccountant(msg){
 
 function paidModeMenu(){ var L=[]; for(var i=0;i<LEDGER_MODES.length;i++) L.push((i+1)+'. '+LEDGER_MODES[i]); return L.join('   '); }
 function paidTagMenu(){ var L=[]; for(var i=0;i<TAG_QUICK.length;i++) L.push((i+1)+'. '+TAG_QUICK[i]); return L.join('   '); }
+function paidNumberedMenu(list){ var L=[]; for(var i=0;i<list.length;i++){ var a=list[i]; L.push((i+1)+'. '+(a==='—'?'— (none / blank)':a)); } return L.join('\n'); }
+function paidAccountMenu(){ return paidNumberedMenu(LEDGER_ACCOUNTS); }
+function paidEntityMenu(){ return paidNumberedMenu(LEDGER_ENTITIES); }
+// Resolve a typed value to a canonical list entry. Returns {match} | {ambiguous:[...]} | {none:true}.
+function resolveFromList(input, list){
+  var low=(input||'').trim().toLowerCase();
+  for(var i=0;i<list.length;i++){ if(list[i].toLowerCase()===low) return { match:list[i] }; }
+  var hits=list.filter(function(a){ return a!=='—' && a.toLowerCase().indexOf(low)>=0; });
+  if(hits.length===1) return { match:hits[0] };
+  if(hits.length>1) return { ambiguous:hits };
+  return { none:true };
+}
+function resolveAccount(input){ var r=resolveFromList(input,LEDGER_ACCOUNTS); return r.match?{account:r.match}:r; }
+function resolveEntity(input){ var r=resolveFromList(input,LEDGER_ENTITIES); return r.match?{entity:r.match}:r; }
 function personForTag(tag){ if(tag==='Directors-SM') return 'SM'; if(tag==='Directors-MM') return 'MM'; return ''; }
 // Human-readable label for the step an in-progress session is sitting on (used by the guard).
-var PAID_STEP_LABEL = { amount:'the amount paid', date:'the date', mode:'the payment mode', head:'the Head', tag:'the Tag', confirm:'confirming the row' };
+var PAID_STEP_LABEL = { amount:'the amount paid', date:'the date', mode:'the payment mode', head:'the Head', tag:'the Tag', account:'the paying account', entity:'the entity', confirm:'confirming the row' };
 function paidRowPreview(row){
   var a=rowToArray(row);
   var cols=['Date','Entity','Head','Description','Tag','IN/OUT','Amount','Mode','Person','Bank A/C','Transfer To','Notes'];
@@ -1258,12 +1277,12 @@ async function paidFlowAdvance(session, inputRaw){
     if(low==='ok'){ session.answers.amount=session.amount; }
     else { var amt=extractLineAmount(input,false)||parseAmount(input); if(!amt){ return { reply:'Didn\'t catch an amount. Type the actual amount paid, or "ok" to use the approved Rs.'+formatINR(session.amount)+'.' }; } session.answers.amount=amt; }
     session.step='date';
-    return { reply:'2/5 *Date?* — reply "today" or dd/mm (e.g. 14/06).' };
+    return { reply:'2/7 *Date?* — reply "today" or dd/mm (e.g. 14/06).' };
   }
   if(session.step==='date'){
     session.answers.date = toLedgerDate(/^today$/i.test(low)?'today':input);
     session.step='mode';
-    return { reply:'3/5 *Mode?* — reply the number:\n'+paidModeMenu() };
+    return { reply:'3/7 *Mode?* — reply the number:\n'+paidModeMenu() };
   }
   if(session.step==='mode'){
     var mi=parseInt(low,10);
@@ -1272,7 +1291,7 @@ async function paidFlowAdvance(session, inputRaw){
     var head=await aiGuessHead(session.description, session.entity);
     if(!head) head=guessHeadFallback(session.description);
     session.guessHead=head; session.step='head';
-    return { reply:'4/5 *Head?* — my guess: *'+head+'*. Reply "ok" to accept, or type the correct Head.' };
+    return { reply:'4/7 *Head?* — my guess: *'+head+'*. Reply "ok" to accept, or type the correct Head.' };
   }
   if(session.step==='head'){
     session.answers.head = (low==='ok') ? session.guessHead : input;
@@ -1283,7 +1302,7 @@ async function paidFlowAdvance(session, inputRaw){
     session.guessPerson = personForTag(finalTag) || (g ? (g.person||'') : '');
     session.step='tag';
     var lead = session.guessTag ? ('my guess: *'+session.guessTag+'*. Reply "ok" to accept, or pick a number') : 'pick a number';
-    return { reply:'5/5 *Tag?* — '+lead+':\n'+paidTagMenu()+'\n(or type any full tag)' };
+    return { reply:'5/7 *Tag?* — '+lead+':\n'+paidTagMenu()+'\n(or type any full tag)' };
   }
   if(session.step==='tag'){
     var tag='';
@@ -1296,6 +1315,38 @@ async function paidFlowAdvance(session, inputRaw){
     if(!tag){ return { reply:'Pick the Tag by number, "ok" for the guess, or type a full tag:\n'+paidTagMenu() }; }
     session.answers.tag=tag;
     session.answers.person = personForTag(tag) || session.guessPerson || '';
+    session.step='account';
+    return { reply:'6/7 *Paid from which account?* — reply the number, or type the account name:\n'+paidAccountMenu() };
+  }
+  if(session.step==='account'){
+    var acct='';
+    if(/^\d+$/.test(low)){
+      var ac=parseInt(low,10);
+      if(ac>=1 && ac<=LEDGER_ACCOUNTS.length){ acct=LEDGER_ACCOUNTS[ac-1]; }
+      else { return { reply:'Pick the account by number (1\u2013'+LEDGER_ACCOUNTS.length+') or type the account name:\n'+paidAccountMenu() }; }
+    } else {
+      var r=resolveAccount(input);
+      if(r.account){ acct=r.account; }
+      else if(r.ambiguous){ return { reply:'\u201c'+input+'\u201d matches several accounts: '+r.ambiguous.join(', ')+'. Type the exact one, or reply its number:\n'+paidAccountMenu() }; }
+      else { return { reply:'\u26A0\uFE0F \u201c'+input+'\u201d isn\u2019t one of the known accounts. Reply a number (1\u2013'+LEDGER_ACCOUNTS.length+') or type an exact account name:\n'+paidAccountMenu() }; }
+    }
+    session.answers.bankAc=acct;
+    session.step='entity';
+    return { reply:'7/7 *Which entity / company?* — reply the number, or type the name:\n'+paidEntityMenu() };
+  }
+  if(session.step==='entity'){
+    var ent='';
+    if(/^\d+$/.test(low)){
+      var en=parseInt(low,10);
+      if(en>=1 && en<=LEDGER_ENTITIES.length){ ent=LEDGER_ENTITIES[en-1]; }
+      else { return { reply:'Pick the entity by number (1\u2013'+LEDGER_ENTITIES.length+') or type the name:\n'+paidEntityMenu() }; }
+    } else {
+      var re=resolveEntity(input);
+      if(re.entity){ ent=re.entity; }
+      else if(re.ambiguous){ return { reply:'\u201c'+input+'\u201d matches several: '+re.ambiguous.join(', ')+'. Type the exact one, or reply its number:\n'+paidEntityMenu() }; }
+      else { return { reply:'\u26A0\uFE0F \u201c'+input+'\u201d isn\u2019t in the entity list. Reply a number (1\u2013'+LEDGER_ENTITIES.length+') or type an exact name:\n'+paidEntityMenu() }; }
+    }
+    session.answers.entity=ent;
     var item={ id:session.itemId, entity:session.entity, bankAc:session.bankAc, description:session.description, label:session.label };
     session.row = assemblePaymentRow(item, session.answers);
     session.step='confirm';
@@ -1338,7 +1389,7 @@ async function handlePaidFlow(msg){
         startedAt:new Date().toISOString(), lastAt:new Date().toISOString(), by:who.name };
       st.sessions[who.key]=ses; savePaidState(st);
       try{ if(msg.id) appendThreadMsg(ses.itemId, msg.id._serialized); }catch(e){}   // the "paid" trigger msg
-      await send((who.name?who.name+' \u2014 ':'')+'marking *'+ses.label+'* (approved Rs.'+formatINR(ses.amount)+') as paid.\n\n1/5 *Amount paid?* — reply "ok" for Rs.'+formatINR(ses.amount)+', or type the actual amount.');
+      await send((who.name?who.name+' \u2014 ':'')+'marking *'+ses.label+'* (approved Rs.'+formatINR(ses.amount)+') as paid.\n\n1/7 *Amount paid?* — reply "ok" for Rs.'+formatINR(ses.amount)+', or type the actual amount.');
       return true;
     }
 
@@ -4104,7 +4155,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.8',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.11',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -4913,7 +4964,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.10.0-s5.8 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.10.0-s5.11 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
