@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.10.0-s5.1 — backfill now sourced from approval history/reconciliation (awaitingPayment), NOT the event store, so the real backlog shows up and Company/From are recovered from the request body. list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
+// FIDATO MIS SERVER v2.10.0-s5.7 — outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -182,7 +182,10 @@ function parseSheetDate(val) {
   if (!val) return null; if (val instanceof Date) return val;
   var s = val.toString().trim(), p = s.split(/[\/\.\-]/);
   if (p.length === 3) { var d=parseInt(p[0]),m=parseInt(p[1]),y=parseInt(p[2]); if(y<100)y+=2000; if(d>0&&d<=31&&m>0&&m<=12) return new Date(y,m-1,d); }
-  var x = new Date(val); return isNaN(x.getTime()) ? null : x;
+  var cleaned = s.replace(/,\s*[A-Za-z]+\.?\s*$/,'').trim();      // strip a trailing weekday, e.g. "09 Apr 2026, Thursday"
+  if (/^-?\d+(\.\d+)?$/.test(cleaned)) return null;               // a bare number is not a date (avoid 208287 -> year)
+  if (!/\b\d{4}\b/.test(cleaned)) return null;                    // require a 4-digit year so "14 Jan" titles don't become phantom dates
+  var x = new Date(cleaned); return isNaN(x.getTime()) ? null : x;
 }
 function parseAmount(val) { if(typeof val==='number')return val; if(!val)return 0; var n=parseFloat(String(val).replace(/,/g,'').replace(/[^0-9.\-]/g,'')); return isNaN(n)?0:n; }
 function formatINR(num) {
@@ -905,7 +908,7 @@ async function aiGuessTag(desc, entity){
 // Column order: Date, Entity, Head, Description, Tag, IN/OUT, Amount, Mode, Person, Bank A/C, Transfer To, Notes
 function assemblePaymentRow(item, answers){
   return {
-    date: answers.date,                          // dd.mm.yy
+    date: toLedgerWriteDate(answers.date),       // dd/mm/yyyy real date (so SUMIFS day-totals match)
     entity: item.entity || '',                   // from EXPENSE REQUEST Company
     head: answers.head || '',                    // AI-guessed, confirmed
     description: item.description || item.label || '', // auto from request
@@ -940,6 +943,14 @@ function toLedgerDate(input){
   var dd=('0'+d.getDate()).slice(-2), mm=('0'+(d.getMonth()+1)).slice(-2), yy=String(d.getFullYear()).slice(-2);
   return dd+'.'+mm+'.'+yy;
 }
+// v2.10.0-s5.4: the date written into Ledger col A MUST be a real date in dd/mm/yyyy so the
+// day-total breaker's =SUMIFS(G:G,A:A,<date>,...) actually matches it (dd.mm.yy reads as text
+// and the totals silently miss the row). Reads/matching still accept both formats.
+function toLedgerWriteDate(input){
+  var d = parseSheetDate(input) || new Date();
+  var dd=('0'+d.getDate()).slice(-2), mm=('0'+(d.getMonth()+1)).slice(-2), yyyy=d.getFullYear();
+  return dd+'/'+mm+'/'+yyyy;
+}
 // Find the row index of a date block's header in the Ledger (returns {headerRow, dayTotalRow} or null).
 // Reads the sheet; pure read, safe. Caller decides insert position.
 async function findDateBlock(ledgerValues, shortDate){
@@ -971,11 +982,21 @@ function loadLedgerDryrun(){
   return LEDGER_WRITE_DRYRUN;   // env-var default until the dashboard toggle overrides it
 }
 function saveLedgerDryrun(on){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(LEDGER_DRYRUN_STATE_FILE, JSON.stringify({enabled:!!on, at:new Date().toISOString()})); }catch(e){ console.error('[Ledger] dryrun toggle save:',e.message); } }
-// Pure planner. values: 2D array of Ledger!A:L. row: assembled 12-col row. cfg:{newDay}.
+// v2.10.0-s5.3: which TAB writes target. Default the real 'Ledger'. For a same-workbook
+// rehearsal, set LEDGER_WRITE_TAB to your copy tab's exact name (e.g. 'Copy of Ledger').
+// Only the WRITE path uses this; all reads/reports stay on the real 'Ledger' tab.
+var LEDGER_WRITE_TAB = process.env.LEDGER_WRITE_TAB || 'Ledger';
+function a1Tab(name){ return /^[A-Za-z0-9_]+$/.test(name) ? name : ("'"+String(name).replace(/'/g,"''")+"'"); } // quote tab names with spaces
+// A real transaction row has a NUMBER in col G (amount). Breaker/header/day-total rows do not,
+// even though a breaker's top row carries a date in A and the label "OUT" in F — so col G is the
+// reliable discriminator (learned from the live sheet).
+function isLedgerNum(v){ if(v===0||v==='0') return true; if(v===''||v===null||v===undefined) return false; var s=String(v); if(!/[0-9]/.test(s)) return false; var n=parseFloat(s.replace(/[^0-9.\-]/g,'')); return !isNaN(n); }
+// Pure planner. values: 2D array of the target tab A:L. row: assembled 12-col row. cfg:{newDay, tab}.
 // A transaction row is one with BOTH a parseable date in col A and a value in col F (IN/OUT) —
 // header rows and day-total rows lack col F, so they're skipped (matches getLedgerData).
 function planLedgerWrite(values, row, cfg){
   cfg = cfg || {};
+  var tab = cfg.tab || 'Ledger';
   values = values || [];
   var rowArray = rowToArray(row);
   var idm = (row.notes||'').match(/\[bot:([^\]]+)\]/);
@@ -988,38 +1009,60 @@ function planLedgerWrite(values, row, cfg){
       }
     }
   }
-  // 2) find the last transaction row of the target day (parsed-date equality + col F present)
+  // 2) classify rows. txn = parseable date in A AND a number in G. breaker-top = date in A, no number in G.
+  var txns=[], breakers=[];
+  for(var j=0;j<values.length;j++){
+    var A = values[j] && values[j][0], G = values[j] && values[j][6];
+    var d = parseSheetDate(A); if(!d) continue;
+    var key = d.toISOString().split('T')[0], rec = { idx:j, key:key, t:d.getTime() };
+    if(isLedgerNum(G)) txns.push(rec); else breakers.push(rec);   // breakers/txns gathered in row order = date order
+  }
   var target = parseSheetDate(row.date);
-  var targetKey = target ? target.toISOString().split('T')[0] : null;
-  var lastIdx = -1, dayCount = 0;
-  if(targetKey){
-    for(var j=0;j<values.length;j++){
-      var a = values[j] && values[j][0], f = values[j] && values[j][5];
-      if(!a || !f) continue;                       // not a transaction row
-      var d = parseSheetDate(a); if(!d) continue;
-      if(d.toISOString().split('T')[0]===targetKey){ lastIdx=j; dayCount++; }
-    }
-  }
-  if(lastIdx>=0){
-    var insertArrayIndex = lastIdx + 1;            // place after the day's last txn row
-    var sheetRow = insertArrayIndex + 1;           // 1-based; Ledger!A:L starts at row 1
+  if(!target) return { action:'no-date', reason:'could not parse the row date "'+row.date+'"', rowArray:rowArray };
+  var targetKey = target.toISOString().split('T')[0], targetT = target.getTime();
+  // 3) block already exists for this date (anywhere in the sheet — handles back-dated dates too)?
+  var lastTxn=-1, dayCount=0;
+  for(var k=0;k<txns.length;k++){ if(txns[k].key===targetKey){ lastTxn=txns[k].idx; dayCount++; } }
+  if(lastTxn>=0){
+    var insertArrayIndex = lastTxn + 1, sheetRow = insertArrayIndex + 1;
     return { action:'insert', insertArrayIndex:insertArrayIndex, sheetRow:sheetRow,
-      a1Range:'Ledger!A'+sheetRow+':L'+sheetRow, dayCount:dayCount, rowArray:rowArray,
-      reason:'insert into the '+row.date+' block (after its '+dayCount+' existing row(s)) at sheet row '+sheetRow };
+      a1Range:a1Tab(tab)+'!A'+sheetRow+':L'+sheetRow, dayCount:dayCount, rowArray:rowArray,
+      reason:'insert into the '+row.date+' block (after its '+dayCount+' row(s)) at sheet row '+sheetRow };
   }
-  // 3) no block for this day → new-day case (the riskier path, deliberately limited here)
-  if(cfg.newDay){
-    return { action:'append-newday', reason:'no '+row.date+' block; NEWDAY enabled → append at bottom', rowArray:rowArray };
+  var bMatch=null; for(var b0=0;b0<breakers.length;b0++){ if(breakers[b0].key===targetKey){ bMatch=breakers[b0]; break; } }
+  if(bMatch){
+    var insB = bMatch.idx + 2, srB = insB + 1;       // header exists but no rows: insert just below the 2-row breaker
+    return { action:'insert', insertArrayIndex:insB, sheetRow:srB, a1Range:a1Tab(tab)+'!A'+srB+':L'+srB, dayCount:0, rowArray:rowArray,
+      reason:'header for '+row.date+' exists but has no rows yet; insert first row at sheet row '+srB };
   }
-  return { action:'newday-blocked', reason:'no '+row.date+' block and NEWDAY_BLOCK_CREATE_ENABLED is off; not writing', rowArray:rowArray };
+  // 4) NEW DAY (no block). Need an existing breaker to clone, and the NEWDAY toggle on.
+  if(!breakers.length) return { action:'newday-blocked', reason:'no existing breaker to clone (empty ledger); not creating a block', rowArray:rowArray };
+  if(!cfg.newDay)       return { action:'newday-blocked', reason:'no '+row.date+' block and NEWDAY_BLOCK_CREATE_ENABLED is off; not writing', rowArray:rowArray };
+  // chronological insert point: before the first breaker dated later than target; else after the last txn (bottom, above any grand-total footer)
+  var later = breakers.filter(function(b){ return b.t > targetT; });
+  var t = later.length ? later[0].idx : ((txns.length ? txns[txns.length-1].idx : values.length-1) + 1);
+  // clone the nearest breaker above the insert point; if none (target older than all), clone the next one
+  var above=null; for(var c=0;c<breakers.length;c++){ if(breakers[c].idx < t) above=breakers[c]; }
+  var cloneTop = above ? above.idx : later[0].idx;
+  return {
+    action:'newday-create',
+    insertArrayIndex:t, insertSheetRow:t+1,
+    cloneTopArrayIndex:cloneTop, cloneBottomArrayIndex:cloneTop+1,
+    newDate:{ y:target.getFullYear(), m:target.getMonth()+1, d:target.getDate() },
+    dateA1:a1Tab(tab)+'!A'+(t+1),
+    txnSheetRow:t+3, a1Range:a1Tab(tab)+'!A'+(t+3)+':L'+(t+3),
+    rowArray:rowArray,
+    reason:'no '+row.date+' block → clone breaker at sheet rows '+(cloneTop+1)+'-'+(cloneTop+2)+', insert new block at sheet row '+(t+1)+', write row at sheet row '+(t+3)+(later.length?' (back-dated, mid-sheet)':' (newest day, bottom)')
+  };
 }
-// Resolve the numeric sheetId (gid) of the "Ledger" tab — needed for row insertion.
-async function getLedgerSheetGid(){
-  if(process.env.LEDGER_SHEET_GID) return parseInt(process.env.LEDGER_SHEET_GID,10);
+// Resolve the numeric sheetId (gid) of a tab by title — needed for row insertion.
+async function getLedgerSheetGid(tabName){
+  tabName = tabName || 'Ledger';
+  if(tabName==='Ledger' && process.env.LEDGER_SHEET_GID) return parseInt(process.env.LEDGER_SHEET_GID,10);
   var meta = await sheetsApi.spreadsheets.get({ spreadsheetId: CONFIG.SHEET_ID });
   var sheets = (meta.data && meta.data.sheets) || [];
-  for(var i=0;i<sheets.length;i++){ if(sheets[i].properties && sheets[i].properties.title==='Ledger') return sheets[i].properties.sheetId; }
-  return 0;
+  for(var i=0;i<sheets.length;i++){ if(sheets[i].properties && sheets[i].properties.title===tabName) return sheets[i].properties.sheetId; }
+  throw new Error('tab "'+tabName+'" not found in the workbook');
 }
 // Executor. Gated: writes only when LEDGER_WRITE_ENABLED; dry-run (live, panel-toggle) logs and writes nothing.
 async function writeRowToLedger(row){
@@ -1027,16 +1070,22 @@ async function writeRowToLedger(row){
   if(!LEDGER_WRITE_ENABLED && !dry) return { skipped:true, reason:'capture-only (LEDGER_WRITE_ENABLED off, no dry-run)' };
   if(!sheetsApi) return { error:'Sheets not initialized' };
   try{
-    var values = await readSheet('Ledger!A:L');
-    var plan = planLedgerWrite(values, row, { newDay: NEWDAY_BLOCK_CREATE_ENABLED });
+    var tab = LEDGER_WRITE_TAB;
+    var values = await readSheet(a1Tab(tab)+'!A:L');
+    var plan = planLedgerWrite(values, row, { newDay: NEWDAY_BLOCK_CREATE_ENABLED, tab: tab });
     if(plan.action==='skip-dup'){ console.log('[Ledger] skip duplicate:', plan.reason); return { skipped:true, dup:true, plan:plan }; }
     if(plan.action==='newday-blocked'){ console.log('[Ledger]', plan.reason); return { skipped:true, plan:plan }; }
+    if(plan.action==='no-date'){ console.log('[Ledger]', plan.reason); return { skipped:true, plan:plan }; }
     if(dry){
-      console.log('[Ledger][DRY-RUN] WOULD WRITE → '+(plan.a1Range||'(append bottom)')+' :: '+JSON.stringify(plan.rowArray)+'  ['+plan.reason+']');
+      if(plan.action==='newday-create'){
+        console.log('[Ledger][DRY-RUN] WOULD CREATE NEW DAY for '+row.date+' → clone breaker (sheet rows '+(plan.cloneTopArrayIndex+1)+'-'+(plan.cloneTopArrayIndex+2)+') into a new block at sheet row '+plan.insertSheetRow+', set date =DATE('+plan.newDate.y+','+plan.newDate.m+','+plan.newDate.d+'), write row at '+plan.a1Range+' :: '+JSON.stringify(plan.rowArray)+'  ['+plan.reason+']');
+      } else {
+        console.log('[Ledger][DRY-RUN] WOULD WRITE → '+(plan.a1Range||'(n/a)')+' :: '+JSON.stringify(plan.rowArray)+'  ['+plan.reason+']');
+      }
       return { dryRun:true, plan:plan };
     }
     if(plan.action==='insert'){
-      var gid = await getLedgerSheetGid();
+      var gid = await getLedgerSheetGid(tab);
       await sheetsApi.spreadsheets.batchUpdate({ spreadsheetId:CONFIG.SHEET_ID, resource:{ requests:[
         { insertDimension:{ range:{ sheetId:gid, dimension:'ROWS', startIndex:plan.insertArrayIndex, endIndex:plan.insertArrayIndex+1 }, inheritFromBefore:true } }
       ]}});
@@ -1044,10 +1093,28 @@ async function writeRowToLedger(row){
       console.log('[Ledger] inserted row at', plan.a1Range);
       return { written:true, plan:plan };
     }
-    if(plan.action==='append-newday'){
-      await sheetsApi.spreadsheets.values.append({ spreadsheetId:CONFIG.SHEET_ID, range:'Ledger!A:L', valueInputOption:'USER_ENTERED', insertDataOption:'INSERT_ROWS', resource:{ values:[plan.rowArray] } });
-      console.log('[Ledger] appended new-day row at bottom');
-      return { written:true, plan:plan };
+    if(plan.action==='newday-create'){
+      var gidN = await getLedgerSheetGid(tab);
+      var t = plan.insertArrayIndex;
+      // 1) open 3 rows (breaker-top, breaker-bottom, txn), inheriting format from the row above
+      await sheetsApi.spreadsheets.batchUpdate({ spreadsheetId:CONFIG.SHEET_ID, resource:{ requests:[
+        { insertDimension:{ range:{ sheetId:gidN, dimension:'ROWS', startIndex:t, endIndex:t+3 }, inheritFromBefore:true } }
+      ]}});
+      // 2) clone the breaker (2 rows × cols A:L) — copies formats, merges AND the SUMIFS/NET formulas,
+      //    whose relative refs auto-re-point to the new block's own rows.
+      var src = (plan.cloneTopArrayIndex >= t) ? plan.cloneTopArrayIndex+3 : plan.cloneTopArrayIndex; // source shifts if it was below the insert
+      await sheetsApi.spreadsheets.batchUpdate({ spreadsheetId:CONFIG.SHEET_ID, resource:{ requests:[
+        { copyPaste:{
+            source:{ sheetId:gidN, startRowIndex:src, endRowIndex:src+2, startColumnIndex:0, endColumnIndex:12 },
+            destination:{ sheetId:gidN, startRowIndex:t, endRowIndex:t+2, startColumnIndex:0, endColumnIndex:12 },
+            pasteType:'PASTE_NORMAL' } }
+      ]}});
+      // 3) overwrite the cloned breaker's date (top row, col A) with the real new-day date
+      await sheetsApi.spreadsheets.values.update({ spreadsheetId:CONFIG.SHEET_ID, range:plan.dateA1, valueInputOption:'USER_ENTERED', resource:{ values:[['=DATE('+plan.newDate.y+','+plan.newDate.m+','+plan.newDate.d+')']] } });
+      // 4) write the transaction row beneath the new breaker
+      await sheetsApi.spreadsheets.values.update({ spreadsheetId:CONFIG.SHEET_ID, range:plan.a1Range, valueInputOption:'USER_ENTERED', resource:{ values:[plan.rowArray] } });
+      console.log('[Ledger] created new-day block for', row.date, 'at sheet row', plan.insertSheetRow, '— wrote row at', plan.a1Range);
+      return { written:true, createdBlock:true, plan:plan };
     }
     return { skipped:true, plan:plan };
   }catch(e){ console.error('[Ledger] write:', e.message); return { error:e.message }; }
@@ -1080,6 +1147,54 @@ function registerPostedApproved(postedMsgId, item){
   p.items[postedMsgId]=rec; p.recent.unshift(rec); if(p.recent.length>50) p.recent=p.recent.slice(0,50);
   if(item.id) p.byItem[item.id]=postedMsgId;
   savePaidPosted(p); return rec;
+}
+// ── v2.10.0-s5.7: outflow log + testing controls (mark unpaid / unpost-delete) ──
+// Combined live view of everything pushed to the payments group, joined with paid events.
+function buildOutflowLog(){
+  var p=loadPaidPosted(), store=loadEventStore();
+  var paidByItem={}; (store.events||[]).forEach(function(e){ if(e.type==='paid') paidByItem[e.itemId]=e; });
+  var rows=[], seen={};
+  (p.recent||[]).forEach(function(rec){
+    if(seen[rec.id]) return; seen[rec.id]=true;
+    var pe=paidByItem[rec.id];
+    rows.push({ itemId:rec.id, label:rec.label, amount:rec.amount, entity:rec.entity||'', bankAc:rec.bankAc||'',
+      postedAt:rec.at, postedMsgId:rec.postedMsgId, paid:!!pe,
+      paidDetails: pe?{amount:pe.paidAmount,date:pe.date,mode:pe.mode,head:pe.head,tag:pe.tag,person:pe.person,entity:pe.entity,bankAc:pe.bankAc,at:pe.at}:null,
+      status: pe?'paid':'posted' });
+  });
+  // paid events whose item has no posted record (e.g. paid via a manual flow) — still list them
+  (store.events||[]).forEach(function(e){
+    if(e.type!=='paid' || seen[e.itemId]) return; seen[e.itemId]=true;
+    rows.push({ itemId:e.itemId, label:e.label, amount:e.paidAmount, entity:e.entity||'', bankAc:e.bankAc||'',
+      postedAt:null, postedMsgId:null, paid:true,
+      paidDetails:{amount:e.paidAmount,date:e.date,mode:e.mode,head:e.head,tag:e.tag,person:e.person,entity:e.entity,bankAc:e.bankAc,at:e.at},
+      status:'paid' });
+  });
+  rows.sort(function(a,b){ var ta=Date.parse((a.paidDetails&&a.paidDetails.at)||a.postedAt||0)||0, tb=Date.parse((b.paidDetails&&b.paidDetails.at)||b.postedAt||0)||0; return tb-ta; });
+  return rows;
+}
+// Mark a paid expense back to UNPAID — removes its paid event(s) so it can be re-tested.
+function markItemUnpaid(itemId){
+  var store=loadEventStore(); var before=store.events.length;
+  _eventStoreCache.events = store.events.filter(function(e){ return !(e.type==='paid' && e.itemId===itemId); });
+  var removed = before - _eventStoreCache.events.length;
+  if(removed>0) _persistEventStore();
+  return { itemId:itemId, removed:removed,
+    message: removed ? ('Marked unpaid — removed '+removed+' paid event(s); it can be paid again.') : 'No paid event found for that id.' };
+}
+// Remove a pushed item from the dashboard's posted index; optionally delete the WhatsApp post too.
+async function unpostOutflowItem(itemId, deleteMsg){
+  var p=loadPaidPosted(); var msgId=p.byItem[itemId]; var rec=msgId?p.items[msgId]:null;
+  var waDeleted=false, waError=null;
+  if(msgId && deleteMsg){
+    if(waReady && waClient){
+      try{ var m=await waClient.getMessageById(msgId); if(m){ await m.delete(true); waDeleted=true; } else { waError='message not found (may be too old to delete)'; } }
+      catch(e){ waError=e.message; }
+    } else { waError='WhatsApp not connected — removed from dashboard only'; }
+  }
+  if(msgId){ delete p.items[msgId]; delete p.byItem[itemId]; p.recent=(p.recent||[]).filter(function(r){return r.id!==itemId;}); savePaidPosted(p); }
+  return { itemId:itemId, removedFromDashboard:!!msgId, postedMsgId:msgId||null, waDeleted:waDeleted, waError:waError,
+    message: msgId ? ('Removed from dashboard'+(deleteMsg?(waDeleted?' and deleted the group message.':(' — group message NOT deleted ('+(waError||'?')+').')):'.')) : 'No posted record for that id.' };
 }
 function alreadyPosted(itemId){ try{ var p=loadPaidPosted(); return !!(p.byItem && p.byItem[itemId]); }catch(e){ return false; } }
 
@@ -1274,14 +1389,15 @@ async function postApprovedToOutflow(item, amount, force){
   }catch(e){ console.error('[Outflow] post:', e.message); return false; }
 }
 
-// ── v2.10.0-s5.1: backfill — sourced from the APPROVAL AUDIT / reconciliation ──
-// The event store only holds approvals captured live since its code shipped (and it
-// resets if the volume is wiped), so it is NOT the backlog. The real "approved and
-// not yet paid" list is buildReconciliation().awaitingPayment — approved items with no
-// matching Ledger payment. Each carries its original request body, so we recover
-// Company/From too. Joined with paid_posted.byItem for posted-status.
-function mapAwaitingToQueue(awaiting, pp){            // pure: testable offline
-  var list = (awaiting||[]).map(function(e){
+// ── v2.10.0-s5.2: backfill — sourced from the approval AUDIT (fast). ──────────
+// s5.1 sourced this from buildReconciliation().awaitingPayment, but that runs the
+// per-item AI Ledger matcher (tens of seconds) — far too heavy for a page load, so the
+// queue page hung. We now use buildApprovalAudit().fullyApproved directly: fast, shows
+// the real approved backlog, enriched with Company/From from the request body. Trade-off:
+// this does NOT auto-exclude items already paid in the Ledger (that needed the slow
+// matcher), so push selectively — per-item buttons let you skip anything already paid.
+function mapApprovedToQueue(approved, pp){            // pure: testable offline
+  var list = (approved||[]).map(function(e){
     var ef = parseExpenseFields(e.body||'');
     var posted = !!(pp && pp.byItem && pp.byItem[e.id]);
     return {
@@ -1292,7 +1408,7 @@ function mapAwaitingToQueue(awaiting, pp){            // pure: testable offline
       entity: ef.entity || '',
       bankAc: ef.bankAc || '',
       posted: posted,
-      paid: false,                                    // awaitingPayment excludes paid-in-Ledger items
+      paid: false,
       status: posted ? 'posted' : 'pending'
     };
   });
@@ -1300,8 +1416,8 @@ function mapAwaitingToQueue(awaiting, pp){            // pure: testable offline
   return list;
 }
 async function listApprovedForOutflow(days){
-  var rec = await buildReconciliation(days || 30);
-  return mapAwaitingToQueue(rec.awaitingPayment, loadPaidPosted());
+  var audit = await buildApprovalAudit(days || 15);
+  return mapApprovedToQueue(audit.fullyApproved, loadPaidPosted());
 }
 // Manually push one approved item (admin action; bypasses the auto toggle, still dedupes).
 async function pushOneApprovedToOutflow(itemId){
@@ -3969,7 +4085,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.1',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.7',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -4143,7 +4259,8 @@ var TABS = [
     {ep:'/api/ledger-write-status', ico:'\\uD83D\\uDCD2', label:'Ledger write status'},
     {ep:'/api/ledger-dryrun-on', ico:'\\uD83E\\uDDEA', label:'Ledger dry-run ON (rehearsal)', act:true, confirm:'Turn ledger dry-run ON? The bot will log the row it would write but write nothing — this also pauses any real writes.'},
     {ep:'/api/ledger-dryrun-off', ico:'\\u270D', label:'Ledger dry-run OFF', act:true, confirm:'Turn ledger dry-run OFF? If LEDGER_WRITE_ENABLED is on, confirmed rows will then be written to the actual Sheet.'},
-    {ep:'/api/outflow-queue', ico:'\\uD83D\\uDCE4', label:'Approved → payments queue', link:true}
+    {ep:'/api/outflow-queue', ico:'\\uD83D\\uDCE4', label:'Approved → payments queue', link:true},
+    {ep:'/api/outflow-log', ico:'\\uD83D\\uDCCB', label:'Payments log (posted + paid)'}
   ]},
   {id:'debug', label:'Debug', items:[
     {ep:'/api/wa-status', ico:'\\uD83D\\uDCF1', label:'WhatsApp status'},
@@ -4379,24 +4496,38 @@ var OUTFLOW_QUEUE_HTML = `<!DOCTYPE html>
   </div>
   <div id="msg" class="msg"></div>
   <div id="tbl"><div class="empty">Loading…</div></div>
+
+  <h1 style="margin-top:26px;">Payments log — pushed to the group</h1>
+  <div class="sub">Everything posted to the payments group, with paid status. While testing you can mark a paid item back to <b>unpaid</b>, or <b>delete</b> a pushed item (which also deletes its message in the group).</div>
+  <div class="bar"><button onclick="loadLog()">Refresh log</button><span id="logcount" class="sub" style="margin:0;"></span></div>
+  <div id="logtbl"><div class="empty">Loading…</div></div>
 <script>
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
 function inr(n){ if(n==null||isNaN(n))return ''; return '\\u20B9'+Number(n).toLocaleString('en-IN'); }
 function flash(t,ok){ var m=document.getElementById('msg'); m.textContent=t; m.className='msg '+(ok?'ok':'err'); m.style.display='block'; }
 function load(){
-  fetch('/api/outflow-pending',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+  var tbl=document.getElementById('tbl');
+  tbl.innerHTML='<div class="empty">Reading approval history… this can take a few seconds.</div>';
+  var ctrl=new AbortController(); var to=setTimeout(function(){ctrl.abort();},90000);
+  fetch('/api/outflow-pending',{credentials:'same-origin',signal:ctrl.signal}).then(function(r){return r.json();}).then(function(d){
+    clearTimeout(to);
+    if(d&&d.error){ tbl.innerHTML='<div class="empty">Couldn\\'t load: '+esc(d.error)+'</div>'; flash('Error: '+d.error,false); return; }
     var items=(d&&d.items)||[]; var pend=items.filter(function(x){return x.status==='pending';}).length;
     document.getElementById('count').textContent=items.length+' approved \\u00b7 '+pend+' pending';
     document.getElementById('allBtn').disabled = pend===0;
-    if(!items.length){ document.getElementById('tbl').innerHTML='<div class="empty">No approved items found in the event store.</div>'; return; }
+    if(!items.length){ tbl.innerHTML='<div class="empty">No approved items found in the last 15 days. (Add ?days=30 to the URL to look further back.)</div>'; return; }
     var h='<table><tr><th>Approved</th><th>Description</th><th class="amt">Amount</th><th>Status</th><th></th></tr>';
     items.forEach(function(it){
       var when=it.approvedAt?new Date(it.approvedAt).toLocaleDateString('en-IN',{day:'2-digit',month:'short'}):'';
       var act = it.status==='pending' ? '<button class="push" onclick="push(\\''+esc(it.itemId)+'\\',this)">Push</button>' : '';
       h+='<tr><td class="sub" style="margin:0;">'+esc(when)+'</td><td>'+esc(it.label)+'</td><td class="amt">'+inr(it.amount)+'</td><td><span class="st '+it.status+'">'+it.status+'</span></td><td>'+act+'</td></tr>';
     });
-    h+='</table>'; document.getElementById('tbl').innerHTML=h;
-  }).catch(function(e){ flash('Load failed: '+e,false); });
+    h+='</table>'; tbl.innerHTML=h;
+  }).catch(function(e){
+    clearTimeout(to);
+    var why = (e&&e.name==='AbortError') ? 'timed out (the approval history is large — try ?days=7)' : String(e);
+    tbl.innerHTML='<div class="empty">Load failed: '+esc(why)+'</div>'; flash('Load failed: '+why,false);
+  });
 }
 function push(id,btn){ if(btn){btn.disabled=true;btn.textContent='…';}
   fetch('/api/outflow-push?id='+encodeURIComponent(id),{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
@@ -4412,7 +4543,41 @@ function catchUp(){ var b=document.getElementById('allBtn'); b.disabled=true; b.
     b.textContent='Push all pending (catch-up)'; load();
   }).catch(function(e){ flash('Catch-up failed: '+e,false); b.disabled=false; b.textContent='Push all pending (catch-up)'; });
 }
+function loadLog(){
+  var t=document.getElementById('logtbl'); t.innerHTML='<div class="empty">Loading…</div>';
+  fetch('/api/outflow-log',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(d&&d.error){ t.innerHTML='<div class="empty">Couldn\\'t load: '+esc(d.error)+'</div>'; return; }
+    var items=(d&&d.items)||[];
+    document.getElementById('logcount').textContent=items.length+' posted \\u00b7 '+(d.paidCount||0)+' paid';
+    if(!items.length){ t.innerHTML='<div class="empty">Nothing pushed to the group yet.</div>'; return; }
+    var h='<table><tr><th>When</th><th>Description</th><th class="amt">Amount</th><th>Mode</th><th>Account</th><th>Status</th><th></th></tr>';
+    items.forEach(function(it){
+      var when=(it.paidDetails&&it.paidDetails.at)||it.postedAt;
+      when=when?new Date(when).toLocaleDateString('en-IN',{day:'2-digit',month:'short'}):'';
+      var mode=(it.paidDetails&&it.paidDetails.mode)||''; var acct=(it.paidDetails&&it.paidDetails.bankAc)||it.bankAc||'';
+      var amt=(it.paidDetails&&it.paidDetails.amount)||it.amount;
+      var acts='';
+      if(it.paid){ acts+='<button class="push" style="background:#3a2f12;border-color:#5a4a1a;color:#e5c97a;" onclick="markUnpaid(\\''+esc(it.itemId)+'\\',this)">Mark unpaid</button> '; }
+      if(it.postedMsgId){ acts+='<button class="push" style="background:#3a1c1c;border-color:#5a2a2a;color:#e09a9a;" onclick="unpost(\\''+esc(it.itemId)+'\\',this)">Delete</button>'; }
+      h+='<tr><td class="sub" style="margin:0;">'+esc(when)+'</td><td>'+esc(it.label)+'</td><td class="amt">'+inr(amt)+'</td><td>'+esc(mode)+'</td><td>'+esc(acct)+'</td><td><span class="st '+it.status+'">'+it.status+'</span></td><td style="white-space:nowrap;">'+acts+'</td></tr>';
+    });
+    h+='</table>'; t.innerHTML=h;
+  }).catch(function(e){ t.innerHTML='<div class="empty">Load failed: '+esc(String(e))+'</div>'; });
+}
+function markUnpaid(id,btn){ if(btn){btn.disabled=true;btn.textContent='…';}
+  fetch('/api/paid-undo?id='+encodeURIComponent(id),{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    flash(d.message||(d.error?('Error: '+d.error):'Done'), !d.error); loadLog(); load();
+  }).catch(function(e){ flash('Failed: '+e,false); if(btn){btn.disabled=false;btn.textContent='Mark unpaid';} });
+}
+function unpost(id,btn){
+  if(!confirm('Delete this pushed item from the dashboard AND delete its message in the payments group?')) return;
+  if(btn){btn.disabled=true;btn.textContent='…';}
+  fetch('/api/outflow-unpost?id='+encodeURIComponent(id)+'&deleteMsg=1',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    flash(d.message||(d.error?('Error: '+d.error):'Done'), !d.error); loadLog(); load();
+  }).catch(function(e){ flash('Failed: '+e,false); if(btn){btn.disabled=false;btn.textContent='Delete';} });
+}
 load();
+loadLog();
 </script>
 </body></html>`;
 app.get('/api/pair',function(req,res){
@@ -4637,11 +4802,14 @@ app.get('/api/outflow-post-off',function(req,res){try{saveOutflowPostEnabled(fal
 app.get('/api/outflow-post-status',function(req,res){try{res.json({outflowPosting:loadOutflowPostEnabled(),envDefault:OUTFLOW_POST_ENABLED,note:'Panel toggle overrides the OUTFLOW_POST_ENABLED env default once set.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/ledger-dryrun-on',function(req,res){try{saveLedgerDryrun(true);res.json({success:true,dryRun:true,message:'Ledger dry-run ON. The bot computes the exact row+target it would write and logs it, but writes nothing — even if LEDGER_WRITE_ENABLED is on. Safe rehearsal / runtime pause.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/ledger-dryrun-off',function(req,res){try{saveLedgerDryrun(false);res.json({success:true,dryRun:false,message:'Ledger dry-run OFF. If LEDGER_WRITE_ENABLED is on, confirmed rows will now actually be written to the Sheet; if it is off, the bot stays capture-only.'});}catch(e){res.json({error:e.message});}});
-app.get('/api/ledger-write-status',function(req,res){try{var dry=loadLedgerDryrun();var live=LEDGER_WRITE_ENABLED;var posture=dry?'DRY-RUN (rehearsal — nothing written)':(live?'LIVE (rows are written to the Sheet)':'CAPTURE-ONLY (no write)');res.json({posture:posture,dryRun:dry,writeEnabled:live,sheetScope:(live?'read/write':'read-only'),newDayBlocks:NEWDAY_BLOCK_CREATE_ENABLED,note:'Dry-run wins over write-enabled. LEDGER_WRITE_ENABLED is env+redeploy (it sets the OAuth scope); dry-run is a live panel toggle.'});}catch(e){res.json({error:e.message});}});
-app.get('/api/outflow-pending',async function(req,res){try{var days=parseInt(req.query.days)||30;res.json({items:await listApprovedForOutflow(days)});}catch(e){res.json({error:e.message});}});
+app.get('/api/ledger-write-status',function(req,res){try{var dry=loadLedgerDryrun();var live=LEDGER_WRITE_ENABLED;var posture=dry?'DRY-RUN (rehearsal — nothing written)':(live?'LIVE (rows are written to the Sheet)':'CAPTURE-ONLY (no write)');res.json({posture:posture,dryRun:dry,writeEnabled:live,sheetScope:(live?'read/write':'read-only'),writeTab:LEDGER_WRITE_TAB,newDayBlocks:NEWDAY_BLOCK_CREATE_ENABLED,note:'Dry-run wins over write-enabled. LEDGER_WRITE_ENABLED is env+redeploy (it sets the OAuth scope); dry-run is a live panel toggle.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/outflow-pending',async function(req,res){try{var days=parseInt(req.query.days)||15;res.json({items:await listApprovedForOutflow(days)});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-push',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var id=req.query.id;if(!id)return res.json({error:'missing id'});res.json(await pushOneApprovedToOutflow(id));}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-catchup',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});res.json(await catchUpApprovedToOutflow());}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-queue',function(req,res){res.type('html').send(OUTFLOW_QUEUE_HTML);});
+app.get('/api/outflow-log',function(req,res){try{var items=buildOutflowLog();var paidCount=items.filter(function(x){return x.paid;}).length;res.json({count:items.length,paidCount:paidCount,postedCount:items.length-paidCount,items:items});}catch(e){res.json({error:e.message});}});
+app.get('/api/paid-undo',function(req,res){try{var id=req.query.id;if(!id)return res.json({error:'missing id'});res.json(markItemUnpaid(id));}catch(e){res.json({error:e.message});}});
+app.get('/api/outflow-unpost',async function(req,res){try{var id=req.query.id;if(!id)return res.json({error:'missing id'});var del=req.query.deleteMsg==='1'||req.query.deleteMsg==='true';res.json(await unpostOutflowItem(id,del));}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-scan',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await scanStalePendings();res.json({success:true,remindersSent:count});}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-state',function(req,res){try{res.json(loadStaleState());}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-reset',function(req,res){try{saveStaleState({reminded:{}});res.json({success:true,message:'Stale reminder state cleared - next scan will re-send any 30+ min pending items'});}catch(e){res.json({error:e.message});}});
@@ -4726,7 +4894,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.10.0-s5.1 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.10.0-s5.7 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
