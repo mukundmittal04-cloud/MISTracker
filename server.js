@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.8.19 — master control panel at /api/panel (tabs+buttons behind Basic Auth lock). Base: v2.8.18 endpoint lock.
+// FIDATO MIS SERVER v2.9.0 — persist-on-event capture (Railway volume, append-only, additive): records verdict/approved/paid events as they happen, runs in parallel with chat-history audit for validation. Base: v2.8.19 control panel.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -724,6 +724,67 @@ function saveVerdicts(v){ try{ fs.writeFileSync(VERDICT_FILE, JSON.stringify(v,n
 function loadDigestMap(){ try{ if(fs.existsSync(DIGEST_MAP_FILE)) return JSON.parse(fs.readFileSync(DIGEST_MAP_FILE,'utf8')); }catch(e){} return null; }
 function saveDigestMap(m){ try{ fs.writeFileSync(DIGEST_MAP_FILE, JSON.stringify(m,null,1)); }catch(e){ console.error('[DigestMap] save:',e.message);} }
 
+// ── v2.9.0 persist-on-event store (Railway volume, append-only) ──────────────
+// Records approval/verdict/paid events the MOMENT they happen, so the bot's record
+// no longer depends on re-reading WhatsApp history. ADDITIVE ONLY in this build:
+// the bot still reads from chat history as before. This store runs in parallel so
+// it can be validated against the chat-history audit before any read-path cutover.
+var EVENT_STORE_FILE = './wa_auth/event_store.json';   // {version, createdAt, events:[{seq,type,at,...}]}
+var _eventStoreCache = null;
+function loadEventStore(){
+  if(_eventStoreCache) return _eventStoreCache;
+  try{ if(fs.existsSync(EVENT_STORE_FILE)){ _eventStoreCache = JSON.parse(fs.readFileSync(EVENT_STORE_FILE,'utf8')); } }catch(e){ console.error('[Events] load:',e.message); }
+  if(!_eventStoreCache || !Array.isArray(_eventStoreCache.events)){
+    _eventStoreCache = { version:1, createdAt:new Date().toISOString(), events:[] };
+  }
+  return _eventStoreCache;
+}
+function _persistEventStore(){
+  try{
+    if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true});
+    fs.writeFileSync(EVENT_STORE_FILE, JSON.stringify(_eventStoreCache));
+  }catch(e){ console.error('[Events] save:',e.message); }
+}
+// Append one event. type: 'verdict' | 'approved' | 'paid'. data: type-specific fields.
+// dedupeKey (optional): if an event with the same dedupeKey already exists, skip (idempotency).
+function recordEvent(type, data, dedupeKey){
+  try{
+    var store = loadEventStore();
+    if(dedupeKey){
+      for(var i=store.events.length-1;i>=0 && i>store.events.length-500;i--){
+        if(store.events[i].dedupeKey===dedupeKey) return false; // already recorded
+      }
+    }
+    var ev = { seq: store.events.length+1, type: type, at: new Date().toISOString() };
+    if(dedupeKey) ev.dedupeKey = dedupeKey;
+    for(var k in data){ if(Object.prototype.hasOwnProperty.call(data,k)) ev[k]=data[k]; }
+    store.events.push(ev);
+    _persistEventStore();
+    return true;
+  }catch(e){ console.error('[Events] record:',e.message); return false; }
+}
+// Convenience recorders for the three event types.
+function recordVerdictEvent(itemId, label, amount, role, verdict, amendAmount, raw){
+  return recordEvent('verdict', {
+    itemId: itemId, label: label, amount: amount,
+    role: role, party: (role==='mm'?'M':'S'),
+    verdict: verdict, amendAmount: amendAmount||0,
+    raw: (raw||'').substring(0,200)
+  }, 'verdict:'+itemId+':'+role+':'+verdict+':'+(amendAmount||0));
+}
+function recordApprovedEvent(itemId, label, amount){
+  return recordEvent('approved', { itemId:itemId, label:label, amount:amount }, 'approved:'+itemId);
+}
+function recordPaidEvent(itemId, label, paidAmount, fields){
+  return recordEvent('paid', {
+    itemId:itemId, label:label, paidAmount:paidAmount,
+    date: fields&&fields.date, mode: fields&&fields.mode, head: fields&&fields.head,
+    person: fields&&fields.person, transferTo: fields&&fields.transferTo,
+    entity: fields&&fields.entity, bankAc: fields&&fields.bankAc
+  }, 'paid:'+itemId);
+}
+
+
 // v2.8.11: parse any of the bot's own posts into the item(s) it was about.
 // Returns {kind:'digest'|'single', items:[{label,amount}]} or null if not a bot post.
 // - digest: '🔔 *PENDING APPROVALS*' with numbered '*N.* label' lines + '*Rs.X*' lines
@@ -1085,6 +1146,7 @@ async function handlePromoterVerdicts(msg){
       store[item.id]._label = item.label;   // v2.8.12: enable id-drift-safe reconciliation
       store[item.id]._amount = item.amount;
       store[item.id][role] = { verdict:v.verdict, amount:v.amount||0, raw:body.substring(0,200), at:new Date().toISOString() };
+      recordVerdictEvent(item.id, item.label, item.amount, role, v.verdict, v.amount||0, body);
       // Is this item now approved by BOTH parties (per the verdict store)?
       var mmV = store[item.id].mm, smV = store[item.id].sm;
       var isYes = function(x){ return x && (x.verdict==='yes' || x.verdict==='amend'); };
@@ -1093,6 +1155,7 @@ async function handlePromoterVerdicts(msg){
         if(mmV.verdict==='amend' && mmV.amount>0) amt = mmV.amount;
         if(smV.verdict==='amend' && smV.amount>0 && (!amt || smV.amount<amt)) amt = smV.amount;
         nowApproved.push({ label:item.label, amount:amt });
+        recordApprovedEvent(item.id, item.label, amt);
       }
     });
     saveVerdicts(store);
@@ -3359,7 +3422,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.19',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.9.0',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -3737,6 +3800,7 @@ app.get('/api/pair',function(req,res){
   res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Scan QR with WhatsApp</h1><img src="'+latestQRDataUrl+'" style="width:300px"/></div></body></html>');
 });
 app.get('/api/wa-status',function(req,res){res.json({connected:waReady});});
+app.get('/api/event-store',function(req,res){try{var s=loadEventStore();var limit=parseInt(req.query.limit)||200;var evs=s.events.slice(-limit).reverse();var counts={verdict:0,approved:0,paid:0};s.events.forEach(function(e){if(counts[e.type]!=null)counts[e.type]++;});res.json({version:s.version,createdAt:s.createdAt,totalEvents:s.events.length,counts:counts,showing:evs.length,events:evs});}catch(e){res.json({error:e.message});}});
 app.get('/api/groups',async function(req,res){if(!waReady)return res.json({error:'Not connected'});try{var chats=await waClient.getChats();res.json({groups:chats.filter(function(c){return c.isGroup;}).map(function(c){return{name:c.name,jid:c.id._serialized};})});}catch(e){res.json({error:e.message});}});
 app.get('/api/bot/on',function(req,res){CONFIG.BOT_ENABLED=true;res.json({botEnabled:true});});
 app.get('/api/bot/off',function(req,res){CONFIG.BOT_ENABLED=false;res.json({botEnabled:false});});
@@ -3979,7 +4043,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.8.19 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.9.0 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
