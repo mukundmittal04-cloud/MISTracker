@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.9.1 — adds /api/event-store-diff: read-only comparison of chat-history audit vs event store (distinguishes pre-existing backlog from genuine new mismatches). Base: v2.9.0 persist-on-event capture.
+// FIDATO MIS SERVER v2.10.0-s4.1 — STAGE 4 LEDGER WRITE (dry-run is now a live lock-protected panel toggle; also acts as a runtime pause over real writes): pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -22,6 +22,7 @@ const CONFIG = {
   GOOGLE_CREDENTIALS: process.env.GOOGLE_CREDENTIALS,
   WHATSAPP_GROUP_JID: process.env.WHATSAPP_GROUP_JID || '120363425432126351@g.us',
   APPROVAL_GROUP_JID: process.env.APPROVAL_GROUP_JID || '120363408304471879@g.us',
+  PAYMENT_OUTFLOW_GROUP_JID: process.env.PAYMENT_OUTFLOW_GROUP_JID || '120363425603031556@g.us',
   BOT_ENABLED: process.env.BOT_ENABLED !== 'false',
   CLAUDE_API_KEY: process.env.CLAUDE_API_KEY,
   PORT: process.env.PORT || 3000,
@@ -82,9 +83,14 @@ function initGoogleSheets() {
   if (!CONFIG.GOOGLE_CREDENTIALS) { console.log('No GOOGLE_CREDENTIALS.'); return; }
   try {
     var creds = JSON.parse(CONFIG.GOOGLE_CREDENTIALS);
-    var auth = new google.auth.GoogleAuth({ credentials: creds, scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'] });
+    // v2.10.0-s4: request the read/write scope only when ledger writing is enabled.
+    // While off (and during dry-run), stay read-only so a bug literally cannot write.
+    var scope = (process.env.LEDGER_WRITE_ENABLED === 'true')
+      ? 'https://www.googleapis.com/auth/spreadsheets'
+      : 'https://www.googleapis.com/auth/spreadsheets.readonly';
+    var auth = new google.auth.GoogleAuth({ credentials: creds, scopes: [scope] });
     sheetsApi = google.sheets({ version: 'v4', auth: auth });
-    console.log('Google Sheets API initialized.');
+    console.log('Google Sheets API initialized ('+(scope.indexOf('readonly')>=0?'read-only':'READ/WRITE')+').');
   } catch (e) { console.error('Sheets init failed:', e.message); }
 }
 async function readSheet(range) {
@@ -149,8 +155,11 @@ function createWhatsAppClient() {
     }, 10000);
   });
   waClient.on('message', function(msg) {
-    handlePromoterVerdicts(msg).then(function(handled){
-      if(!handled) return handleAccountantDM(msg);
+    handlePaidFlow(msg).then(function(handledPaid){
+      if(handledPaid) return;
+      return handlePromoterVerdicts(msg).then(function(handled){
+        if(!handled) return handleAccountantDM(msg);
+      });
     }).catch(function(e){ console.error('[Msg handler]', e.message); });
   });
   waClient.initialize().catch(function(e) { console.error('WA init failed:', e.message); });
@@ -352,6 +361,18 @@ function parseExpenseMessage(body) {
   var rawVendor = extractLineVendor(lines[0]) || lines[0].substring(0,150);
   var vendor = (typeof cleanDetails==='function') ? (cleanDetails(rawVendor)||rawVendor) : rawVendor;
   return [{vendor:vendor,amount:total}];
+}
+// v2.10.0-s3: pull the structured fields (Company / From / Details) out of an EXPENSE
+// REQUEST body so the approved item can carry entity + paying account + description into
+// the outflow post and the final ledger row. Free-text expenses (no Company/From) return
+// blanks, which the accountant sees in the posted message.
+function parseExpenseFields(body){
+  var out = { entity:'', bankAc:'', description:'' };
+  if(!body) return out;
+  var mC = body.match(/^\s*Company:\s*(.+)$/im); if(mC) out.entity = mC[1].trim();
+  var mF = body.match(/^\s*From:\s*(.+)$/im);    if(mF) out.bankAc = mF[1].trim();
+  var mD = body.match(/^\s*Details:\s*(.+)$/im); if(mD) out.description = mD[1].trim();
+  return out;
 }
 // ── Vision (image + PDF) ──────────────────────────────────────────────────────
 const visionCache = new Map();
@@ -779,11 +800,479 @@ function recordPaidEvent(itemId, label, paidAmount, fields){
   return recordEvent('paid', {
     itemId:itemId, label:label, paidAmount:paidAmount,
     date: fields&&fields.date, mode: fields&&fields.mode, head: fields&&fields.head,
-    person: fields&&fields.person, transferTo: fields&&fields.transferTo,
+    tag: fields&&fields.tag, person: fields&&fields.person, transferTo: fields&&fields.transferTo,
     entity: fields&&fields.entity, bankAc: fields&&fields.bankAc
   }, 'paid:'+itemId);
 }
 
+// ── v2.10.0 Payment Outflow flow — stage 1 helpers (capture-only, no Sheet write) ──
+// Real Ledger taxonomy (from the live sheet audit).
+var LEDGER_TAGS = ['Other','Office','Legal','Salary','Directors-SM','Directors-MM',
+  'FBD-CCM-Contractor','FBD-CCM-Legal','FBD-CCM-Exterior','FBD-CCM-Diesel',
+  'FBD-Plot-Receivable','FBD-Plot-Construction','FBD-Floor-Receivable','FBD-Floor-Possession',
+  'VRN-Plot','VRN-Site','VRN-Contractor','VRN-Other','Loan'];
+var LEDGER_MODES = ['Chq','Cash','RTGS','NEFT','PDC','Auto'];
+// Tags shown as quick numbered picks (the common ones); full list available by typing.
+var TAG_QUICK = ['Directors-SM','Directors-MM','Office','Legal','Salary','Other'];
+
+// Rule-based Tag pre-guess from a description. Returns {tag, person} or null.
+function guessTagAndPerson(desc){
+  var d = (desc||'').toLowerCase();
+  // drawings → Directors-SM / Directors-MM, with promoter in Person
+  var isDrawing = /\bdrawing\b|\bdraw\b/.test(d);
+  var hasSM = /\bsm\b|\bs\.?m\.?\b|sumit/.test(d);
+  var hasMM = /\bmm\b|\bm\.?m\.?\b|madhur|mummy/.test(d);
+  if(isDrawing || hasSM || hasMM){
+    if(hasSM && !hasMM) return {tag:'Directors-SM', person:'SM'};
+    if(hasMM && !hasSM) return {tag:'Directors-MM', person:'MM'};
+    if(isDrawing) return {tag:'Directors-SM', person:'SM'}; // default drawing guess, confirmable
+  }
+  if(/salary|payroll/.test(d)) return {tag:'Salary', person:''};
+  if(/legal|advocate|\bca\b|roc|retainer|notary|stamp/.test(d)) return {tag:'Legal', person:''};
+  if(/office|conveyance|petrol|stationery|bank charge/.test(d)) return {tag:'Office', person:''};
+  if(/contractor|rmc|concrete|steel|cement/.test(d)) return {tag:'FBD-CCM-Contractor', person:''};
+  if(/diesel/.test(d)) return {tag:'FBD-CCM-Diesel', person:''};
+  if(/electric|electricity|bill/.test(d)) return {tag:'Other', person:''};
+  return null; // unknown → ask the accountant to pick
+}
+
+// Rule-based Head pre-guess fallback (used if AI guess unavailable). Loose, descriptive.
+function guessHeadFallback(desc){
+  var d = (desc||'').toLowerCase();
+  if(/drawing|draw\b/.test(d)) return 'Drawing';
+  if(/salary|payroll/.test(d)) return 'Salary';
+  if(/legal|advocate|\bca\b|roc|retainer/.test(d)) return 'Legal';
+  if(/office|conveyance/.test(d)) return 'Office GK-1';
+  if(/capital|site/.test(d)) return 'Capital Site';
+  if(/pdc/.test(d)) return 'PDC (General)';
+  return 'Other';
+}
+
+// AI Head guess via the Claude API (uses the key already wired in). Returns a string or null.
+async function aiGuessHead(desc, entity){
+  if(!CONFIG.CLAUDE_API_KEY) return null;
+  try{
+    var prompt = 'You are labelling a real-estate accounting ledger row. Given the expense description, '+
+      'return ONLY a short 1-3 word "Head" label (the line-item category), no punctuation, no explanation. '+
+      'Examples of valid heads: Drawing, Salary, Legal, Capital Site, Office GK-1, Office Exp, Noida 153, '+
+      'Vrindavan, Directors, PDC (General), Other.\nDescription: "'+(desc||'')+'"\nEntity: "'+(entity||'')+'"\nHead:';
+    var r = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
+      body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:20, messages:[{role:'user',content:prompt}] })
+    });
+    var data = await r.json();
+    if(data && data.content && data.content[0] && data.content[0].text){
+      var head = data.content[0].text.trim().replace(/^["']|["'\.]+$/g,'').trim();
+      if(head && head.length<=40) return head;
+    }
+  }catch(e){ console.error('[PaidFlow] aiGuessHead:', e.message); }
+  return null;
+}
+
+// AI Tag guess, CONSTRAINED to the real LEDGER_TAGS taxonomy. Unlike Head (free text),
+// Tag drives the Dashboard, so this NEVER returns an invented value: the model's answer
+// is validated against LEDGER_TAGS and rejected (→ null, caller falls back to the rule
+// guess) if off-list. The prompt gives the model the project codes so it can disambiguate
+// e.g. diesel-for-Vrindavan (VRN-Site) from diesel-for-Faridabad-CCM (FBD-CCM-Diesel).
+async function aiGuessTag(desc, entity){
+  if(!CONFIG.CLAUDE_API_KEY) return null;
+  try{
+    var prompt = 'You are tagging one row of a real-estate accounting ledger. Pick the SINGLE best Tag '+
+      'from this exact list and reply with the tag VERBATIM and nothing else:\n'+
+      LEDGER_TAGS.join('\n')+'\n\n'+
+      'Rules: FBD-* = the Faridabad CCM project; VRN-* = the Vrindavan project. Use the description AND '+
+      'entity to infer which project, then pick the matching code (e.g. diesel for a Vrindavan site is '+
+      'VRN-Site; diesel for a Faridabad CCM site is FBD-CCM-Diesel). Directors-SM / Directors-MM are '+
+      'promoter drawings. If nothing clearly fits, reply Other.\n'+
+      'Description: "'+(desc||'')+'"\nEntity: "'+(entity||'')+'"\nTag:';
+    var r = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
+      body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:20, messages:[{role:'user',content:prompt}] })
+    });
+    var data = await r.json();
+    if(data && data.content && data.content[0] && data.content[0].text){
+      var guess = data.content[0].text.trim().replace(/^["']|["'\.]+$/g,'').trim().toLowerCase();
+      for(var i=0;i<LEDGER_TAGS.length;i++){ if(LEDGER_TAGS[i].toLowerCase()===guess) return LEDGER_TAGS[i]; }
+      console.log('[PaidFlow] aiGuessTag off-list, ignoring:', guess);
+    }
+  }catch(e){ console.error('[PaidFlow] aiGuessTag:', e.message); }
+  return null;
+}
+
+// Assemble the 12-column Ledger row object from the approved item + collected answers.
+// Column order: Date, Entity, Head, Description, Tag, IN/OUT, Amount, Mode, Person, Bank A/C, Transfer To, Notes
+function assemblePaymentRow(item, answers){
+  return {
+    date: answers.date,                          // dd.mm.yy
+    entity: item.entity || '',                   // from EXPENSE REQUEST Company
+    head: answers.head || '',                    // AI-guessed, confirmed
+    description: item.description || item.label || '', // auto from request
+    tag: answers.tag || '',                      // guessed, confirmed
+    inout: 'OUT',                                // approved spend, always OUT
+    amount: answers.amount,                      // confirmed paid amount
+    mode: answers.mode || '',                    // Chq/Cash/RTGS/NEFT/PDC/Auto
+    person: answers.person || '',                // derived from Tag (Directors-SM→SM)
+    bankAc: item.bankAc || '',                   // from EXPENSE REQUEST From
+    transferTo: '',                              // always blank (internal transfers manual)
+    notes: '[bot:'+(item.id||'')+']'             // tag bot rows for reconciliation/undo
+  };
+}
+function rowToArray(r){
+  return [r.date, r.entity, r.head, r.description, r.tag, r.inout, r.amount, r.mode, r.person, r.bankAc, r.transferTo, r.notes];
+}
+
+// ── Date-block write logic (TOGGLED OFF by default; built for later) ─────────
+// Writing to the Ledger requires this flag AND the read/write Sheets scope.
+var LEDGER_WRITE_ENABLED = (process.env.LEDGER_WRITE_ENABLED === 'true');
+var NEWDAY_BLOCK_CREATE_ENABLED = (process.env.NEWDAY_BLOCK_CREATE_ENABLED === 'true');
+// Convert dd.mm.yy / today → the Ledger's column-A short date string dd.mm.yy
+function toLedgerDate(input){
+  var d;
+  if(!input || /today/i.test(input)){ d = new Date(); }
+  else {
+    var m = input.match(/(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?/);
+    if(m){ var yr = m[3]?(m[3].length===2?2000+parseInt(m[3]):parseInt(m[3])):new Date().getFullYear();
+      d = new Date(yr, parseInt(m[2])-1, parseInt(m[1])); }
+    else d = new Date();
+  }
+  var dd=('0'+d.getDate()).slice(-2), mm=('0'+(d.getMonth()+1)).slice(-2), yy=String(d.getFullYear()).slice(-2);
+  return dd+'.'+mm+'.'+yy;
+}
+// Find the row index of a date block's header in the Ledger (returns {headerRow, dayTotalRow} or null).
+// Reads the sheet; pure read, safe. Caller decides insert position.
+async function findDateBlock(ledgerValues, shortDate){
+  // ledgerValues: 2D array of the Ledger sheet. Date header rows contain the long date;
+  // transaction rows carry shortDate in column A. We locate the contiguous block.
+  var firstRow=-1, lastRow=-1;
+  for(var i=0;i<ledgerValues.length;i++){
+    var colA = (ledgerValues[i][0]||'').toString().trim();
+    if(colA===shortDate){ if(firstRow<0) firstRow=i; lastRow=i; }
+  }
+  if(firstRow<0) return null;
+  return { firstTxnRow:firstRow, lastTxnRow:lastRow };
+}
+
+// ── v2.10.0-s4: LEDGER WRITE — planner (pure) + dry-run/gated executor ────────
+// The planner decides WHAT and WHERE to write, with zero I/O, so the scary part
+// (right day-block, right row, no double-write) is unit-testable offline against a
+// synthetic ledger array. The executor only touches Google Sheets when LEDGER_WRITE_ENABLED
+// is on; with LEDGER_WRITE_DRYRUN it computes the plan and logs it but writes nothing.
+// v2.10.0-s4.1: dry-run is a RUNTIME switch flippable from the locked control panel
+// (saved to ./wa_auth/ledger_dryrun.json, read live). The LEDGER_WRITE_DRYRUN env var is
+// the boot default until the dashboard toggle is set. NOTE: LEDGER_WRITE_ENABLED stays an
+// env var — it also controls the OAuth scope at startup (read-only vs read/write), which
+// can't change at runtime — so going truly live still requires setting it + redeploy.
+var LEDGER_WRITE_DRYRUN = (process.env.LEDGER_WRITE_DRYRUN === 'true');
+var LEDGER_DRYRUN_STATE_FILE = './wa_auth/ledger_dryrun.json';
+function loadLedgerDryrun(){
+  try{ if(fs.existsSync(LEDGER_DRYRUN_STATE_FILE)){ return JSON.parse(fs.readFileSync(LEDGER_DRYRUN_STATE_FILE,'utf8')).enabled===true; } }catch(e){}
+  return LEDGER_WRITE_DRYRUN;   // env-var default until the dashboard toggle overrides it
+}
+function saveLedgerDryrun(on){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(LEDGER_DRYRUN_STATE_FILE, JSON.stringify({enabled:!!on, at:new Date().toISOString()})); }catch(e){ console.error('[Ledger] dryrun toggle save:',e.message); } }
+// Pure planner. values: 2D array of Ledger!A:L. row: assembled 12-col row. cfg:{newDay}.
+// A transaction row is one with BOTH a parseable date in col A and a value in col F (IN/OUT) —
+// header rows and day-total rows lack col F, so they're skipped (matches getLedgerData).
+function planLedgerWrite(values, row, cfg){
+  cfg = cfg || {};
+  values = values || [];
+  var rowArray = rowToArray(row);
+  var idm = (row.notes||'').match(/\[bot:([^\]]+)\]/);
+  var botId = idm ? idm[1] : '';
+  // 1) dedupe — never write the same bot row twice (idempotency)
+  if(botId){
+    for(var i=0;i<values.length;i++){
+      if((values[i] && (values[i][11]||'').toString()).indexOf('[bot:'+botId+']')>=0){
+        return { action:'skip-dup', reason:'a row tagged [bot:'+botId+'] already exists at sheet row '+(i+1), existingRow:i+1, rowArray:rowArray };
+      }
+    }
+  }
+  // 2) find the last transaction row of the target day (parsed-date equality + col F present)
+  var target = parseSheetDate(row.date);
+  var targetKey = target ? target.toISOString().split('T')[0] : null;
+  var lastIdx = -1, dayCount = 0;
+  if(targetKey){
+    for(var j=0;j<values.length;j++){
+      var a = values[j] && values[j][0], f = values[j] && values[j][5];
+      if(!a || !f) continue;                       // not a transaction row
+      var d = parseSheetDate(a); if(!d) continue;
+      if(d.toISOString().split('T')[0]===targetKey){ lastIdx=j; dayCount++; }
+    }
+  }
+  if(lastIdx>=0){
+    var insertArrayIndex = lastIdx + 1;            // place after the day's last txn row
+    var sheetRow = insertArrayIndex + 1;           // 1-based; Ledger!A:L starts at row 1
+    return { action:'insert', insertArrayIndex:insertArrayIndex, sheetRow:sheetRow,
+      a1Range:'Ledger!A'+sheetRow+':L'+sheetRow, dayCount:dayCount, rowArray:rowArray,
+      reason:'insert into the '+row.date+' block (after its '+dayCount+' existing row(s)) at sheet row '+sheetRow };
+  }
+  // 3) no block for this day → new-day case (the riskier path, deliberately limited here)
+  if(cfg.newDay){
+    return { action:'append-newday', reason:'no '+row.date+' block; NEWDAY enabled → append at bottom', rowArray:rowArray };
+  }
+  return { action:'newday-blocked', reason:'no '+row.date+' block and NEWDAY_BLOCK_CREATE_ENABLED is off; not writing', rowArray:rowArray };
+}
+// Resolve the numeric sheetId (gid) of the "Ledger" tab — needed for row insertion.
+async function getLedgerSheetGid(){
+  if(process.env.LEDGER_SHEET_GID) return parseInt(process.env.LEDGER_SHEET_GID,10);
+  var meta = await sheetsApi.spreadsheets.get({ spreadsheetId: CONFIG.SHEET_ID });
+  var sheets = (meta.data && meta.data.sheets) || [];
+  for(var i=0;i<sheets.length;i++){ if(sheets[i].properties && sheets[i].properties.title==='Ledger') return sheets[i].properties.sheetId; }
+  return 0;
+}
+// Executor. Gated: writes only when LEDGER_WRITE_ENABLED; dry-run (live, panel-toggle) logs and writes nothing.
+async function writeRowToLedger(row){
+  var dry = loadLedgerDryrun();   // live panel toggle; also acts as a runtime "pause real writes"
+  if(!LEDGER_WRITE_ENABLED && !dry) return { skipped:true, reason:'capture-only (LEDGER_WRITE_ENABLED off, no dry-run)' };
+  if(!sheetsApi) return { error:'Sheets not initialized' };
+  try{
+    var values = await readSheet('Ledger!A:L');
+    var plan = planLedgerWrite(values, row, { newDay: NEWDAY_BLOCK_CREATE_ENABLED });
+    if(plan.action==='skip-dup'){ console.log('[Ledger] skip duplicate:', plan.reason); return { skipped:true, dup:true, plan:plan }; }
+    if(plan.action==='newday-blocked'){ console.log('[Ledger]', plan.reason); return { skipped:true, plan:plan }; }
+    if(dry){
+      console.log('[Ledger][DRY-RUN] WOULD WRITE → '+(plan.a1Range||'(append bottom)')+' :: '+JSON.stringify(plan.rowArray)+'  ['+plan.reason+']');
+      return { dryRun:true, plan:plan };
+    }
+    if(plan.action==='insert'){
+      var gid = await getLedgerSheetGid();
+      await sheetsApi.spreadsheets.batchUpdate({ spreadsheetId:CONFIG.SHEET_ID, resource:{ requests:[
+        { insertDimension:{ range:{ sheetId:gid, dimension:'ROWS', startIndex:plan.insertArrayIndex, endIndex:plan.insertArrayIndex+1 }, inheritFromBefore:true } }
+      ]}});
+      await sheetsApi.spreadsheets.values.update({ spreadsheetId:CONFIG.SHEET_ID, range:plan.a1Range, valueInputOption:'USER_ENTERED', resource:{ values:[plan.rowArray] } });
+      console.log('[Ledger] inserted row at', plan.a1Range);
+      return { written:true, plan:plan };
+    }
+    if(plan.action==='append-newday'){
+      await sheetsApi.spreadsheets.values.append({ spreadsheetId:CONFIG.SHEET_ID, range:'Ledger!A:L', valueInputOption:'USER_ENTERED', insertDataOption:'INSERT_ROWS', resource:{ values:[plan.rowArray] } });
+      console.log('[Ledger] appended new-day row at bottom');
+      return { written:true, plan:plan };
+    }
+    return { skipped:true, plan:plan };
+  }catch(e){ console.error('[Ledger] write:', e.message); return { error:e.message }; }
+}
+
+// ── v2.10.0 Payment Outflow flow — STAGE 2: paid-flow Q&A state machine ──────
+// When an accountant replies "paid" on a posted approved item in the payments
+// group, run a 5-question Q&A (amount → date → mode → Head → Tag), assemble the
+// 12-col row, require CONFIRM, then recordPaidEvent to the volume store.
+// CAPTURE-ONLY: no Sheet write (LEDGER_WRITE_ENABLED stays off). Stage 3 will add
+// the approved→post-to-group trigger that fills paid_posted.json (registerPostedApproved).
+var PAID_STATE_FILE  = './wa_auth/paid_state.json';   // { sessions: { <authorJid>: {...} } }
+var PAID_POSTED_FILE = './wa_auth/paid_posted.json';  // { items:{<postedMsgId>:item}, recent:[item,...] }
+var PAID_SESSION_TTL_MS  = 6 * 60 * 60 * 1000;        // abandon a half-finished Q&A after 6h
+var PAID_POSTED_FRESH_MS = 36 * 60 * 60 * 1000;       // a bare "paid" binds to a posted item this fresh
+
+function loadPaidState(){ try{ if(fs.existsSync(PAID_STATE_FILE)){ var s=JSON.parse(fs.readFileSync(PAID_STATE_FILE,'utf8')); if(s&&s.sessions) return s; } }catch(e){} return { sessions:{} }; }
+function savePaidState(s){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(PAID_STATE_FILE, JSON.stringify(s,null,1)); }catch(e){ console.error('[PaidFlow] state save:',e.message); } }
+function prunePaidState(s){ var now=Date.now(),n=0; for(var k in s.sessions){ if(!Object.prototype.hasOwnProperty.call(s.sessions,k)) continue; var ses=s.sessions[k]; var t=(ses&&ses.lastAt)?Date.parse(ses.lastAt):0; if(!t || (now-t)>PAID_SESSION_TTL_MS){ delete s.sessions[k]; n++; } } return n; }
+
+function loadPaidPosted(){ try{ if(fs.existsSync(PAID_POSTED_FILE)){ var p=JSON.parse(fs.readFileSync(PAID_POSTED_FILE,'utf8')); if(p){ if(!p.items)p.items={}; if(!p.recent)p.recent=[]; if(!p.byItem)p.byItem={}; return p; } } }catch(e){} return { items:{}, recent:[], byItem:{} }; }
+function savePaidPosted(p){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(PAID_POSTED_FILE, JSON.stringify(p,null,1)); }catch(e){ console.error('[PaidFlow] posted save:',e.message); } }
+// Stage 3 calls this when it posts an approved item into the payments group.
+// byItem indexes by expense id so the same approved item is never posted twice.
+function registerPostedApproved(postedMsgId, item){
+  var p=loadPaidPosted();
+  var rec={ postedMsgId:postedMsgId, at:new Date().toISOString(),
+    id:item.id, label:item.label, amount:item.amount,
+    entity:item.entity||'', bankAc:item.bankAc||'', description:item.description||item.label||'' };
+  p.items[postedMsgId]=rec; p.recent.unshift(rec); if(p.recent.length>50) p.recent=p.recent.slice(0,50);
+  if(item.id) p.byItem[item.id]=postedMsgId;
+  savePaidPosted(p); return rec;
+}
+function alreadyPosted(itemId){ try{ var p=loadPaidPosted(); return !!(p.byItem && p.byItem[itemId]); }catch(e){ return false; } }
+
+// Which approved item does this "paid" message refer to?
+async function resolvePostedItem(msg){
+  var p=loadPaidPosted();
+  if(msg && msg.hasQuotedMsg){
+    try{ var q=await msg.getQuotedMessage(); var qid=q&&(q.id._serialized||q.id.id); if(qid && p.items[qid]) return p.items[qid]; }catch(e){}
+  }
+  if(p.recent && p.recent.length){
+    var top=p.recent[0]; var t=top.at?Date.parse(top.at):0;
+    if(t && (Date.now()-t) <= PAID_POSTED_FRESH_MS) return top;
+  }
+  return null;
+}
+
+// Display name + stable session key for an accountant in the payments group.
+async function resolveAccountant(msg){
+  var author=msg.author||msg.from||'';
+  var who=await identifySender(author);
+  return { key:author, name:(who&&who.contactName)||'' };
+}
+
+function paidModeMenu(){ var L=[]; for(var i=0;i<LEDGER_MODES.length;i++) L.push((i+1)+'. '+LEDGER_MODES[i]); return L.join('   '); }
+function paidTagMenu(){ var L=[]; for(var i=0;i<TAG_QUICK.length;i++) L.push((i+1)+'. '+TAG_QUICK[i]); return L.join('   '); }
+function personForTag(tag){ if(tag==='Directors-SM') return 'SM'; if(tag==='Directors-MM') return 'MM'; return ''; }
+// Human-readable label for the step an in-progress session is sitting on (used by the guard).
+var PAID_STEP_LABEL = { amount:'the amount paid', date:'the date', mode:'the payment mode', head:'the Head', tag:'the Tag', confirm:'confirming the row' };
+function paidRowPreview(row){
+  var a=rowToArray(row);
+  var cols=['Date','Entity','Head','Description','Tag','IN/OUT','Amount','Mode','Person','Bank A/C','Transfer To','Notes'];
+  var L=['*Row to record:*'];
+  for(var i=0;i<cols.length;i++){ var v=a[i]; if(i===6) v='Rs.'+formatINR(parseAmount(v)); L.push(cols[i]+': '+((v===''||v==null)?'—':v)); }
+  return L.join('\n');
+}
+
+// Core step machine. Mutates the passed session, calls in-scope guess helpers.
+// Steps: amount → date → mode → head → tag → confirm. Returns {reply,done,cancelled,recordArgs}.
+async function paidFlowAdvance(session, inputRaw){
+  var input=(inputRaw||'').trim(), low=input.toLowerCase();
+  if(/^(cancel|reset|clear|stop)$/i.test(low)){ return { reply:'Paid entry cancelled. Reply "paid" on an approved item to start again.', done:true, cancelled:true }; }
+
+  if(session.step==='amount'){
+    if(low==='ok'){ session.answers.amount=session.amount; }
+    else { var amt=extractLineAmount(input,false)||parseAmount(input); if(!amt){ return { reply:'Didn\'t catch an amount. Type the actual amount paid, or "ok" to use the approved Rs.'+formatINR(session.amount)+'.' }; } session.answers.amount=amt; }
+    session.step='date';
+    return { reply:'2/5 *Date?* — reply "today" or dd/mm (e.g. 14/06).' };
+  }
+  if(session.step==='date'){
+    session.answers.date = toLedgerDate(/^today$/i.test(low)?'today':input);
+    session.step='mode';
+    return { reply:'3/5 *Mode?* — reply the number:\n'+paidModeMenu() };
+  }
+  if(session.step==='mode'){
+    var mi=parseInt(low,10);
+    if(!(mi>=1 && mi<=LEDGER_MODES.length)){ return { reply:'Pick the mode by number:\n'+paidModeMenu() }; }
+    session.answers.mode=LEDGER_MODES[mi-1];
+    var head=await aiGuessHead(session.description, session.entity);
+    if(!head) head=guessHeadFallback(session.description);
+    session.guessHead=head; session.step='head';
+    return { reply:'4/5 *Head?* — my guess: *'+head+'*. Reply "ok" to accept, or type the correct Head.' };
+  }
+  if(session.step==='head'){
+    session.answers.head = (low==='ok') ? session.guessHead : input;
+    var aiTag = await aiGuessTag(session.description, session.entity);   // validated to LEDGER_TAGS, or null
+    var g = guessTagAndPerson(session.description) || null;              // rule fallback (offline / off-list)
+    var finalTag = aiTag || (g ? g.tag : '');
+    session.guessTag = finalTag;
+    session.guessPerson = personForTag(finalTag) || (g ? (g.person||'') : '');
+    session.step='tag';
+    var lead = session.guessTag ? ('my guess: *'+session.guessTag+'*. Reply "ok" to accept, or pick a number') : 'pick a number';
+    return { reply:'5/5 *Tag?* — '+lead+':\n'+paidTagMenu()+'\n(or type any full tag)' };
+  }
+  if(session.step==='tag'){
+    var tag='';
+    if(low==='ok' && session.guessTag){ tag=session.guessTag; }
+    else {
+      var ti=parseInt(low,10);
+      if(ti>=1 && ti<=TAG_QUICK.length){ tag=TAG_QUICK[ti-1]; }
+      else { for(var i=0;i<LEDGER_TAGS.length;i++){ if(LEDGER_TAGS[i].toLowerCase()===low){ tag=LEDGER_TAGS[i]; break; } } }
+    }
+    if(!tag){ return { reply:'Pick the Tag by number, "ok" for the guess, or type a full tag:\n'+paidTagMenu() }; }
+    session.answers.tag=tag;
+    session.answers.person = personForTag(tag) || session.guessPerson || '';
+    var item={ id:session.itemId, entity:session.entity, bankAc:session.bankAc, description:session.description, label:session.label };
+    session.row = assemblePaymentRow(item, session.answers);
+    session.step='confirm';
+    return { reply: paidRowPreview(session.row)+'\n\nReply *CONFIRM* to record, or *cancel*.' };
+  }
+  if(session.step==='confirm'){
+    if(/^(confirm|yes|ok|y)$/i.test(low)){
+      return { reply:'\u2713 Recorded to the event store.', done:true,
+        recordArgs:{ itemId:session.itemId, label:session.label, paidAmount:session.answers.amount, row:session.row,
+          fields:{ date:session.row.date, mode:session.row.mode, head:session.row.head, tag:session.row.tag, person:session.row.person,
+            transferTo:session.row.transferTo, entity:session.row.entity, bankAc:session.row.bankAc } } };
+    }
+    return { reply:'Reply *CONFIRM* to record this row, or *cancel* to discard.' };
+  }
+  return { reply:'Reply "paid" on an approved item to start.', done:true };
+}
+
+// WhatsApp adapter: gate to the payments group + authorised accountants, manage
+// per-accountant session state, drive paidFlowAdvance, and fire recordPaidEvent.
+async function handlePaidFlow(msg){
+  try{
+    if(!msg || !waReady) return false;
+    if(msg.from !== CONFIG.PAYMENT_OUTFLOW_GROUP_JID) return false;
+    if(msg.fromMe) return false;
+    var who=await resolveAccountant(msg);
+    if(!(await isAuthorisedAccountant(msg.author||msg.from, who.name))) return false;
+    var body=(msg.body||'').trim();
+    if(!body) return false;
+    var send=function(t){ return waClient.sendMessage(CONFIG.PAYMENT_OUTFLOW_GROUP_JID, t); };
+
+    var st=loadPaidState(); prunePaidState(st);
+    var ses=st.sessions[who.key];
+
+    if(!ses){
+      if(!/^paid\b/i.test(body)) return false;          // not in a flow, not a trigger
+      var item=await resolvePostedItem(msg);
+      if(!item){ await send((who.name?who.name+': ':'')+'I don\'t see a posted approved item to mark paid. Reply "paid" on the approved item I post here.'); return true; }
+      ses={ itemId:item.id, label:item.label, amount:item.amount, entity:item.entity, bankAc:item.bankAc,
+        description:item.description||item.label, step:'amount', answers:{},
+        startedAt:new Date().toISOString(), lastAt:new Date().toISOString(), by:who.name };
+      st.sessions[who.key]=ses; savePaidState(st);
+      await send((who.name?who.name+' \u2014 ':'')+'marking *'+ses.label+'* (approved Rs.'+formatINR(ses.amount)+') as paid.\n\n1/5 *Amount paid?* — reply "ok" for Rs.'+formatINR(ses.amount)+', or type the actual amount.');
+      return true;
+    }
+
+    // In-progress guard: a fresh "paid" while a Q&A is already open would otherwise be
+    // fed into the current question (e.g. silently parsed as a date). Intercept it so the
+    // accountant must consciously cancel or finish, rather than corrupt the open entry.
+    if(/^paid\b/i.test(body)){
+      var qlabel = PAID_STEP_LABEL[ses.step] || 'the current question';
+      await send('\u26A0\uFE0F You\u2019re already part-way through marking *'+ses.label+'* as paid (currently on: '+qlabel+').\nReply *cancel* to scrap that and start over, or just answer the question above to finish it.');
+      return true;
+    }
+    var out=await paidFlowAdvance(ses, body);
+    ses.lastAt=new Date().toISOString();
+    var ledgerSuffix='';
+    if(out.recordArgs){
+      try{ recordPaidEvent(out.recordArgs.itemId, out.recordArgs.label, out.recordArgs.paidAmount, out.recordArgs.fields); }
+      catch(e){ console.error('[PaidFlow] recordPaidEvent:', e.message); }
+      // v2.10.0-s4: attempt the ledger write (no-op while capture-only; logs in dry-run)
+      try{
+        var w = await writeRowToLedger(out.recordArgs.row);
+        if(w.written) ledgerSuffix = '\n\u2705 Written to the Ledger ('+(w.plan&&w.plan.a1Range||'appended')+').';
+        else if(w.dryRun) ledgerSuffix = '\n[dry-run] Would write to '+(w.plan&&w.plan.a1Range||'(bottom)')+' \u2014 nothing changed.';
+        else if(w.dup) ledgerSuffix = '\n(Ledger row already exists \u2014 not duplicated.)';
+        else if(w.skipped && w.plan && w.plan.action==='newday-blocked') ledgerSuffix = '\n(Not written to the Ledger: no '+out.recordArgs.row.date+' block yet.)';
+        else ledgerSuffix = '\n(Capture-only \u2014 not written to the Sheet.)';
+      }catch(e){ console.error('[PaidFlow] writeRowToLedger:', e.message); ledgerSuffix='\n(Ledger write errored \u2014 captured only.)'; }
+    }
+    if(out.done) delete st.sessions[who.key];
+    savePaidState(st);
+    if(out.reply) await send(out.reply + ledgerSuffix);
+    return true;
+  }catch(e){ console.error('[PaidFlow]', e.message); return false; }
+}
+
+// ── v2.10.0-s3: THE BRIDGE — approved item → post into the outflow group ─────
+// Toggle-gated (default OFF) like every other side-effecting stage: deploying is a
+// no-op until the toggle is ON, so it can ship before going live.
+// Idempotent: the same expense id is posted at most once (byItem index).
+// v2.10.0-s3.1: the toggle is now a RUNTIME switch flippable from the locked control
+// panel (saved to ./wa_auth/outflow_post.json, read live). The OUTFLOW_POST_ENABLED env
+// var is the boot DEFAULT used only until the dashboard toggle has been set at least once.
+var OUTFLOW_POST_ENABLED = (process.env.OUTFLOW_POST_ENABLED === 'true');
+var OUTFLOW_POST_STATE_FILE = './wa_auth/outflow_post.json';
+function loadOutflowPostEnabled(){
+  try{ if(fs.existsSync(OUTFLOW_POST_STATE_FILE)){ return JSON.parse(fs.readFileSync(OUTFLOW_POST_STATE_FILE,'utf8')).enabled===true; } }catch(e){}
+  return OUTFLOW_POST_ENABLED;   // env-var default until the dashboard toggle overrides it
+}
+function saveOutflowPostEnabled(on){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(OUTFLOW_POST_STATE_FILE, JSON.stringify({enabled:!!on, at:new Date().toISOString()})); }catch(e){ console.error('[Outflow] toggle save:',e.message); } }
+async function postApprovedToOutflow(item, amount){
+  if(!loadOutflowPostEnabled()) return false;       // live toggle gate (panel-controlled)
+  if(!waReady || !waClient || !item || !item.id) return false;
+  if(alreadyPosted(item.id)) return false;          // never double-post
+  try{
+    var entity = item.entity || '';
+    var bankAc = item.bankAc || '';
+    var desc   = item.description || item.label || '';
+    var lines = ['*PAYMENT DUE* \u2014 approved by M+S', '', desc, '*Rs.'+formatINR(amount)+'*'];
+    if(entity) lines.push('Company: '+entity);
+    if(bankAc) lines.push('From: '+bankAc);
+    lines.push('', 'Once paid, reply *paid* on this message to log it.');
+    var sent = await waClient.sendMessage(CONFIG.PAYMENT_OUTFLOW_GROUP_JID, lines.join('\n'));
+    var postedMsgId = (sent && sent.id && (sent.id._serialized || sent.id.id)) || ('post_'+item.id+'_'+Date.now());
+    registerPostedApproved(postedMsgId, { id:item.id, label:desc, amount:amount, entity:entity, bankAc:bankAc, description:desc });
+    console.log('[Outflow] posted approved item', item.id, 'Rs.'+amount, 'as', postedMsgId);
+    return true;
+  }catch(e){ console.error('[Outflow] post:', e.message); return false; }
+}
 
 // v2.8.11: parse any of the bot's own posts into the item(s) it was about.
 // Returns {kind:'digest'|'single', items:[{label,amount}]} or null if not a bot post.
@@ -958,7 +1447,8 @@ async function buildApprovalReminderDigest() {
       var q = e.state==='query' ? ' _(query open)_' : '';
       lines.push('*'+n+'.* '+label(e));
       lines.push('*Rs.'+formatINR(e.approvedAmount||e.amount)+'* _('+age(e)+' ago)_'+q);
-      items.push({n:n, id:e.id, label:label(e), amount:e.approvedAmount||e.amount, sender:e.sender});
+      var ef = parseExpenseFields(e.body||'');
+      items.push({n:n, id:e.id, label:label(e), amount:e.approvedAmount||e.amount, sender:e.sender, entity:ef.entity, bankAc:ef.bankAc, description:ef.description||label(e)});
     });
   }
   section('Needs M approval', 'S already approved', onM);
@@ -973,7 +1463,8 @@ async function buildApprovalReminderDigest() {
       n++;
       lines.push('*'+n+'.* '+label(e));
       lines.push('*Rs.'+formatINR(e.amount)+'* _(held by '+who+', '+age(e)+')_');
-      items.push({n:n, id:e.id, label:label(e), amount:e.approvedAmount||e.amount, sender:e.sender});
+      var efh = parseExpenseFields(e.body||'');
+      items.push({n:n, id:e.id, label:label(e), amount:e.approvedAmount||e.amount, sender:e.sender, entity:efh.entity, bankAc:efh.bankAc, description:efh.description||label(e)});
     });
   }
   lines.push('');
@@ -1154,7 +1645,7 @@ async function handlePromoterVerdicts(msg){
         var amt = item.amount;
         if(mmV.verdict==='amend' && mmV.amount>0) amt = mmV.amount;
         if(smV.verdict==='amend' && smV.amount>0 && (!amt || smV.amount<amt)) amt = smV.amount;
-        nowApproved.push({ label:item.label, amount:amt });
+        nowApproved.push({ label:item.label, amount:amt, item:item });
         recordApprovedEvent(item.id, item.label, amt);
       }
     });
@@ -1162,6 +1653,11 @@ async function handlePromoterVerdicts(msg){
     if(nowApproved.length){
       var conf = nowApproved.map(function(a){ return '✓ Approved (M+S): '+a.label+' Rs.'+formatINR(a.amount); });
       await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, conf.join('\n'));
+      // v2.10.0-s3: bridge each newly-approved item into the outflow group (toggle-gated, idempotent)
+      for(var qi=0; qi<nowApproved.length; qi++){
+        try{ await postApprovedToOutflow(nowApproved[qi].item, nowApproved[qi].amount); }
+        catch(e){ console.error('[Outflow] bridge:', e.message); }
+      }
     }
     console.log('[Verdicts]', who, 'recorded', verdicts.length, 'item(s);', nowApproved.length, 'now fully approved');
     return true;
@@ -3422,7 +3918,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.9.1',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s1',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -3589,7 +4085,13 @@ var TABS = [
     {ep:'/api/silent-status', ico:'\\u2139', label:'Silent mode status'},
     {ep:'/api/silent-on', ico:'\\uD83D\\uDD07', label:'Silent mode ON', act:true, confirm:'Turn on silent mode (bot stops scanning/posting)?'},
     {ep:'/api/silent-off', ico:'\\uD83D\\uDD0A', label:'Silent mode OFF', act:true, confirm:'Turn off silent mode?'},
-    {ep:'/api/unapproved-alert-toggle', ico:'\\uD83D\\uDD14', label:'Toggle unapproved alert', act:true, confirm:'Toggle the unapproved-alert setting?'}
+    {ep:'/api/unapproved-alert-toggle', ico:'\\uD83D\\uDD14', label:'Toggle unapproved alert', act:true, confirm:'Toggle the unapproved-alert setting?'},
+    {ep:'/api/outflow-post-status', ico:'\\u2139', label:'Outflow posting status'},
+    {ep:'/api/outflow-post-on', ico:'\\uD83D\\uDE80', label:'Outflow posting ON (go live)', act:true, confirm:'Start auto-posting approved items into the payments group for accountants to mark paid? (Still capture-only — no Sheet write.)'},
+    {ep:'/api/outflow-post-off', ico:'\\u23F9', label:'Outflow posting OFF', act:true, confirm:'Stop posting approved items to the payments group?'},
+    {ep:'/api/ledger-write-status', ico:'\\uD83D\\uDCD2', label:'Ledger write status'},
+    {ep:'/api/ledger-dryrun-on', ico:'\\uD83E\\uDDEA', label:'Ledger dry-run ON (rehearsal)', act:true, confirm:'Turn ledger dry-run ON? The bot will log the row it would write but write nothing — this also pauses any real writes.'},
+    {ep:'/api/ledger-dryrun-off', ico:'\\u270D', label:'Ledger dry-run OFF', act:true, confirm:'Turn ledger dry-run OFF? If LEDGER_WRITE_ENABLED is on, confirmed rows will then be written to the actual Sheet.'}
   ]},
   {id:'debug', label:'Debug', items:[
     {ep:'/api/wa-status', ico:'\\uD83D\\uDCF1', label:'WhatsApp status'},
@@ -4011,6 +4513,12 @@ app.get('/api/reconciliation',async function(req,res){
 app.get('/api/silent-on',function(req,res){try{saveSilentMode(true);res.json({success:true,silentMode:true,message:'Silent mode ON. Bot will stop group reminders and DM the observer ('+SILENT_OBSERVER+') with daily summaries.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/silent-off',function(req,res){try{saveSilentMode(false);res.json({success:true,silentMode:false,message:'Silent mode OFF. Bot will resume group reminders and post evening report to Day Book group.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/silent-status',function(req,res){try{res.json({silentMode:loadSilentMode(),observer:SILENT_OBSERVER});}catch(e){res.json({error:e.message});}});
+app.get('/api/outflow-post-on',function(req,res){try{saveOutflowPostEnabled(true);res.json({success:true,outflowPosting:true,message:'Outflow posting ON. Newly approved items will auto-post to the payments group for the accountants to mark paid. (Still capture-only — no Sheet write.)'});}catch(e){res.json({error:e.message});}});
+app.get('/api/outflow-post-off',function(req,res){try{saveOutflowPostEnabled(false);res.json({success:true,outflowPosting:false,message:'Outflow posting OFF. Approved items will no longer be posted to the payments group.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/outflow-post-status',function(req,res){try{res.json({outflowPosting:loadOutflowPostEnabled(),envDefault:OUTFLOW_POST_ENABLED,note:'Panel toggle overrides the OUTFLOW_POST_ENABLED env default once set.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/ledger-dryrun-on',function(req,res){try{saveLedgerDryrun(true);res.json({success:true,dryRun:true,message:'Ledger dry-run ON. The bot computes the exact row+target it would write and logs it, but writes nothing — even if LEDGER_WRITE_ENABLED is on. Safe rehearsal / runtime pause.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/ledger-dryrun-off',function(req,res){try{saveLedgerDryrun(false);res.json({success:true,dryRun:false,message:'Ledger dry-run OFF. If LEDGER_WRITE_ENABLED is on, confirmed rows will now actually be written to the Sheet; if it is off, the bot stays capture-only.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/ledger-write-status',function(req,res){try{var dry=loadLedgerDryrun();var live=LEDGER_WRITE_ENABLED;var posture=dry?'DRY-RUN (rehearsal — nothing written)':(live?'LIVE (rows are written to the Sheet)':'CAPTURE-ONLY (no write)');res.json({posture:posture,dryRun:dry,writeEnabled:live,sheetScope:(live?'read/write':'read-only'),newDayBlocks:NEWDAY_BLOCK_CREATE_ENABLED,note:'Dry-run wins over write-enabled. LEDGER_WRITE_ENABLED is env+redeploy (it sets the OAuth scope); dry-run is a live panel toggle.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-scan',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await scanStalePendings();res.json({success:true,remindersSent:count});}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-state',function(req,res){try{res.json(loadStaleState());}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-reset',function(req,res){try{saveStaleState({reminded:{}});res.json({success:true,message:'Stale reminder state cleared - next scan will re-send any 30+ min pending items'});}catch(e){res.json({error:e.message});}});
@@ -4095,7 +4603,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.9.1 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.10.0-s4.1 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
