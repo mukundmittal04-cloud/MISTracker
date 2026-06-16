@@ -3359,7 +3359,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.19',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT,panelUserSet:!!(process.env.PANEL_USER&&process.env.PANEL_USER.length>0),panelUserLen:(process.env.PANEL_USER||'').length,panelPasswordSet:!!(process.env.PANEL_PASSWORD&&process.env.PANEL_PASSWORD.length>0),panelPasswordLen:(process.env.PANEL_PASSWORD||'').length,lockArmed:!!((process.env.PANEL_USER||'').length>0&&(process.env.PANEL_PASSWORD||'').length>0)});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.19',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -3391,7 +3391,7 @@ function authGate(req, res, next) {
   // fail closed if not configured
   if (!EU || !EP) {
     res.set('WWW-Authenticate', 'Basic realm="Fidato MIS", charset="UTF-8"');
-    return res.status(503).json({ error: 'Auth not configured on server.', _seen: { userLen: EU.length, passLen: EP.length } });
+    return res.status(503).json({ error: 'Auth not configured on server.' });
   }
   var hdr = req.headers.authorization || '';
   var m = /^Basic\s+(.+)$/i.exec(hdr);
@@ -3604,21 +3604,104 @@ function confirmModal(){
   if(ep) run(ep);
 }
 
+var lastRaw = null;
 function run(ep){
   var out = el('out');
   out.classList.add('show');
   out.innerHTML = '<span class="lbl">'+ep+'</span><span class="spin"></span> running…';
   fetch(ep, {credentials:'same-origin'})
-    .then(function(r){ return r.text().then(function(tx){ return {ok:r.ok, status:r.status, tx:tx}; }); })
+    .then(function(r){ return r.text().then(function(tx){ return {ok:r.ok, status:r.status, tx:tx, ct:r.headers.get('content-type')||''}; }); })
     .then(function(res){
-      var body = res.tx;
-      try { body = JSON.stringify(JSON.parse(res.tx), null, 2); } catch(e){}
-      out.innerHTML = '<span class="lbl">'+ep+'  \\u2192  HTTP '+res.status+'</span>'+escapeHtml(body);
+      var data = null;
+      try { data = JSON.parse(res.tx); } catch(e){}
+      lastRaw = res.tx;
+      var head = '<span class="lbl">'+ep+'  \\u2192  HTTP '+res.status+'  <a href="#" onclick="showRaw(event)" style="color:#9ab;float:right;">raw</a></span>';
+      if(data && typeof data === 'object'){
+        out.innerHTML = head + '<div id="pretty">'+formatResult(ep, data)+'</div>';
+      } else {
+        // HTML or non-JSON (e.g. report previews) — offer to open in a tab
+        out.innerHTML = head + '<div style="color:#bcc;">This endpoint returned a page, not data. <a href="'+ep+'" target="_blank" style="color:#7fa7ff;">Open it in a new tab</a>.</div>';
+      }
     })
     .catch(function(err){
       out.innerHTML = '<span class="lbl">'+ep+'</span>Error: '+escapeHtml(String(err));
     });
 }
+function showRaw(e){ e.preventDefault(); var p=document.getElementById('pretty'); if(p){ p.outerHTML='<pre id="pretty" style="margin:0;white-space:pre-wrap;">'+escapeHtml(JSON.stringify(JSON.parse(lastRaw),null,2))+'</pre>'; } }
+
+function fmtMoney(n){ if(n==null||isNaN(n)) return ''; return '\\u20B9'+Number(n).toLocaleString('en-IN'); }
+function row(cells, isHead){ var tag=isHead?'th':'td'; var st=isHead?'text-align:left;color:#9ab;font-weight:600;border-bottom:1px solid #2a2f3a;':'border-bottom:1px solid #1c2129;'; return '<tr>'+cells.map(function(c){return '<'+tag+' style="padding:5px 10px 5px 0;'+st+'">'+c+'</'+tag+'>';}).join('')+'</tr>'; }
+function table(rows){ return '<table style="width:100%;border-collapse:collapse;font-size:12px;">'+rows.join('')+'</table>'; }
+
+function formatResult(ep, d){
+  if(d.error){ return '<div style="color:#ff9b9b;">Error: '+escapeHtml(String(d.error))+'</div>'; }
+
+  // approval audit
+  if(ep.indexOf('/api/approval-audit')===0 && d.summary){
+    var s=d.summary, h='';
+    h += '<div style="margin-bottom:10px;">'+
+         pill('Approved', s.fullyApproved, '#1f9d55') + pill('Partial', s.partialApproval, '#9a6b00') +
+         pill('Pending', s.noApproval, '#b3261e') + pill('On hold', s.onHold, '#6b7080') +
+         pill('Rejected', s.rejected, '#6b7080') + ' <span style="color:#8893a5;">of '+s.totalExpenseRequests+' total · '+s.period+'</span></div>';
+    function section(title, arr, color){
+      if(!arr || !arr.length) return '';
+      var rows=[row(['Date','Vendor / details','Amount','M','S'],true)];
+      arr.forEach(function(e){
+        var who=e.message? escapeHtml(e.vendor||e.message.slice(0,48)) : '';
+        rows.push(row([e.date||'', who, e.amountFormatted||fmtMoney(e.amount), tick(e.mm), tick(e.sm)]));
+      });
+      return '<div style="margin:10px 0 4px;color:'+color+';font-weight:600;">'+title+' ('+arr.length+')</div>'+table(rows);
+    }
+    h += section('Pending', d.noApproval, '#ff9b9b');
+    h += section('Partial', d.partialApproval, '#e0b057');
+    h += section('Fully approved', d.fullyApproved, '#7fdca4');
+    if(d.onHold&&d.onHold.length) h += section('On hold', d.onHold, '#9aa4b5');
+    if(d.rejected&&d.rejected.length) h += section('Rejected', d.rejected, '#9aa4b5');
+    return h;
+  }
+
+  // reconciliation
+  if(ep.indexOf('/api/reconciliation')===0){
+    var rows=[];
+    Object.keys(d).forEach(function(k){
+      var v=d[k];
+      if(Array.isArray(v)){ rows.push(row([escapeHtml(k), v.length+' items']));}
+      else if(typeof v==='object' && v){ rows.push(row([escapeHtml(k), escapeHtml(JSON.stringify(v))]));}
+      else { rows.push(row([escapeHtml(k), escapeHtml(String(v))])); }
+    });
+    return table([row(['Field','Value'],true)].concat(rows));
+  }
+
+  // fund position
+  if(ep.indexOf('/api/fund-position')===0 && d.accounts){
+    var rows=[row(['Account','Balance'],true)];
+    (Array.isArray(d.accounts)?d.accounts:Object.keys(d.accounts).map(function(k){return{name:k,balance:d.accounts[k]};})).forEach(function(a){
+      rows.push(row([escapeHtml(a.name||a.account||''), fmtMoney(a.balance!=null?a.balance:a.amount)]));
+    });
+    return table(rows);
+  }
+
+  // ledger
+  if(ep.indexOf('/api/ledger')===0 && d.entries){
+    var hdr = '<div style="margin-bottom:8px;">'+pill('In', fmtMoney(d.totalIn), '#1f9d55')+pill('Out', fmtMoney(d.totalOut), '#b3261e')+pill('Net', fmtMoney(d.net), '#2456b3')+' <span style="color:#8893a5;">'+(d.count||0)+' entries · '+(d.date||'')+'</span></div>';
+    var rows=[row(['Entity','Description','In/Out','Amount'],true)];
+    d.entries.slice(0,100).forEach(function(e){
+      rows.push(row([escapeHtml(e.entity||''), escapeHtml((e.description||'').slice(0,50)), e.inOut||'', fmtMoney(e.amount)]));
+    });
+    return hdr+table(rows);
+  }
+
+  // generic object → key/value table
+  var rows=[row(['Field','Value'],true)];
+  Object.keys(d).forEach(function(k){
+    var v=d[k];
+    var disp = (v==null)?'' : (typeof v==='object' ? (Array.isArray(v)? v.length+' items' : escapeHtml(JSON.stringify(v).slice(0,120))) : escapeHtml(String(v)));
+    rows.push(row([escapeHtml(k), disp]));
+  });
+  return table(rows);
+}
+function pill(label, val, color){ return '<span style="display:inline-block;background:'+color+'22;color:'+color+';border-radius:6px;padding:2px 9px;margin-right:6px;font-size:12px;">'+label+': <b>'+(val!=null?val:'\\u2014')+'</b></span>'; }
+function tick(v){ if(v===true||v==='approved'||v==='yes') return '<span style="color:#7fdca4;">\\u2713</span>'; if(v===false||v==null||v==='') return '<span style="color:#6b7080;">\\u2014</span>'; return '<span style="color:#e0b057;">'+escapeHtml(String(v))+'</span>'; }
 function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 // load header status + stat cards from /health (open) and approval-audit
@@ -3630,9 +3713,10 @@ function loadStatus(){
   }).catch(function(){});
   fetch('/api/approval-audit?days=3',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null;}).then(function(a){
     if(!a) return;
-    var pending = a.noApproval!=null ? a.noApproval : (a.pending||0);
-    var approved = a.fullyApproved!=null ? a.fullyApproved : (a.approved||0);
-    var total = a.totalExpenseRequests!=null ? a.totalExpenseRequests : (a.total||0);
+    var s = a.summary || {};
+    var pending = s.noApproval!=null ? s.noApproval : 0;
+    var approved = s.fullyApproved!=null ? s.fullyApproved : 0;
+    var total = s.totalExpenseRequests!=null ? s.totalExpenseRequests : 0;
     el('cards').innerHTML =
       card('Pending approval', pending) +
       card('Fully approved', approved) +
