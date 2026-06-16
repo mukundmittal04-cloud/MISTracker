@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.9.0 — persist-on-event capture (Railway volume, append-only, additive): records verdict/approved/paid events as they happen, runs in parallel with chat-history audit for validation. Base: v2.8.19 control panel.
+// FIDATO MIS SERVER v2.9.1 — adds /api/event-store-diff: read-only comparison of chat-history audit vs event store (distinguishes pre-existing backlog from genuine new mismatches). Base: v2.9.0 persist-on-event capture.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -3422,7 +3422,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.9.0',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.9.1',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -3801,6 +3801,58 @@ app.get('/api/pair',function(req,res){
 });
 app.get('/api/wa-status',function(req,res){res.json({connected:waReady});});
 app.get('/api/event-store',function(req,res){try{var s=loadEventStore();var limit=parseInt(req.query.limit)||200;var evs=s.events.slice(-limit).reverse();var counts={verdict:0,approved:0,paid:0};s.events.forEach(function(e){if(counts[e.type]!=null)counts[e.type]++;});res.json({version:s.version,createdAt:s.createdAt,totalEvents:s.events.length,counts:counts,showing:evs.length,events:evs});}catch(e){res.json({error:e.message});}});
+app.get('/api/event-store-diff',async function(req,res){
+  try{
+    var days=parseInt(req.query.days)||15;
+    var audit=await buildApprovalAudit(days);
+    var store=loadEventStore();
+    var storeCreated=store.createdAt||null;
+    // index the store's approved events by itemId
+    var storeApproved={};
+    store.events.forEach(function(ev){ if(ev.type==='approved' && ev.itemId){ storeApproved[ev.itemId]=ev; } });
+    // audit's fully-approved items
+    var auditApproved=(audit.fullyApproved||[]).map(function(e){
+      return { id:e.id, label:(e.vendor||e.label||(e.body?e.body.substring(0,60):'')||'').toString().slice(0,80), amount:e.amount, date:e.date?e.date.toISOString():null };
+    });
+    var matched=[], auditOnly=[], storeOnly=[];
+    var seen={};
+    auditApproved.forEach(function(a){
+      seen[a.id]=true;
+      if(storeApproved[a.id]){
+        matched.push({ id:a.id, label:a.label, amount:a.amount });
+      }else{
+        // approval the chat-history audit sees but the event store missed.
+        // pre-existing = its approval likely happened before the store was created.
+        var pre = storeCreated && a.date && (new Date(a.date) < new Date(storeCreated));
+        auditOnly.push({ id:a.id, label:a.label, amount:a.amount, date:a.date, preExisting: !!pre });
+      }
+    });
+    // events the store has but the audit doesn't currently classify as approved (would be an anomaly)
+    Object.keys(storeApproved).forEach(function(id){
+      if(!seen[id]){ var ev=storeApproved[id]; storeOnly.push({ id:id, label:ev.label, amount:ev.amount, at:ev.at }); }
+    });
+    var preCount=auditOnly.filter(function(x){return x.preExisting;}).length;
+    var newMismatch=auditOnly.filter(function(x){return !x.preExisting;});
+    res.json({
+      storeCreatedAt: storeCreated,
+      auditWindowDays: days,
+      summary: {
+        auditFullyApproved: auditApproved.length,
+        storeApprovedEvents: Object.keys(storeApproved).length,
+        matched: matched.length,
+        auditOnly_total: auditOnly.length,
+        auditOnly_preExistingBacklog: preCount,
+        auditOnly_newMismatch: newMismatch.length,
+        storeOnly_anomalies: storeOnly.length
+      },
+      note: "matched = in both (good). auditOnly_preExistingBacklog = approved before the store existed (expected, ignore). auditOnly_newMismatch = NEW approvals the store should have caught but didn't (investigate). storeOnly = store has it, audit doesn't (investigate).",
+      matched: matched,
+      newMismatch: newMismatch,
+      preExistingBacklog: auditOnly.filter(function(x){return x.preExisting;}),
+      storeOnlyAnomalies: storeOnly
+    });
+  }catch(e){ res.json({error:e.message}); }
+});
 app.get('/api/groups',async function(req,res){if(!waReady)return res.json({error:'Not connected'});try{var chats=await waClient.getChats();res.json({groups:chats.filter(function(c){return c.isGroup;}).map(function(c){return{name:c.name,jid:c.id._serialized};})});}catch(e){res.json({error:e.message});}});
 app.get('/api/bot/on',function(req,res){CONFIG.BOT_ENABLED=true;res.json({botEnabled:true});});
 app.get('/api/bot/off',function(req,res){CONFIG.BOT_ENABLED=false;res.json({botEnabled:false});});
@@ -4043,7 +4095,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.9.0 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.9.1 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
