@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.10.0-s5 — backfill: list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
+// FIDATO MIS SERVER v2.10.0-s5.1 — backfill now sourced from approval history/reconciliation (awaitingPayment), NOT the event store, so the real backlog shows up and Company/From are recovered from the request body. list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -1274,47 +1274,51 @@ async function postApprovedToOutflow(item, amount, force){
   }catch(e){ console.error('[Outflow] post:', e.message); return false; }
 }
 
-// ── v2.10.0-s5: backfill — list approved items + manually push / catch-up sweep ──
-// Source of truth is the event store's 'approved' events, joined with what's already
-// been posted (paid_posted.byItem) and paid (paid events). NOTE: approved events store
-// only label+amount, so backfilled posts have blank Company/From — the accountant fills
-// those when marking paid.
-function listApprovedForOutflow(){
-  var store = loadEventStore();
-  var pp = loadPaidPosted();
-  var paidIds = {}, approved = {};
-  (store.events||[]).forEach(function(e){
-    if(e.type==='paid') paidIds[e.itemId]=true;
-    if(e.type==='approved') approved[e.itemId] = { itemId:e.itemId, label:e.label, amount:e.amount, approvedAt:e.at };
+// ── v2.10.0-s5.1: backfill — sourced from the APPROVAL AUDIT / reconciliation ──
+// The event store only holds approvals captured live since its code shipped (and it
+// resets if the volume is wiped), so it is NOT the backlog. The real "approved and
+// not yet paid" list is buildReconciliation().awaitingPayment — approved items with no
+// matching Ledger payment. Each carries its original request body, so we recover
+// Company/From too. Joined with paid_posted.byItem for posted-status.
+function mapAwaitingToQueue(awaiting, pp){            // pure: testable offline
+  var list = (awaiting||[]).map(function(e){
+    var ef = parseExpenseFields(e.body||'');
+    var posted = !!(pp && pp.byItem && pp.byItem[e.id]);
+    return {
+      itemId: e.id,
+      label: ef.description || e.vendor || (e.body||'').replace(/\n/g,' ').substring(0,60) || e.id,
+      amount: e.approvedAmount || e.amount,
+      approvedAt: e.date ? (e.date.toISOString ? e.date.toISOString() : String(e.date)) : null,
+      entity: ef.entity || '',
+      bankAc: ef.bankAc || '',
+      posted: posted,
+      paid: false,                                    // awaitingPayment excludes paid-in-Ledger items
+      status: posted ? 'posted' : 'pending'
+    };
   });
-  var list = [];
-  for(var id in approved){ if(!Object.prototype.hasOwnProperty.call(approved,id)) continue;
-    var a = approved[id];
-    var posted = !!(pp.byItem && pp.byItem[id]);
-    var paid = !!paidIds[id];
-    list.push({ itemId:id, label:a.label, amount:a.amount, approvedAt:a.approvedAt,
-      posted:posted, paid:paid, status: paid?'paid':(posted?'posted':'pending') });
-  }
   list.sort(function(x,y){ return (Date.parse(y.approvedAt)||0)-(Date.parse(x.approvedAt)||0); });
   return list;
 }
+async function listApprovedForOutflow(days){
+  var rec = await buildReconciliation(days || 30);
+  return mapAwaitingToQueue(rec.awaitingPayment, loadPaidPosted());
+}
 // Manually push one approved item (admin action; bypasses the auto toggle, still dedupes).
 async function pushOneApprovedToOutflow(itemId){
-  var list = listApprovedForOutflow(), a=null;
+  var list = await listApprovedForOutflow(), a=null;
   for(var i=0;i<list.length;i++){ if(list[i].itemId===itemId){ a=list[i]; break; } }
-  if(!a) return { error:'no approved item with id '+itemId };
-  if(a.paid)   return { skipped:true, reason:'already paid', itemId:itemId };
+  if(!a) return { error:'no awaiting-payment item with id '+itemId+' (it may already be paid in the Ledger)' };
   if(a.posted) return { skipped:true, reason:'already posted', itemId:itemId };
-  var ok = await postApprovedToOutflow({ id:a.itemId, label:a.label, amount:a.amount, entity:'', bankAc:'', description:a.label }, a.amount, true);
+  var ok = await postApprovedToOutflow({ id:a.itemId, label:a.label, amount:a.amount, entity:a.entity, bankAc:a.bankAc, description:a.label }, a.amount, true);
   return ok ? { pushed:true, itemId:itemId, label:a.label, amount:a.amount } : { error:'post failed (WhatsApp not connected?)', itemId:itemId };
 }
-// One-time catch-up: push every approved item that hasn't been posted or paid.
+// One-time catch-up: push every awaiting-payment item not already posted.
 async function catchUpApprovedToOutflow(){
-  var list = listApprovedForOutflow(), pushed=[], skipped=[];
+  var list = await listApprovedForOutflow(), pushed=[], skipped=[];
   for(var i=0;i<list.length;i++){
     var a=list[i];
-    if(a.posted || a.paid){ skipped.push({ itemId:a.itemId, reason:a.status }); continue; }
-    var ok = await postApprovedToOutflow({ id:a.itemId, label:a.label, amount:a.amount, entity:'', bankAc:'', description:a.label }, a.amount, true);
+    if(a.posted){ skipped.push({ itemId:a.itemId, reason:'posted' }); continue; }
+    var ok = await postApprovedToOutflow({ id:a.itemId, label:a.label, amount:a.amount, entity:a.entity, bankAc:a.bankAc, description:a.label }, a.amount, true);
     if(ok) pushed.push({ itemId:a.itemId, label:a.label, amount:a.amount });
     else skipped.push({ itemId:a.itemId, reason:'post failed' });
   }
@@ -3965,7 +3969,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.1',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -4367,7 +4371,7 @@ var OUTFLOW_QUEUE_HTML = `<!DOCTYPE html>
 </style></head>
 <body>
   <h1>Approved → Payments queue</h1>
-  <div class="sub">Items approved by M+S. Push one into the payments group, or run a one-time catch-up for everything not yet posted. (Backfilled posts carry the description + amount; Company/From are filled when the accountant marks them paid.)</div>
+  <div class="sub">Items approved by M+S that have no matching Ledger payment yet (sourced from your approval history, not the event store). Push one into the payments group, or run a one-time catch-up for everything not yet posted. Anything already paid in the Ledger is excluded automatically.</div>
   <div class="bar">
     <button class="all" id="allBtn" onclick="catchUp()">Push all pending (catch-up)</button>
     <button onclick="load()">Refresh</button>
@@ -4634,7 +4638,7 @@ app.get('/api/outflow-post-status',function(req,res){try{res.json({outflowPostin
 app.get('/api/ledger-dryrun-on',function(req,res){try{saveLedgerDryrun(true);res.json({success:true,dryRun:true,message:'Ledger dry-run ON. The bot computes the exact row+target it would write and logs it, but writes nothing — even if LEDGER_WRITE_ENABLED is on. Safe rehearsal / runtime pause.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/ledger-dryrun-off',function(req,res){try{saveLedgerDryrun(false);res.json({success:true,dryRun:false,message:'Ledger dry-run OFF. If LEDGER_WRITE_ENABLED is on, confirmed rows will now actually be written to the Sheet; if it is off, the bot stays capture-only.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/ledger-write-status',function(req,res){try{var dry=loadLedgerDryrun();var live=LEDGER_WRITE_ENABLED;var posture=dry?'DRY-RUN (rehearsal — nothing written)':(live?'LIVE (rows are written to the Sheet)':'CAPTURE-ONLY (no write)');res.json({posture:posture,dryRun:dry,writeEnabled:live,sheetScope:(live?'read/write':'read-only'),newDayBlocks:NEWDAY_BLOCK_CREATE_ENABLED,note:'Dry-run wins over write-enabled. LEDGER_WRITE_ENABLED is env+redeploy (it sets the OAuth scope); dry-run is a live panel toggle.'});}catch(e){res.json({error:e.message});}});
-app.get('/api/outflow-pending',function(req,res){try{res.json({items:listApprovedForOutflow()});}catch(e){res.json({error:e.message});}});
+app.get('/api/outflow-pending',async function(req,res){try{var days=parseInt(req.query.days)||30;res.json({items:await listApprovedForOutflow(days)});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-push',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var id=req.query.id;if(!id)return res.json({error:'missing id'});res.json(await pushOneApprovedToOutflow(id));}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-catchup',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});res.json(await catchUpApprovedToOutflow());}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-queue',function(req,res){res.type('html').send(OUTFLOW_QUEUE_HTML);});
@@ -4722,7 +4726,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.10.0-s5 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.10.0-s5.1 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
