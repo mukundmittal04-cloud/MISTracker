@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.8.18 — endpoint lock: HTTP Basic Auth on all /api/* (/health open), fail-closed if unset, per-IP rate limiting. Base: v2.8.17 (echo-on-full-approval + intake gate).
+// FIDATO MIS SERVER v2.8.19 — master control panel at /api/panel (tabs+buttons behind Basic Auth lock). Base: v2.8.18 endpoint lock.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -3359,7 +3359,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.18d',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT,panelUserSet:!!(process.env.PANEL_USER&&process.env.PANEL_USER.length>0),panelUserLen:(process.env.PANEL_USER||'').length,panelPasswordSet:!!(process.env.PANEL_PASSWORD&&process.env.PANEL_PASSWORD.length>0),panelPasswordLen:(process.env.PANEL_PASSWORD||'').length,lockArmed:!!((process.env.PANEL_USER||'').length>0&&(process.env.PANEL_PASSWORD||'').length>0)});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.8.19',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT,panelUserSet:!!(process.env.PANEL_USER&&process.env.PANEL_USER.length>0),panelUserLen:(process.env.PANEL_USER||'').length,panelPasswordSet:!!(process.env.PANEL_PASSWORD&&process.env.PANEL_PASSWORD.length>0),panelPasswordLen:(process.env.PANEL_PASSWORD||'').length,lockArmed:!!((process.env.PANEL_USER||'').length>0&&(process.env.PANEL_PASSWORD||'').length>0)});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -3385,10 +3385,13 @@ function authGate(req, res, next) {
     res.set('Retry-After', String(secs));
     return res.status(429).json({ error: 'Too many failed attempts. Locked for ' + secs + 's.' });
   }
+  // read live from process.env at request time (matches /health which works)
+  var EU = process.env.PANEL_USER || '';
+  var EP = process.env.PANEL_PASSWORD || '';
   // fail closed if not configured
-  if (!PANEL_USER || !PANEL_PASSWORD) {
+  if (!EU || !EP) {
     res.set('WWW-Authenticate', 'Basic realm="Fidato MIS", charset="UTF-8"');
-    return res.status(503).json({ error: 'Auth not configured on server.' });
+    return res.status(503).json({ error: 'Auth not configured on server.', _seen: { userLen: EU.length, passLen: EP.length } });
   }
   var hdr = req.headers.authorization || '';
   var m = /^Basic\s+(.+)$/i.exec(hdr);
@@ -3398,8 +3401,8 @@ function authGate(req, res, next) {
     var idx = decoded.indexOf(':');
     var u = idx >= 0 ? decoded.slice(0, idx) : '';
     var p = idx >= 0 ? decoded.slice(idx + 1) : '';
-    var okU = _safeEq(u, PANEL_USER);
-    var okP = _safeEq(p, PANEL_PASSWORD);
+    var okU = _safeEq(u, EU);
+    var okP = _safeEq(p, EP);
     if (okU && okP) {
       if (_authFails[ip]) delete _authFails[ip]; // clear on success
       return next();
@@ -3415,6 +3418,235 @@ function authGate(req, res, next) {
 }
 // gate everything below this line (all /api/*). /health is registered ABOVE and stays open.
 app.use('/api', authGate);
+
+// ── v2.8.19 master control panel (served at /api/panel, behind the lock) ──────
+var PANEL_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Fidato MIS — Control Panel</title>
+<style>
+  :root{
+    --navy:#191C3C; --terra:#9F5355; --bg:#f4f5f7; --card:#ffffff;
+    --line:#e3e5ea; --ink:#1d2030; --muted:#6b7080; --ok:#1f9d55; --okbg:#e8f6ee;
+    --warn:#9a6b00; --warnbg:#fbf3e0; --danger:#b3261e; --dangerbg:#fbeae9; --info:#2456b3; --infobg:#e9f0fb;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--ink);}
+  header{background:var(--navy);color:#fff;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;}
+  header .l{display:flex;align-items:center;gap:10px;}
+  header .dot{width:9px;height:9px;border-radius:50%;background:#7fdca4;display:inline-block;}
+  header h1{font-size:15px;font-weight:600;margin:0;}
+  header .sub{font-size:12px;opacity:.7;margin:0;}
+  .wrap{max-width:880px;margin:0 auto;padding:18px;}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:16px;}
+  .tab{font-size:13px;padding:7px 13px;border-radius:8px;cursor:pointer;color:var(--muted);border:1px solid transparent;user-select:none;background:none;}
+  .tab:hover{background:#eceef2;}
+  .tab.active{background:var(--infobg);color:var(--info);font-weight:600;}
+  .tab.dz.active{background:var(--dangerbg);color:var(--danger);}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;}
+  .card .k{font-size:12px;color:var(--muted);margin:0 0 5px;}
+  .card .v{font-size:20px;font-weight:600;margin:0;}
+  .btn{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:12px 14px;font-size:14px;background:var(--card);border:1px solid var(--line);border-radius:9px;cursor:pointer;color:var(--ink);margin-bottom:9px;transition:background .12s;}
+  .btn:hover{background:#f0f2f6;}
+  .btn .ico{font-size:16px;width:20px;text-align:center;}
+  .btn.dz{color:var(--danger);border-color:#ecc7c5;}
+  .btn.act{color:var(--info);}
+  .note{font-size:12px;color:var(--muted);margin:8px 2px 18px;line-height:1.6;}
+  .out{background:#0f1117;color:#d7dbe6;border-radius:9px;padding:14px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;margin-top:6px;display:none;}
+  .out.show{display:block;}
+  .out .lbl{color:#7fa7ff;display:block;margin-bottom:6px;}
+  .modal{position:fixed;inset:0;background:rgba(10,12,20,.45);display:none;align-items:center;justify-content:center;padding:20px;z-index:50;}
+  .modal.show{display:flex;}
+  .modal .box{background:#fff;border-radius:12px;max-width:380px;width:100%;padding:20px;}
+  .modal h3{margin:0 0 8px;font-size:16px;}
+  .modal p{margin:0 0 16px;font-size:13px;color:var(--muted);line-height:1.6;}
+  .modal .row{display:flex;gap:8px;justify-content:flex-end;}
+  .modal button{font-size:13px;padding:8px 16px;border-radius:8px;border:1px solid var(--line);background:#fff;cursor:pointer;}
+  .modal button.go{background:var(--danger);color:#fff;border-color:var(--danger);}
+  .modal button.goact{background:var(--info);color:#fff;border-color:var(--info);}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid #ccd;border-top-color:var(--info);border-radius:50%;animation:sp .7s linear infinite;vertical-align:middle;}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <div class="l">
+    <span class="dot" id="hdot"></span>
+    <div><h1>Fidato MIS — Control Panel</h1><p class="sub" id="hsub">loading…</p></div>
+  </div>
+  <div style="font-size:12px;opacity:.8;">v<span id="hver">—</span></div>
+</header>
+<div class="wrap">
+  <div class="tabs" id="tabs"></div>
+  <div class="cards" id="cards"></div>
+  <div id="buttons"></div>
+  <div class="out" id="out"></div>
+</div>
+
+<div class="modal" id="modal">
+  <div class="box">
+    <h3 id="mTitle">Are you sure?</h3>
+    <p id="mBody"></p>
+    <div class="row">
+      <button onclick="closeModal()">Cancel</button>
+      <button id="mGo" class="goact" onclick="confirmModal()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- endpoint catalogue ----
+var TABS = [
+  {id:'approvals', label:'Approvals', items:[
+    {ep:'/api/approval-audit?days=3', ico:'\\uD83D\\uDC41', label:'View pending & recent approvals'},
+    {ep:'/api/reminder-digest-preview', ico:'\\uD83D\\uDD14', label:'Preview the digest (no send)'},
+    {ep:'/api/reminder-digest-send', ico:'\\uD83D\\uDCE4', label:'Send digest to approval group', act:true, confirm:'This posts the approval digest to your WhatsApp approval group.'},
+    {ep:'/api/send-reminders', ico:'\\u23F0', label:'Send reminders now', act:true, confirm:'This sends reminder messages on WhatsApp.'}
+  ]},
+  {id:'reports', label:'Reports', items:[
+    {ep:'/api/eod-preview', ico:'\\uD83D\\uDCC4', label:'Preview tonight\\u2019s EOD report'},
+    {ep:'/api/eod-image', ico:'\\uD83D\\uDDBC', label:'EOD as an image'},
+    {ep:'/api/eod-send', ico:'\\uD83D\\uDCE4', label:'Send EOD report now', act:true, confirm:'This sends the EOD report on WhatsApp.'},
+    {ep:'/api/daily-report', ico:'\\uD83D\\uDCCA', label:'Daily report', act:true, confirm:'This may post the daily report to WhatsApp.'},
+    {ep:'/api/report-status', ico:'\\u2139', label:'Report status'}
+  ]},
+  {id:'recon', label:'Reconciliation', items:[
+    {ep:'/api/reconciliation', ico:'\\u2696', label:'Run reconciliation'},
+    {ep:'/api/fund-position', ico:'\\uD83D\\uDCB0', label:'Fund position'},
+    {ep:'/api/ledger', ico:'\\uD83D\\uDCD2', label:'Ledger view'},
+    {ep:'/api/outliers', ico:'\\u26A0', label:'Outliers'},
+    {ep:'/api/matcher-stats', ico:'\\uD83D\\uDCC8', label:'Matcher stats'}
+  ]},
+  {id:'controls', label:'Controls', items:[
+    {ep:'/api/bot/on', ico:'\\u2705', label:'Turn bot ON', act:true, confirm:'Enable the bot?'},
+    {ep:'/api/bot/off', ico:'\\u23F8', label:'Turn bot OFF', act:true, confirm:'Disable the bot? It will stop posting and processing.'},
+    {ep:'/api/silent-status', ico:'\\u2139', label:'Silent mode status'},
+    {ep:'/api/silent-on', ico:'\\uD83D\\uDD07', label:'Silent mode ON', act:true, confirm:'Turn on silent mode (bot stops scanning/posting)?'},
+    {ep:'/api/silent-off', ico:'\\uD83D\\uDD0A', label:'Silent mode OFF', act:true, confirm:'Turn off silent mode?'},
+    {ep:'/api/unapproved-alert-toggle', ico:'\\uD83D\\uDD14', label:'Toggle unapproved alert', act:true, confirm:'Toggle the unapproved-alert setting?'}
+  ]},
+  {id:'debug', label:'Debug', items:[
+    {ep:'/api/wa-status', ico:'\\uD83D\\uDCF1', label:'WhatsApp status'},
+    {ep:'/api/groups', ico:'\\uD83D\\uDC65', label:'Groups & JIDs'},
+    {ep:'/api/debug-messages', ico:'\\uD83D\\uDCAC', label:'Recent messages'},
+    {ep:'/api/debug-replies', ico:'\\u21A9', label:'Recent replies'},
+    {ep:'/api/debug-verdict', ico:'\\u2696', label:'Verdict store'},
+    {ep:'/api/dm-state', ico:'\\u2709', label:'DM state'},
+    {ep:'/api/whoami', ico:'\\uD83D\\uDC64', label:'Who am I'},
+    {ep:'/api/auth-list', ico:'\\uD83D\\uDD11', label:'Auth list'},
+    {ep:'/api/stale-state', ico:'\\uD83D\\uDD52', label:'Stale state'},
+    {ep:'/api/match-cache', ico:'\\uD83D\\uDDC2', label:'Match cache'}
+  ]},
+  {id:'dz', label:'Danger zone', dz:true, items:[
+    {ep:'/api/wa-reset', ico:'\\uD83D\\uDD04', label:'Reset WhatsApp session (re-pair)', dz:true, confirm:'This LOGS THE BOT OUT of WhatsApp. You will have to re-scan the QR to reconnect. This cannot be undone.'},
+    {ep:'/api/dm-clear', ico:'\\uD83D\\uDDD1', label:'Clear DM state', dz:true, confirm:'This wipes the bot\\u2019s DM state. This cannot be undone.'},
+    {ep:'/api/match-cache-clear', ico:'\\uD83E\\uDDF9', label:'Clear match cache', dz:true, confirm:'This clears the reconciliation match cache. This cannot be undone.'},
+    {ep:'/api/stale-reset', ico:'\\u267B', label:'Reset stale scan', dz:true, confirm:'This resets the stale-scan state. This cannot be undone.'}
+  ]}
+];
+
+var active = 'approvals';
+var pendingEp = null, pendingDz = false;
+
+function el(id){return document.getElementById(id);}
+function renderTabs(){
+  var h='';
+  TABS.forEach(function(t){
+    h += '<button class="tab'+(t.dz?' dz':'')+(t.id===active?' active':'')+'" onclick="switchTab(\\''+t.id+'\\')">'+t.label+'</button>';
+  });
+  el('tabs').innerHTML=h;
+}
+function switchTab(id){ active=id; el('out').classList.remove('show'); renderTabs(); renderButtons(); }
+function renderButtons(){
+  var t = TABS.filter(function(x){return x.id===active;})[0];
+  var h='';
+  t.items.forEach(function(it,i){
+    var cls='btn'+(it.dz?' dz':(it.act?' act':''));
+    h += '<button class="'+cls+'" onclick="hit(\\''+active+'\\','+i+')"><span class="ico">'+it.ico+'</span>'+it.label+'</button>';
+  });
+  if(t.dz){ h += '<p class="note">Every action here is destructive and asks you to confirm twice.</p>'; }
+  else if(t.items.some(function(x){return x.act;})){ h += '<p class="note">Actions marked in blue post to WhatsApp or change settings — they ask you to confirm first.</p>'; }
+  el('buttons').innerHTML=h;
+}
+var confirmsLeft = 0;
+function hit(tabId,i){
+  var t = TABS.filter(function(x){return x.id===tabId;})[0];
+  var it = t.items[i];
+  if(it.confirm){
+    pendingEp = it.ep; pendingDz = !!it.dz;
+    confirmsLeft = it.dz ? 2 : 1;   // danger zone needs two confirms
+    el('mTitle').textContent = it.dz ? 'Confirm — destructive' : 'Are you sure?';
+    el('mBody').textContent = it.confirm;
+    var go = el('mGo');
+    go.className = it.dz ? 'go' : 'goact';
+    go.textContent = it.dz ? 'Yes, do it' : 'Confirm';
+    el('modal').classList.add('show');
+  } else {
+    run(it.ep);
+  }
+}
+function closeModal(){ el('modal').classList.remove('show'); pendingEp=null; confirmsLeft=0; }
+function confirmModal(){
+  confirmsLeft--;
+  if(confirmsLeft > 0){
+    // show the final confirmation step (danger zone)
+    el('mTitle').textContent = 'Final confirmation';
+    el('mBody').textContent = 'Last chance — are you absolutely sure? This cannot be undone.';
+    var go = el('mGo'); go.className='go'; go.textContent='Yes, I am sure';
+    return; // modal stays open for the second click
+  }
+  var ep = pendingEp;
+  el('modal').classList.remove('show');
+  pendingEp=null;
+  if(ep) run(ep);
+}
+
+function run(ep){
+  var out = el('out');
+  out.classList.add('show');
+  out.innerHTML = '<span class="lbl">'+ep+'</span><span class="spin"></span> running…';
+  fetch(ep, {credentials:'same-origin'})
+    .then(function(r){ return r.text().then(function(tx){ return {ok:r.ok, status:r.status, tx:tx}; }); })
+    .then(function(res){
+      var body = res.tx;
+      try { body = JSON.stringify(JSON.parse(res.tx), null, 2); } catch(e){}
+      out.innerHTML = '<span class="lbl">'+ep+'  \\u2192  HTTP '+res.status+'</span>'+escapeHtml(body);
+    })
+    .catch(function(err){
+      out.innerHTML = '<span class="lbl">'+ep+'</span>Error: '+escapeHtml(String(err));
+    });
+}
+function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// load header status + stat cards from /health (open) and approval-audit
+function loadStatus(){
+  fetch('/health',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(h){
+    el('hver').textContent = h.version || '—';
+    el('hsub').textContent = 'WhatsApp '+(h.whatsapp||'?')+' · sheets '+(h.sheets||'?')+' · bot '+(h.botEnabled?'on':'off');
+    el('hdot').style.background = (h.whatsapp==='connected') ? '#7fdca4' : '#e0a96d';
+  }).catch(function(){});
+  fetch('/api/approval-audit?days=3',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null;}).then(function(a){
+    if(!a) return;
+    var pending = a.noApproval!=null ? a.noApproval : (a.pending||0);
+    var approved = a.fullyApproved!=null ? a.fullyApproved : (a.approved||0);
+    var total = a.totalExpenseRequests!=null ? a.totalExpenseRequests : (a.total||0);
+    el('cards').innerHTML =
+      card('Pending approval', pending) +
+      card('Fully approved', approved) +
+      card('Total requests', total);
+  }).catch(function(){});
+}
+function card(k,v){ return '<div class="card"><p class="k">'+k+'</p><p class="v">'+v+'</p></div>'; }
+
+renderTabs(); renderButtons(); loadStatus();
+</script>
+</body>
+</html>
+`;
+app.get('/api/panel', function(req, res){ res.type('html').send(PANEL_HTML); });
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
@@ -3663,7 +3895,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.8.18d | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.8.19 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
