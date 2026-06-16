@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.10.0-s5.7 — outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
+// FIDATO MIS SERVER v2.10.0-s5.8 — Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -1182,19 +1182,36 @@ function markItemUnpaid(itemId){
   return { itemId:itemId, removed:removed,
     message: removed ? ('Marked unpaid — removed '+removed+' paid event(s); it can be paid again.') : 'No paid event found for that id.' };
 }
-// Remove a pushed item from the dashboard's posted index; optionally delete the WhatsApp post too.
+// Append a message id to an item's thread (so deleting the item can clear the whole conversation).
+function appendThreadMsg(itemId, msgId){
+  try{
+    if(!itemId || !msgId) return;
+    var p=loadPaidPosted(); var pmid=p.byItem[itemId]; if(!pmid) return; var rec=p.items[pmid]; if(!rec) return;
+    if(!rec.threadMsgIds) rec.threadMsgIds=[];
+    if(rec.threadMsgIds.indexOf(msgId)<0){ rec.threadMsgIds.push(msgId); savePaidPosted(p); }
+  }catch(e){}
+}
+// Remove a pushed item from the dashboard; optionally delete the WHOLE group thread for it
+// (the original PAYMENT DUE post + every paid-flow message tracked against it).
 async function unpostOutflowItem(itemId, deleteMsg){
   var p=loadPaidPosted(); var msgId=p.byItem[itemId]; var rec=msgId?p.items[msgId]:null;
-  var waDeleted=false, waError=null;
-  if(msgId && deleteMsg){
+  var ids=[]; if(msgId) ids.push(msgId);
+  if(rec && rec.threadMsgIds) rec.threadMsgIds.forEach(function(id){ if(ids.indexOf(id)<0) ids.push(id); });
+  var deleted=0, failed=0, waError=null;
+  if(deleteMsg && ids.length){
     if(waReady && waClient){
-      try{ var m=await waClient.getMessageById(msgId); if(m){ await m.delete(true); waDeleted=true; } else { waError='message not found (may be too old to delete)'; } }
-      catch(e){ waError=e.message; }
+      for(var i=0;i<ids.length;i++){
+        try{ var m=await waClient.getMessageById(ids[i]); if(m){ await m.delete(true); deleted++; } else failed++; }
+        catch(e){ failed++; waError=e.message; }
+      }
     } else { waError='WhatsApp not connected — removed from dashboard only'; }
   }
   if(msgId){ delete p.items[msgId]; delete p.byItem[itemId]; p.recent=(p.recent||[]).filter(function(r){return r.id!==itemId;}); savePaidPosted(p); }
-  return { itemId:itemId, removedFromDashboard:!!msgId, postedMsgId:msgId||null, waDeleted:waDeleted, waError:waError,
-    message: msgId ? ('Removed from dashboard'+(deleteMsg?(waDeleted?' and deleted the group message.':(' — group message NOT deleted ('+(waError||'?')+').')):'.')) : 'No posted record for that id.' };
+  return { itemId:itemId, removedFromDashboard:!!msgId, postedMsgId:msgId||null, threadCount:ids.length,
+    waDeleted:deleted, waFailed:failed, waError:waError,
+    message: msgId
+      ? ('Removed from dashboard'+(deleteMsg?('; deleted '+deleted+' of '+ids.length+' group message(s)'+(failed?(' ('+failed+' could not be deleted — likely an accountant reply the bot cannot remove unless it is group admin, or too old)'):'')+'.'):'.'))
+      : 'No posted record for that id.' };
 }
 function alreadyPosted(itemId){ try{ var p=loadPaidPosted(); return !!(p.byItem && p.byItem[itemId]); }catch(e){ return false; } }
 
@@ -1307,7 +1324,7 @@ async function handlePaidFlow(msg){
     if(!(await isAuthorisedAccountant(msg.author||msg.from, who.name))) return false;
     var body=(msg.body||'').trim();
     if(!body) return false;
-    var send=function(t){ return waClient.sendMessage(CONFIG.PAYMENT_OUTFLOW_GROUP_JID, t); };
+    var send=function(t){ return waClient.sendMessage(CONFIG.PAYMENT_OUTFLOW_GROUP_JID, t).then(function(m){ try{ if(ses && m && m.id) appendThreadMsg(ses.itemId, m.id._serialized); }catch(e){} return m; }); };
 
     var st=loadPaidState(); prunePaidState(st);
     var ses=st.sessions[who.key];
@@ -1320,6 +1337,7 @@ async function handlePaidFlow(msg){
         description:item.description||item.label, step:'amount', answers:{},
         startedAt:new Date().toISOString(), lastAt:new Date().toISOString(), by:who.name };
       st.sessions[who.key]=ses; savePaidState(st);
+      try{ if(msg.id) appendThreadMsg(ses.itemId, msg.id._serialized); }catch(e){}   // the "paid" trigger msg
       await send((who.name?who.name+' \u2014 ':'')+'marking *'+ses.label+'* (approved Rs.'+formatINR(ses.amount)+') as paid.\n\n1/5 *Amount paid?* — reply "ok" for Rs.'+formatINR(ses.amount)+', or type the actual amount.');
       return true;
     }
@@ -1327,6 +1345,7 @@ async function handlePaidFlow(msg){
     // In-progress guard: a fresh "paid" while a Q&A is already open would otherwise be
     // fed into the current question (e.g. silently parsed as a date). Intercept it so the
     // accountant must consciously cancel or finish, rather than corrupt the open entry.
+    try{ if(msg.id) appendThreadMsg(ses.itemId, msg.id._serialized); }catch(e){}   // the accountant's in-flow reply
     if(/^paid\b/i.test(body)){
       var qlabel = PAID_STEP_LABEL[ses.step] || 'the current question';
       await send('\u26A0\uFE0F You\u2019re already part-way through marking *'+ses.label+'* as paid (currently on: '+qlabel+').\nReply *cancel* to scrap that and start over, or just answer the question above to finish it.');
@@ -4085,7 +4104,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.7',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.8',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -4894,7 +4913,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.10.0-s5.7 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.10.0-s5.8 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
