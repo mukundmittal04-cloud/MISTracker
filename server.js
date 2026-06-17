@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.10.0-s5.13 — added /api/outflow-post-dummy (lock-protected): posts a ⟨TEST⟩-tagged PAYMENT DUE item via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the OUTFLOW_POST toggle so it works while posting is OFF; registered in paid_posted.json so a "paid" reply matches back and it shows in the summary). Item id test-<ts> => any ledger row it produces is tagged [bot:test-…] for cleanup. Params: label, amount, optional entity/account. Also added an on-demand summary/status command in the outflow group (works for accountants AND M/S, who are whitelisted): replies with Approved(due)/Paid/Yet-to-pay counts + ₹ totals, yet-to-pay itemised, in the agreed layout. buildPaymentsSummary is a pure status-partition of the POSTED universe valued at the posted/approved (due) amount, so Approved = Paid + Yet-to-pay always reconciles (self-checking); formatPaymentsSummary renders it; both offline-tested. Held / Do-not-pay deferred (no way to set them yet). Prior: v2.10.0-s5.12 — added /api/ledger-test-write (lock-protected rehearsal trigger): builds a row via the same assemblePaymentRow and fires the same gated writeRowToLedger, tagged [bot:test-<ts>] in col L. Lets a same-day or back-dated write be fired from the browser to verify the executor on Copy of Ledger without WhatsApp. Confirmed (live) the new-day clone target: date breaker =DATE(y,m,d) and DAY TOTAL formulas are all RELATIVE (C=SUMIFS IN ref A<daterow>, G=SUMIFS OUT, J=C-G) so copyPaste repoints them; bot clones the 2-row date+total breaker (no repeated header, matching the newest day). entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
+// FIDATO MIS SERVER v2.10.0-s5.16 — corrected Tag and Head to the VERIFIED live dropdowns (screenshots 17 Jun). TAG is now the project cost-code set (FBD-Contractor/Steel/RMC/Exterior/STP/Road/SCO/Electricity/Diesel/Other, VRN-Contractor/Steel/RMC/Electricity/Site/Other, FBD/VRN Floor/Plot/Other-Collection, and a blank '—'); the old generic Tag values (Office/Legal/Salary/Directors-SM/-MM/Loan) were never real Tags — they are HEADS. HEAD is now the verified expense-nature set (Capital Site, Vrindavan, Office GK-1, Legal, Directors, Salary, Loan, Site, Drawing, Office Exp, Legal Exp, Diesel, Electricity, Other, Noida 153, Noida TS-3) and the Head step (4/7) is now a VALIDATED picklist like Tag/Account/Entity (number / "ok" guess / exact name; off-list rejected) — no longer free-form. Realigned the guessers: aiGuessTag prompt updated to project cost-codes only (Head nature lives in Head; off-list→dash); aiGuessHead now constrained to LEDGER_HEADS; guessHeadFallback returns only in-list heads; guessTagAndPerson rewritten to infer a valid project code (proj×category, else the project's -Other, else none) + promoter Person (SM/MM) from the description/entity, and the tag guess is guarded to in-list. Removed the now-dead TAG_QUICK. Prior: v2.10.0-s5.15 — FULL numbered pickers for Mode, Tag and Head in the paid flow. Mode (3/7) and Tag (5/7) now render the COMPLETE list vertically (Tag = all 19 LEDGER_TAGS, not just the 6 quick picks; a tag number now indexes the full list); Head (4/7) gains a numbered quick-pick list (LEDGER_HEADS, PROVISIONAL) shown alongside the AI guess — "ok"=guess, a number picks from the list, or type any Head (Head stays free-form). paidModeMenu/paidTagMenu now use the shared vertical paidNumberedMenu; added paidHeadMenu. No model/flow changes otherwise. Prior: v2.10.0-s5.14 — PART-PAYMENT TRACKING + interactive two-group summary + close/cancel. The paid flow now allows MANY instalments per approved item: each completed flow records its own paid event (seq-aware dedupe key paid:<id>#<seq>) and its own ledger row tagged [bot:<id>#<seq>] (distinct + idempotent per planLedgerWrite). Per item we derive approved (posted/due), paid (Σ instalments), balance; states fresh/part-paid/settled. The "amount paid?" step now defaults "ok" to the remaining BALANCE, not the full approved. Question order swapped: …tag → 6/7 ENTITY → 7/7 ACCOUNT → CONFIRM (was account then entity). buildPaymentsSummary is now a CUMULATIVE roll-up: Paid = actual cash out; identity Paid + Outstanding + Closed = Approved (Closed term shown only when present). formatPaymentsSummary renders two labelled groups — ⚪ FRESH (not yet paid) on top, 🟡 PART-PAID below — with CONTINUOUS numbering (Fresh first), oldest-approved first; settled items drop off. The summary persists its number→item map (paid_summary_map.json) so in the outflow group a bare NUMBER logs the next instalment for that item (balance pre-filled, instalment-aware "paid so far / balance"), and CLOSE <n> / CLOSE <n> yes closes/cancels an item as-is (accountants allowed): under-settled → remaining written off, never-paid → fully cancelled; closing writes NO ledger row. Reopen via /api/payment-reopen?id=. buildOutflowLog sums instalments and reports status posted/part-paid/paid/closed (+ dashboard pill CSS). Prior: v2.10.0-s5.13 — added /api/outflow-post-dummy (lock-protected): posts a ⟨TEST⟩-tagged PAYMENT DUE item via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the OUTFLOW_POST toggle so it works while posting is OFF; registered in paid_posted.json so a "paid" reply matches back and it shows in the summary). Item id test-<ts> => any ledger row it produces is tagged [bot:test-…] for cleanup. Params: label, amount, optional entity/account. Also added an on-demand summary/status command in the outflow group (works for accountants AND M/S, who are whitelisted): replies with Approved(due)/Paid/Yet-to-pay counts + ₹ totals, yet-to-pay itemised, in the agreed layout. buildPaymentsSummary is a pure status-partition of the POSTED universe valued at the posted/approved (due) amount, so Approved = Paid + Yet-to-pay always reconciles (self-checking); formatPaymentsSummary renders it; both offline-tested. Held / Do-not-pay deferred (no way to set them yet). Prior: v2.10.0-s5.12 — added /api/ledger-test-write (lock-protected rehearsal trigger): builds a row via the same assemblePaymentRow and fires the same gated writeRowToLedger, tagged [bot:test-<ts>] in col L. Lets a same-day or back-dated write be fired from the browser to verify the executor on Copy of Ledger without WhatsApp. Confirmed (live) the new-day clone target: date breaker =DATE(y,m,d) and DAY TOTAL formulas are all RELATIVE (C=SUMIFS IN ref A<daterow>, G=SUMIFS OUT, J=C-G) so copyPaste repoints them; bot clones the 2-row date+total breaker (no repeated header, matching the newest day). entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -799,24 +799,49 @@ function recordVerdictEvent(itemId, label, amount, role, verdict, amendAmount, r
 function recordApprovedEvent(itemId, label, amount){
   return recordEvent('approved', { itemId:itemId, label:label, amount:amount }, 'approved:'+itemId);
 }
-function recordPaidEvent(itemId, label, paidAmount, fields){
+function recordPaidEvent(itemId, label, paidAmount, fields, seq){
+  seq = seq || 1;
   return recordEvent('paid', {
-    itemId:itemId, label:label, paidAmount:paidAmount,
+    itemId:itemId, label:label, paidAmount:paidAmount, seq:seq,
     date: fields&&fields.date, mode: fields&&fields.mode, head: fields&&fields.head,
     tag: fields&&fields.tag, person: fields&&fields.person, transferTo: fields&&fields.transferTo,
     entity: fields&&fields.entity, bankAc: fields&&fields.bankAc
-  }, 'paid:'+itemId);
+  }, 'paid:'+itemId+'#'+seq);   // v2.10.0-s5.14: per-instalment dedupe key allows part payments
+}
+// v2.10.0-s5.14: cumulative paid stats for one item across all its instalments.
+// Returns total paid, instalment count (= next seq - 1), and the most recent paid event.
+function paidStatsForItem(store, itemId){
+  var total=0, count=0, last=null;
+  (store && store.events || []).forEach(function(e){
+    if(e.type==='paid' && e.itemId===itemId){ total += (e.paidAmount||0); count++; last=e; }
+  });
+  return { total:total, count:count, last:last };
+}
+// v2.10.0-s5.14: close/cancel an approved item "as-is" — freezes it at whatever cash has
+// actually gone out and stops tracking the rest. Covers under-settlement (₹1L approved, ₹90k
+// paid, done) and cancellation (approved, ₹0 paid, won't be paid). One closed event per item.
+function recordClosedEvent(itemId, label, approvedAmount, paidAmount){
+  return recordEvent('closed', {
+    itemId:itemId, label:label, approvedAmount:approvedAmount||0, paidAmount:paidAmount||0,
+    writeOff: Math.max(0, (approvedAmount||0)-(paidAmount||0))
+  }, 'closed:'+itemId);
+}
+function isClosed(store, itemId){
+  return (store && store.events || []).some(function(e){ return e.type==='closed' && e.itemId===itemId; });
 }
 
 // ── v2.10.0 Payment Outflow flow — stage 1 helpers (capture-only, no Sheet write) ──
 // Real Ledger taxonomy (from the live sheet audit).
-var LEDGER_TAGS = ['Other','Office','Legal','Salary','Directors-SM','Directors-MM',
-  'FBD-CCM-Contractor','FBD-CCM-Legal','FBD-CCM-Exterior','FBD-CCM-Diesel',
-  'FBD-Plot-Receivable','FBD-Plot-Construction','FBD-Floor-Receivable','FBD-Floor-Possession',
-  'VRN-Plot','VRN-Site','VRN-Contractor','VRN-Other','Loan'];
+// v2.10.0-s5.16: Tag = the verified Ledger TAG dropdown (project cost-codes), exact order from the
+// live sheet (screenshots 17 Jun 2026). '—' is the blank/none option. Validated for the numbered
+// picker (step 5) and to constrain a typed tag.
+var LEDGER_TAGS = ['FBD-Contractor','FBD-Steel','FBD-RMC','FBD-Exterior','FBD-STP','FBD-Road','FBD-SCO','FBD-Electricity','FBD-Diesel','FBD-Other',
+  'VRN-Contractor','VRN-Steel','VRN-RMC','VRN-Electricity','VRN-Site','VRN-Other',
+  'FBD-Floor','FBD-Plot','FBD-Other-Collection','VRN-Floor','VRN-Plot','VRN-Other-Collection','—'];
 var LEDGER_MODES = ['Chq','Cash','RTGS','NEFT','PDC','Auto'];
-// Tags shown as quick numbered picks (the common ones); full list available by typing.
-var TAG_QUICK = ['Directors-SM','Directors-MM','Office','Legal','Salary','Other'];
+// v2.10.0-s5.16: Head = the verified Ledger HEAD dropdown (expense nature), exact order from the
+// live sheet (screenshots 17 Jun 2026). Validated for the numbered picker (step 4) like Tag.
+var LEDGER_HEADS = ['Capital Site','Vrindavan','Office GK-1','Legal','Directors','Salary','Loan','Site','Drawing','Office Exp','Legal Exp','Diesel','Electricity','Other','Noida 153','Noida TS-3'];
 // v2.10.0-s5.9: paying-account list — exact order/contents of the Ledger Bank A/C dropdown.
 // Used both for the numbered menu (step 6) and to validate a typed account.
 var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','—','MM PDC','SM PDC','PDC'];
@@ -824,35 +849,56 @@ var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fi
 var LEDGER_ENTITIES = ['Fidatocity - 70%','Fidatocity - 30%','Fidato City Homes','Fidatocity Homes','Trinity Landspace','Pitam','Hansaflon Buildcon','Hansaflon Buildwell','Dholpur Developers','Trinity Tulsivan','Beatific Hospitality','Chahat Garments','Fidato Buildcon','Fidato Maintenance','Maximal Infrastructure','Others (combined)','MM PDC','SM PDC','PDC','MM','SM'];
 
 // Rule-based Tag pre-guess from a description. Returns {tag, person} or null.
-function guessTagAndPerson(desc){
-  var d = (desc||'').toLowerCase();
-  // drawings → Directors-SM / Directors-MM, with promoter in Person
-  var isDrawing = /\bdrawing\b|\bdraw\b/.test(d);
-  var hasSM = /\bsm\b|\bs\.?m\.?\b|sumit/.test(d);
-  var hasMM = /\bmm\b|\bm\.?m\.?\b|madhur|mummy/.test(d);
-  if(isDrawing || hasSM || hasMM){
-    if(hasSM && !hasMM) return {tag:'Directors-SM', person:'SM'};
-    if(hasMM && !hasSM) return {tag:'Directors-MM', person:'MM'};
-    if(isDrawing) return {tag:'Directors-SM', person:'SM'}; // default drawing guess, confirmable
+function guessTagAndPerson(desc, entity){
+  var d = (desc||'').toLowerCase(), e = (entity||'').toLowerCase(), de = d+' '+e;
+  // Promoter (Person col) detection for drawings — independent of the project Tag.
+  var person='';
+  if(/\bsm\b|s\.?m\.?\b|sumit/.test(d)) person='SM';
+  else if(/\bmm\b|m\.?m\.?\b|madhur|mummy/.test(d)) person='MM';
+  // Project inference: which cost-code family.
+  var proj = /vrn|vrindavan|mathura|jait/.test(de) ? 'VRN' : (/fbd|faridabad|ccm/.test(de) ? 'FBD' : '');
+  // Category within the project.
+  var cat='';
+  if(/contractor|labour|mason/.test(d)) cat='Contractor';
+  else if(/\brmc\b|concrete/.test(d)) cat='RMC';
+  else if(/steel|saria|tmt/.test(d)) cat='Steel';
+  else if(/diesel/.test(d)) cat='Diesel';                 // FBD-Diesel only
+  else if(/exterior|facade|finishing/.test(d)) cat='Exterior';
+  else if(/\bstp\b/.test(d)) cat='STP';
+  else if(/\broad\b/.test(d)) cat='Road';
+  else if(/\bsco\b/.test(d)) cat='SCO';
+  else if(/electric/.test(d)) cat='Electricity';
+  else if(/\bsite\b/.test(d)) cat='Site';                 // VRN-Site
+  else if(/floor/.test(d)) cat='Floor';
+  else if(/plot/.test(d)) cat='Plot';
+  var tag='';
+  if(proj && cat){
+    var cand = proj+'-'+cat;
+    if(LEDGER_TAGS.indexOf(cand)>=0) tag=cand;
+    else if(LEDGER_TAGS.indexOf(proj+'-Other')>=0) tag=proj+'-Other';   // category not in this project → project's Other
   }
-  if(/salary|payroll/.test(d)) return {tag:'Salary', person:''};
-  if(/legal|advocate|\bca\b|roc|retainer|notary|stamp/.test(d)) return {tag:'Legal', person:''};
-  if(/office|conveyance|petrol|stationery|bank charge/.test(d)) return {tag:'Office', person:''};
-  if(/contractor|rmc|concrete|steel|cement/.test(d)) return {tag:'FBD-CCM-Contractor', person:''};
-  if(/diesel/.test(d)) return {tag:'FBD-CCM-Diesel', person:''};
-  if(/electric|electricity|bill/.test(d)) return {tag:'Other', person:''};
-  return null; // unknown → ask the accountant to pick
+  if(!tag && !person) return null;                        // nothing confident → accountant picks
+  return { tag:tag, person:person };
 }
 
 // Rule-based Head pre-guess fallback (used if AI guess unavailable). Loose, descriptive.
 function guessHeadFallback(desc){
   var d = (desc||'').toLowerCase();
   if(/drawing|draw\b/.test(d)) return 'Drawing';
-  if(/salary|payroll/.test(d)) return 'Salary';
-  if(/legal|advocate|\bca\b|roc|retainer/.test(d)) return 'Legal';
-  if(/office|conveyance/.test(d)) return 'Office GK-1';
-  if(/capital|site/.test(d)) return 'Capital Site';
-  if(/pdc/.test(d)) return 'PDC (General)';
+  if(/salary|payroll|wages/.test(d)) return 'Salary';
+  if(/legal exp/.test(d)) return 'Legal Exp';
+  if(/legal|advocate|\bca\b|roc|retainer|notary|stamp/.test(d)) return 'Legal';
+  if(/loan|interest|emi|repay/.test(d)) return 'Loan';
+  if(/diesel/.test(d)) return 'Diesel';
+  if(/electric|electricity|\bbill\b|power/.test(d)) return 'Electricity';
+  if(/director/.test(d)) return 'Directors';
+  if(/office exp/.test(d)) return 'Office Exp';
+  if(/office|conveyance|stationery|bank charge/.test(d)) return 'Office GK-1';
+  if(/capital|capex/.test(d)) return 'Capital Site';
+  if(/noida.*ts.?3|ts.?3/.test(d)) return 'Noida TS-3';
+  if(/noida.*153|153/.test(d)) return 'Noida 153';
+  if(/vrindavan|vrn|mathura|jait/.test(d)) return 'Vrindavan';
+  if(/\bsite\b/.test(d)) return 'Site';
   return 'Other';
 }
 
@@ -860,10 +906,9 @@ function guessHeadFallback(desc){
 async function aiGuessHead(desc, entity){
   if(!CONFIG.CLAUDE_API_KEY) return null;
   try{
-    var prompt = 'You are labelling a real-estate accounting ledger row. Given the expense description, '+
-      'return ONLY a short 1-3 word "Head" label (the line-item category), no punctuation, no explanation. '+
-      'Examples of valid heads: Drawing, Salary, Legal, Capital Site, Office GK-1, Office Exp, Noida 153, '+
-      'Vrindavan, Directors, PDC (General), Other.\nDescription: "'+(desc||'')+'"\nEntity: "'+(entity||'')+'"\nHead:';
+    var prompt = 'You are labelling a real-estate accounting ledger row. Pick the SINGLE best "Head" '+
+      '(expense nature) from this exact list and reply with it VERBATIM, nothing else:\n'+
+      LEDGER_HEADS.join('\n')+'\n\nDescription: "'+(desc||'')+'"\nEntity: "'+(entity||'')+'"\nHead:';
     var r = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
       headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
@@ -871,8 +916,9 @@ async function aiGuessHead(desc, entity){
     });
     var data = await r.json();
     if(data && data.content && data.content[0] && data.content[0].text){
-      var head = data.content[0].text.trim().replace(/^["']|["'\.]+$/g,'').trim();
-      if(head && head.length<=40) return head;
+      var head = data.content[0].text.trim().replace(/^["']|["'\.]+$/g,'').trim().toLowerCase();
+      for(var i=0;i<LEDGER_HEADS.length;i++){ if(LEDGER_HEADS[i].toLowerCase()===head) return LEDGER_HEADS[i]; }  // validate to list, else null
+      console.log('[PaidFlow] aiGuessHead off-list, ignoring:', head);
     }
   }catch(e){ console.error('[PaidFlow] aiGuessHead:', e.message); }
   return null;
@@ -890,9 +936,10 @@ async function aiGuessTag(desc, entity){
       'from this exact list and reply with the tag VERBATIM and nothing else:\n'+
       LEDGER_TAGS.join('\n')+'\n\n'+
       'Rules: FBD-* = the Faridabad CCM project; VRN-* = the Vrindavan project. Use the description AND '+
-      'entity to infer which project, then pick the matching code (e.g. diesel for a Vrindavan site is '+
-      'VRN-Site; diesel for a Faridabad CCM site is FBD-CCM-Diesel). Directors-SM / Directors-MM are '+
-      'promoter drawings. If nothing clearly fits, reply Other.\n'+
+      'entity to infer which project, then pick the matching cost-code (e.g. diesel on the Faridabad site '+
+      'is FBD-Diesel; a Vrindavan contractor bill is VRN-Contractor; a Vrindavan site cost with no closer '+
+      'code is VRN-Other). These are PROJECT cost-codes only — expense nature (Salary, Legal, Drawing, '+
+      'Directors, etc.) belongs in Head, not here. If no project/code clearly fits, reply — (a dash).\n'+
       'Description: "'+(desc||'')+'"\nEntity: "'+(entity||'')+'"\nTag:';
     var r = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
@@ -924,7 +971,7 @@ function assemblePaymentRow(item, answers){
     person: answers.person || '',                // derived from Tag (Directors-SM→SM)
     bankAc: answers.bankAc || item.bankAc || '', // prefer the account captured at payment time (request 'From' is often just the company)
     transferTo: '',                              // always blank (internal transfers manual)
-    notes: '[bot:'+(item.id||'')+']'             // tag bot rows for reconciliation/undo
+    notes: '[bot:'+(item.id||'')+(item.seq?('#'+item.seq):'')+']'   // v2.10.0-s5.14: #seq per instalment (distinct, idempotent rows)
   };
 }
 function rowToArray(r){
@@ -1157,53 +1204,68 @@ function registerPostedApproved(postedMsgId, item){
 // Combined live view of everything pushed to the payments group, joined with paid events.
 function buildOutflowLog(){
   var p=loadPaidPosted(), store=loadEventStore();
-  var paidByItem={}; (store.events||[]).forEach(function(e){ if(e.type==='paid') paidByItem[e.itemId]=e; });
   var rows=[], seen={};
   (p.recent||[]).forEach(function(rec){
     if(seen[rec.id]) return; seen[rec.id]=true;
-    var pe=paidByItem[rec.id];
-    rows.push({ itemId:rec.id, label:rec.label, amount:rec.amount, entity:rec.entity||'', bankAc:rec.bankAc||'',
-      postedAt:rec.at, postedMsgId:rec.postedMsgId, paid:!!pe,
-      paidDetails: pe?{amount:pe.paidAmount,date:pe.date,mode:pe.mode,head:pe.head,tag:pe.tag,person:pe.person,entity:pe.entity,bankAc:pe.bankAc,at:pe.at}:null,
-      status: pe?'paid':'posted' });
+    var s=paidStatsForItem(store, rec.id); var approved=rec.amount||0; var paid=s.total; var last=s.last;
+    var closed=isClosed(store, rec.id);
+    var status = closed ? 'closed' : (paid<=0 ? 'posted' : (paid<approved ? 'part-paid' : 'paid'));
+    rows.push({ itemId:rec.id, label:rec.label, amount:approved, paidTotal:paid, balance:Math.max(0,approved-paid), instalments:s.count,
+      entity:rec.entity||'', bankAc:rec.bankAc||'', postedAt:rec.at, postedMsgId:rec.postedMsgId, paid:paid>0, closed:closed,
+      paidDetails: last?{amount:last.paidAmount,date:last.date,mode:last.mode,head:last.head,tag:last.tag,person:last.person,entity:last.entity,bankAc:last.bankAc,at:last.at}:null,
+      status: status });
   });
   // paid events whose item has no posted record (e.g. paid via a manual flow) — still list them
   (store.events||[]).forEach(function(e){
     if(e.type!=='paid' || seen[e.itemId]) return; seen[e.itemId]=true;
-    rows.push({ itemId:e.itemId, label:e.label, amount:e.paidAmount, entity:e.entity||'', bankAc:e.bankAc||'',
-      postedAt:null, postedMsgId:null, paid:true,
-      paidDetails:{amount:e.paidAmount,date:e.date,mode:e.mode,head:e.head,tag:e.tag,person:e.person,entity:e.entity,bankAc:e.bankAc,at:e.at},
-      status:'paid' });
+    var s2=paidStatsForItem(store, e.itemId);
+    rows.push({ itemId:e.itemId, label:e.label, amount:s2.total, paidTotal:s2.total, balance:0, instalments:s2.count, entity:e.entity||'', bankAc:e.bankAc||'',
+      postedAt:null, postedMsgId:null, paid:true, closed:isClosed(store,e.itemId),
+      paidDetails:{amount:(s2.last||e).paidAmount,date:(s2.last||e).date,mode:(s2.last||e).mode,head:(s2.last||e).head,tag:(s2.last||e).tag,person:(s2.last||e).person,entity:(s2.last||e).entity,bankAc:(s2.last||e).bankAc,at:(s2.last||e).at},
+      status:isClosed(store,e.itemId)?'closed':'paid' });
   });
   rows.sort(function(a,b){ var ta=Date.parse((a.paidDetails&&a.paidDetails.at)||a.postedAt||0)||0, tb=Date.parse((b.paidDetails&&b.paidDetails.at)||b.postedAt||0)||0; return tb-ta; });
   return rows;
 }
-// ── v2.10.0-s5.13: on-demand payments summary (Approved-due / Paid / Yet-to-pay) ──
-// Pure roll-up over the POSTED universe (everything pushed to the payments group, deduped
-// by item id), partitioned by paid status from the event store. Paid and Yet-to-pay are a
-// partition of the same posted items, each valued at its posted/approved (due) amount, so
-// the identity Approved = Paid + Yet-to-pay ALWAYS holds — the summary is self-checking.
-// (Actual cash paid can differ from the due amount; that is a reconciliation concern, not
-// this summary's — flip `amount`→paidAmount in the paid bucket if you want cash-out totals.)
-// Held / Do-not-pay are NOT modelled yet (no way to set them); deferred.
+// ── v2.10.0-s5.14: on-demand payments summary (cumulative part-payment model) ──
+// Roll-up over the POSTED universe (deduped by item id). Per item: approved (posted/due amount),
+// paid (Σ all instalments), balance (approved−paid). Items bucket into FRESH (paid≤0), PART-PAID
+// (0<paid<approved), SETTLED (paid≥approved → drops off the action list), or CLOSED (an explicit
+// close/cancel — its unpaid slice is written off). Paid is now ACTUAL CASH OUT. The self-checking
+// identity becomes  Paid + Outstanding + Closed = Approved  (Closed term omitted when none).
+// Fresh + Part-paid get continuous numbering (Fresh first) so a single reply-number maps to one item.
 function buildPaymentsSummary(pp, store){
   pp = pp || loadPaidPosted();
   store = store || loadEventStore();
-  var paidByItem = {};
-  (store.events||[]).forEach(function(e){ if(e.type==='paid' && e.itemId) paidByItem[e.itemId]=e; });
-  var seen={}, approved=[], paid=[], yetToPay=[];
+  var seen={}, fresh=[], partPaid=[], settledCount=0;
+  var approvedTotal=0, paidTotal=0, outstandingTotal=0, closedCount=0, closedWriteOff=0;
   (pp.recent||[]).forEach(function(rec){
     if(!rec || seen[rec.id]) return; seen[rec.id]=true;
-    var entry = { itemId:rec.id, label:rec.label||rec.id, amount:rec.amount||0, entity:rec.entity||'', bankAc:rec.bankAc||'' };
-    approved.push(entry);
-    if(paidByItem[rec.id]) paid.push(entry); else yetToPay.push(entry);
+    var approved = rec.amount||0;
+    var s = paidStatsForItem(store, rec.id);
+    var paid = s.total;
+    approvedTotal += approved;
+    paidTotal += paid;                                  // actual cash out (incl. partials on closed items)
+    var entry = { itemId:rec.id, label:rec.label||rec.id, approved:approved, paid:paid,
+      balance:Math.max(0,approved-paid), entity:rec.entity||'', bankAc:rec.bankAc||'', at:rec.at };
+    if(isClosed(store, rec.id)){ closedCount++; closedWriteOff += Math.max(0, approved-paid); return; }
+    if(paid<=0){ fresh.push(entry); outstandingTotal += entry.balance; }
+    else if(paid < approved){ partPaid.push(entry); outstandingTotal += entry.balance; }
+    else { settledCount++; }                            // paid≥approved → settled, drops off
   });
-  function tot(arr){ return arr.reduce(function(s,x){ return s+(x.amount||0); },0); }
+  function byOldest(a,b){ return (Date.parse(a.at)||0)-(Date.parse(b.at)||0); }
+  fresh.sort(byOldest); partPaid.sort(byOldest);        // oldest-approved first within each group
+  var n=0, numbered=[];
+  fresh.forEach(function(e){ e.n=++n; numbered.push(e); });      // Fresh numbered first (on top)
+  partPaid.forEach(function(e){ e.n=++n; numbered.push(e); });   // Part-paid continues the sequence
   return {
-    approved:{ count:approved.length, total:tot(approved), items:approved },
-    paid:{ count:paid.length, total:tot(paid), items:paid },
-    yetToPay:{ count:yetToPay.length, total:tot(yetToPay), items:yetToPay },
-    reconciles: (tot(paid)+tot(yetToPay))===tot(approved)
+    approved:{ count:Object.keys(seen).length, total:approvedTotal },
+    paid:{ total:paidTotal },
+    outstanding:{ total:outstandingTotal },
+    closed:{ count:closedCount, writeOff:closedWriteOff },
+    settledCount:settledCount,
+    fresh:fresh, partPaid:partPaid, numbered:numbered,
+    reconciles: (paidTotal + outstandingTotal + closedWriteOff) === approvedTotal
   };
 }
 // Render the summary in the agreed WhatsApp layout. `now` is injectable for deterministic tests.
@@ -1213,30 +1275,35 @@ function formatPaymentsSummary(sum, now){
   if(!sum || sum.approved.count===0){
     return '\uD83D\uDCCA *PAYMENTS SUMMARY*\n'+DIV+'\nNothing has been posted to the payments group yet.\nApprove an item (or run a \u27E8TEST\u27E9 dummy post) and it will show here.';
   }
+  function lbl(s){ s=(s||'').replace(/\n/g,' ').trim(); return s.length>40 ? s.substring(0,40)+'\u2026' : s; }
   var dateStr = now.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',timeZone:'Asia/Kolkata'});
   var timeStr = now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'Asia/Kolkata'}).toLowerCase();
-  var L=[];
+  var CAP=30, L=[];
   L.push('\uD83D\uDCCA *PAYMENTS SUMMARY*');
   L.push(dateStr+' \u00B7 '+timeStr);
   L.push(DIV);
   L.push('\u2705 *Approved (due):*  '+sum.approved.count+' \u00B7 \u20B9'+formatINR(sum.approved.total));
-  L.push('\uD83D\uDCB8 *Paid:*  '+sum.paid.count+' \u00B7 \u20B9'+formatINR(sum.paid.total));
-  L.push('\uD83D\uDD53 *Yet to pay:*  '+sum.yetToPay.count+' \u00B7 \u20B9'+formatINR(sum.yetToPay.total));
-  L.push('');
-  L.push('*Yet to pay \u2014*');
-  if(sum.yetToPay.count===0){
-    L.push('_None \u2014 every approved payment is done._');
-  } else {
-    var CAP=30, list=sum.yetToPay.items.slice(0,CAP);
-    list.forEach(function(it,i){
-      var label=(it.label||'').replace(/\n/g,' ').trim();
-      if(label.length>40) label=label.substring(0,40)+'\u2026';
-      L.push((i+1)+'. '+label+'  \u20B9'+formatINR(it.amount));
-    });
-    if(sum.yetToPay.count>CAP) L.push('\u2026 +'+(sum.yetToPay.count-CAP)+' more');
+  L.push('\uD83D\uDCB8 *Paid (cash out):*  \u20B9'+formatINR(sum.paid.total));
+  L.push('\uD83D\uDD53 *Outstanding:*  \u20B9'+formatINR(sum.outstanding.total));
+  if(sum.closed.count>0) L.push('\uD83D\uDEAB *Closed/cancelled:*  '+sum.closed.count+' \u00B7 \u20B9'+formatINR(sum.closed.writeOff)+' written off');
+  if(sum.fresh.length){
+    L.push('');
+    L.push('\u26AA *FRESH* (not yet paid) \u2014 reply the number to start');
+    sum.fresh.slice(0,CAP).forEach(function(it){ L.push(it.n+'. '+lbl(it.label)+'  \u20B9'+formatINR(it.approved)); });
+    if(sum.fresh.length>CAP) L.push('\u2026 +'+(sum.fresh.length-CAP)+' more');
+  }
+  if(sum.partPaid.length){
+    L.push('');
+    L.push('\uD83D\uDFE1 *PART-PAID* \u2014 reply the number to log the next instalment');
+    sum.partPaid.slice(0,CAP).forEach(function(it){ L.push(it.n+'. '+lbl(it.label)+' \u2014 paid \u20B9'+formatINR(it.paid)+' of \u20B9'+formatINR(it.approved)+' \u00B7 *bal \u20B9'+formatINR(it.balance)+'*'); });
+    if(sum.partPaid.length>CAP) L.push('\u2026 +'+(sum.partPaid.length-CAP)+' more');
+  }
+  if(!sum.fresh.length && !sum.partPaid.length){
+    L.push('');
+    L.push('_Nothing outstanding \u2014 every approved payment is done or closed._');
   }
   L.push(DIV);
-  L.push('Approved = Paid + Yet to pay');
+  L.push(sum.closed.count>0 ? 'Paid + Outstanding + Closed = Approved' : 'Paid + Outstanding = Approved');
   return L.join('\n');
 }
 // Mark a paid expense back to UNPAID — removes its paid event(s) so it can be re-tested.
@@ -1247,6 +1314,15 @@ function markItemUnpaid(itemId){
   if(removed>0) _persistEventStore();
   return { itemId:itemId, removed:removed,
     message: removed ? ('Marked unpaid — removed '+removed+' paid event(s); it can be paid again.') : 'No paid event found for that id.' };
+}
+// v2.10.0-s5.14: reopen a closed/cancelled item (undo a close) — removes its closed event(s).
+function reopenItem(itemId){
+  var store=loadEventStore(); var before=store.events.length;
+  _eventStoreCache.events = store.events.filter(function(e){ return !(e.type==='closed' && e.itemId===itemId); });
+  var removed = before - _eventStoreCache.events.length;
+  if(removed>0) _persistEventStore();
+  return { itemId:itemId, removed:removed,
+    message: removed ? ('Reopened — removed '+removed+' close event(s); it is back on the list.') : 'No close event found for that id.' };
 }
 // Append a message id to an item's thread (so deleting the item can clear the whole conversation).
 function appendThreadMsg(itemId, msgId){
@@ -1293,6 +1369,25 @@ async function resolvePostedItem(msg){
   }
   return null;
 }
+// ── v2.10.0-s5.14: interactive summary — number→item map, posted lookup, session builder ──
+// Each time the summary is posted to the group we save its numbering so a bare-number reply
+// (or "close <n>") maps back to the right item.
+var PAID_SUMMARY_MAP_FILE = './wa_auth/paid_summary_map.json';   // { at, items:[{n,itemId,label}] }
+function loadPaidSummaryMap(){ try{ if(fs.existsSync(PAID_SUMMARY_MAP_FILE)) return JSON.parse(fs.readFileSync(PAID_SUMMARY_MAP_FILE,'utf8')); }catch(e){} return null; }
+function savePaidSummaryMap(m){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(PAID_SUMMARY_MAP_FILE, JSON.stringify(m,null,1)); }catch(e){ console.error('[PaidSummary] map save:',e.message); } }
+function summaryItemByNumber(n){ var m=loadPaidSummaryMap(); if(!m||!m.items) return null; for(var i=0;i<m.items.length;i++){ if(m.items[i].n===n) return m.items[i]; } return null; }
+// Find the posted record for an item id (the approved/due figure + entity/account live here).
+function findPostedRec(pp, itemId){ var r=(pp.recent||[]).filter(function(x){ return x.id===itemId; }); return r.length?r[0]:null; }
+// Build a paid-flow session for a posted item, instalment-aware: balance = approved − paidSoFar,
+// seq = next instalment number. Used by both the "paid"-quote trigger and the summary-number trigger.
+function newPaidSession(rec, store, byName){
+  var s = paidStatsForItem(store, rec.id);
+  var approved = rec.amount||0;
+  var balance = Math.max(0, approved - s.total);
+  return { itemId:rec.id, label:rec.label, amount:approved, paidSoFar:s.total, balance:balance, seq:s.count+1,
+    entity:rec.entity, bankAc:rec.bankAc, description:rec.description||rec.label,
+    step:'amount', answers:{}, startedAt:new Date().toISOString(), lastAt:new Date().toISOString(), by:byName };
+}
 
 // Display name + stable session key for an accountant in the payments group.
 async function resolveAccountant(msg){
@@ -1301,8 +1396,9 @@ async function resolveAccountant(msg){
   return { key:author, name:(who&&who.contactName)||'' };
 }
 
-function paidModeMenu(){ var L=[]; for(var i=0;i<LEDGER_MODES.length;i++) L.push((i+1)+'. '+LEDGER_MODES[i]); return L.join('   '); }
-function paidTagMenu(){ var L=[]; for(var i=0;i<TAG_QUICK.length;i++) L.push((i+1)+'. '+TAG_QUICK[i]); return L.join('   '); }
+function paidModeMenu(){ return paidNumberedMenu(LEDGER_MODES); }
+function paidTagMenu(){ return paidNumberedMenu(LEDGER_TAGS); }
+function paidHeadMenu(){ return paidNumberedMenu(LEDGER_HEADS); }
 function paidNumberedMenu(list){ var L=[]; for(var i=0;i<list.length;i++){ var a=list[i]; L.push((i+1)+'. '+(a==='—'?'— (none / blank)':a)); } return L.join('\n'); }
 function paidAccountMenu(){ return paidNumberedMenu(LEDGER_ACCOUNTS); }
 function paidEntityMenu(){ return paidNumberedMenu(LEDGER_ENTITIES); }
@@ -1335,8 +1431,9 @@ async function paidFlowAdvance(session, inputRaw){
   if(/^(cancel|reset|clear|stop)$/i.test(low)){ return { reply:'Paid entry cancelled. Reply "paid" on an approved item to start again.', done:true, cancelled:true }; }
 
   if(session.step==='amount'){
-    if(low==='ok'){ session.answers.amount=session.amount; }
-    else { var amt=extractLineAmount(input,false)||parseAmount(input); if(!amt){ return { reply:'Didn\'t catch an amount. Type the actual amount paid, or "ok" to use the approved Rs.'+formatINR(session.amount)+'.' }; } session.answers.amount=amt; }
+    var bal = (session.balance!=null ? session.balance : session.amount);
+    if(low==='ok'){ session.answers.amount=bal; }
+    else { var amt=extractLineAmount(input,false)||parseAmount(input); if(!amt){ return { reply:'Didn\'t catch an amount. Type the actual amount paid, or "ok" to use the balance Rs.'+formatINR(bal)+'.' }; } session.answers.amount=amt; }
     session.step='date';
     return { reply:'2/7 *Date?* — reply "today" or dd/mm (e.g. 14/06).' };
   }
@@ -1352,48 +1449,41 @@ async function paidFlowAdvance(session, inputRaw){
     var head=await aiGuessHead(session.description, session.entity);
     if(!head) head=guessHeadFallback(session.description);
     session.guessHead=head; session.step='head';
-    return { reply:'4/7 *Head?* — my guess: *'+head+'*. Reply "ok" to accept, or type the correct Head.' };
+    var hlead = head ? ('my guess: *'+head+'*. Reply "ok" to accept, or pick a number') : 'pick a number';
+    return { reply:'4/7 *Head?* — '+hlead+':\n'+paidHeadMenu()+'\n(or type the exact head name)' };
   }
   if(session.step==='head'){
-    session.answers.head = (low==='ok') ? session.guessHead : input;
+    var headv='';
+    if(low==='ok' && session.guessHead){ headv=session.guessHead; }
+    else if(/^\d+$/.test(low)){
+      var hi=parseInt(low,10);
+      if(hi>=1 && hi<=LEDGER_HEADS.length){ headv=LEDGER_HEADS[hi-1]; }
+    }
+    else { for(var hj=0;hj<LEDGER_HEADS.length;hj++){ if(LEDGER_HEADS[hj].toLowerCase()===low){ headv=LEDGER_HEADS[hj]; break; } } }
+    if(!headv){ return { reply:'Pick the Head by number (1\u2013'+LEDGER_HEADS.length+'), "ok" for the guess, or type an exact head name:\n'+paidHeadMenu() }; }
+    session.answers.head = headv;
     var aiTag = await aiGuessTag(session.description, session.entity);   // validated to LEDGER_TAGS, or null
-    var g = guessTagAndPerson(session.description) || null;              // rule fallback (offline / off-list)
-    var finalTag = aiTag || (g ? g.tag : '');
+    var g = guessTagAndPerson(session.description, session.entity) || null;   // rule fallback (offline)
+    var finalTag = aiTag || (g && LEDGER_TAGS.indexOf(g.tag)>=0 ? g.tag : '');  // only offer an in-list tag guess
     session.guessTag = finalTag;
     session.guessPerson = personForTag(finalTag) || (g ? (g.person||'') : '');
     session.step='tag';
     var lead = session.guessTag ? ('my guess: *'+session.guessTag+'*. Reply "ok" to accept, or pick a number') : 'pick a number';
-    return { reply:'5/7 *Tag?* — '+lead+':\n'+paidTagMenu()+'\n(or type any full tag)' };
+    return { reply:'5/7 *Tag?* — '+lead+':\n'+paidTagMenu()+'\n(or type the tag name)' };
   }
   if(session.step==='tag'){
     var tag='';
     if(low==='ok' && session.guessTag){ tag=session.guessTag; }
     else {
       var ti=parseInt(low,10);
-      if(ti>=1 && ti<=TAG_QUICK.length){ tag=TAG_QUICK[ti-1]; }
+      if(ti>=1 && ti<=LEDGER_TAGS.length){ tag=LEDGER_TAGS[ti-1]; }
       else { for(var i=0;i<LEDGER_TAGS.length;i++){ if(LEDGER_TAGS[i].toLowerCase()===low){ tag=LEDGER_TAGS[i]; break; } } }
     }
     if(!tag){ return { reply:'Pick the Tag by number, "ok" for the guess, or type a full tag:\n'+paidTagMenu() }; }
     session.answers.tag=tag;
     session.answers.person = personForTag(tag) || session.guessPerson || '';
-    session.step='account';
-    return { reply:'6/7 *Paid from which account?* — reply the number, or type the account name:\n'+paidAccountMenu() };
-  }
-  if(session.step==='account'){
-    var acct='';
-    if(/^\d+$/.test(low)){
-      var ac=parseInt(low,10);
-      if(ac>=1 && ac<=LEDGER_ACCOUNTS.length){ acct=LEDGER_ACCOUNTS[ac-1]; }
-      else { return { reply:'Pick the account by number (1\u2013'+LEDGER_ACCOUNTS.length+') or type the account name:\n'+paidAccountMenu() }; }
-    } else {
-      var r=resolveAccount(input);
-      if(r.account){ acct=r.account; }
-      else if(r.ambiguous){ return { reply:'\u201c'+input+'\u201d matches several accounts: '+r.ambiguous.join(', ')+'. Type the exact one, or reply its number:\n'+paidAccountMenu() }; }
-      else { return { reply:'\u26A0\uFE0F \u201c'+input+'\u201d isn\u2019t one of the known accounts. Reply a number (1\u2013'+LEDGER_ACCOUNTS.length+') or type an exact account name:\n'+paidAccountMenu() }; }
-    }
-    session.answers.bankAc=acct;
     session.step='entity';
-    return { reply:'7/7 *Which entity / company?* — reply the number, or type the name:\n'+paidEntityMenu() };
+    return { reply:'6/7 *Which entity / company?* — reply the number, or type the name:\n'+paidEntityMenu() };
   }
   if(session.step==='entity'){
     var ent='';
@@ -1408,15 +1498,31 @@ async function paidFlowAdvance(session, inputRaw){
       else { return { reply:'\u26A0\uFE0F \u201c'+input+'\u201d isn\u2019t in the entity list. Reply a number (1\u2013'+LEDGER_ENTITIES.length+') or type an exact name:\n'+paidEntityMenu() }; }
     }
     session.answers.entity=ent;
-    var item={ id:session.itemId, entity:session.entity, bankAc:session.bankAc, description:session.description, label:session.label };
+    session.step='account';
+    return { reply:'7/7 *Paid from which account?* — reply the number, or type the account name:\n'+paidAccountMenu() };
+  }
+  if(session.step==='account'){
+    var acct='';
+    if(/^\d+$/.test(low)){
+      var ac=parseInt(low,10);
+      if(ac>=1 && ac<=LEDGER_ACCOUNTS.length){ acct=LEDGER_ACCOUNTS[ac-1]; }
+      else { return { reply:'Pick the account by number (1\u2013'+LEDGER_ACCOUNTS.length+') or type the account name:\n'+paidAccountMenu() }; }
+    } else {
+      var r=resolveAccount(input);
+      if(r.account){ acct=r.account; }
+      else if(r.ambiguous){ return { reply:'\u201c'+input+'\u201d matches several accounts: '+r.ambiguous.join(', ')+'. Type the exact one, or reply its number:\n'+paidAccountMenu() }; }
+      else { return { reply:'\u26A0\uFE0F \u201c'+input+'\u201d isn\u2019t one of the known accounts. Reply a number (1\u2013'+LEDGER_ACCOUNTS.length+') or type an exact account name:\n'+paidAccountMenu() }; }
+    }
+    session.answers.bankAc=acct;
+    var item={ id:session.itemId, seq:session.seq, entity:session.entity, bankAc:session.bankAc, description:session.description, label:session.label };
     session.row = assemblePaymentRow(item, session.answers);
     session.step='confirm';
     return { reply: paidRowPreview(session.row)+'\n\nReply *CONFIRM* to record, or *cancel*.' };
   }
   if(session.step==='confirm'){
     if(/^(confirm|yes|ok|y)$/i.test(low)){
-      return { reply:'\u2713 Recorded to the event store.', done:true,
-        recordArgs:{ itemId:session.itemId, label:session.label, paidAmount:session.answers.amount, row:session.row,
+      return { reply:'\u2713 Recorded.', done:true,
+        recordArgs:{ itemId:session.itemId, label:session.label, paidAmount:session.answers.amount, seq:session.seq, row:session.row,
           fields:{ date:session.row.date, mode:session.row.mode, head:session.row.head, tag:session.row.tag, person:session.row.person,
             transferTo:session.row.transferTo, entity:session.row.entity, bankAc:session.row.bankAc } } };
     }
@@ -1443,8 +1549,11 @@ async function handlePaidFlow(msg){
     // session (return true so the word is never fed into a Q&A step). ses is still
     // undefined here, so send()'s thread-append guard is a no-op for this message.
     if(/^(summary|status)$/i.test(body)){
-      try{ await send(formatPaymentsSummary(buildPaymentsSummary())); }
-      catch(e){ console.error('[PaidFlow] summary:', e.message); }
+      try{
+        var sm=buildPaymentsSummary();
+        savePaidSummaryMap({ at:new Date().toISOString(), items:(sm.numbered||[]).map(function(x){ return { n:x.n, itemId:x.itemId, label:x.label }; }) });
+        await send(formatPaymentsSummary(sm));
+      }catch(e){ console.error('[PaidFlow] summary:', e.message); }
       return true;
     }
 
@@ -1452,15 +1561,58 @@ async function handlePaidFlow(msg){
     var ses=st.sessions[who.key];
 
     if(!ses){
+      // v2.10.0-s5.14: close <n> [yes] — close/cancel an item as-is (anyone in the group, incl. accountants).
+      var cm = body.match(/^close\s+(\d+)(\s+yes)?\s*$/i);
+      if(cm){
+        var cn = parseInt(cm[1],10), cConfirm = !!cm[2];
+        var cmi = summaryItemByNumber(cn);
+        if(!cmi){ await send('I don\u2019t have item #'+cn+' in the latest summary. Type *summary* to refresh the list, then *close '+cn+'*.'); return true; }
+        var cStore = loadEventStore();
+        if(isClosed(cStore, cmi.itemId)){ await send('*'+(cmi.label||cmi.itemId)+'* is already closed.'); return true; }
+        var cRec = findPostedRec(loadPaidPosted(), cmi.itemId);
+        var cApproved = cRec ? (cRec.amount||0) : 0;
+        var cPaid = paidStatsForItem(cStore, cmi.itemId).total;
+        var cWriteOff = Math.max(0, cApproved - cPaid);
+        if(!cConfirm){
+          var cLine = cPaid>0
+            ? ('Approved \u20B9'+formatINR(cApproved)+' \u00B7 paid \u20B9'+formatINR(cPaid)+' \u2192 \u20B9'+formatINR(cWriteOff)+' written off, item closed.')
+            : ('Approved \u20B9'+formatINR(cApproved)+' \u00B7 paid \u20B90 \u2192 cancelled, nothing will be paid.');
+          await send('Close *'+(cmi.label||cmi.itemId)+'* as-is?\n'+cLine+'\nReply *close '+cn+' yes* to confirm.');
+          return true;
+        }
+        recordClosedEvent(cmi.itemId, cmi.label, cApproved, cPaid);
+        await send('\u2705 Closed *'+(cmi.label||cmi.itemId)+'* as-is \u2014 '+(cWriteOff>0?('\u20B9'+formatINR(cWriteOff)+' written off.'):'nothing outstanding.'));
+        return true;
+      }
+      // v2.10.0-s5.14: a bare number from the latest summary → log the next instalment for that item.
+      if(/^\d+$/.test(body)){
+        var nn = parseInt(body,10);
+        var nmi = summaryItemByNumber(nn);
+        if(!nmi){ await send('I don\u2019t have item #'+nn+'. Type *summary* to see the current list and numbers.'); return true; }
+        var nStore = loadEventStore();
+        if(isClosed(nStore, nmi.itemId)){ await send('*'+(nmi.label||nmi.itemId)+'* is closed. Reopen it from the dashboard if it needs more payments.'); return true; }
+        var nRec = findPostedRec(loadPaidPosted(), nmi.itemId);
+        if(!nRec){ await send('I can\u2019t find the posted item for #'+nn+'. Type *summary* to refresh.'); return true; }
+        ses = newPaidSession(nRec, nStore, who.name);
+        if(ses.balance<=0){ await send('*'+ses.label+'* is already fully paid (\u20B9'+formatINR(ses.amount)+'). Nothing left to log.'); return true; }
+        st.sessions[who.key]=ses; savePaidState(st);
+        try{ if(msg.id) appendThreadMsg(ses.itemId, msg.id._serialized); }catch(e){}
+        var nNth = ses.seq>1 ? (' (instalment #'+ses.seq+')') : '';
+        await send((who.name?who.name+' \u2014 ':'')+'logging payment for *'+ses.label+'*'+nNth+'.\nApproved \u20B9'+formatINR(ses.amount)+' \u00B7 paid so far \u20B9'+formatINR(ses.paidSoFar)+' \u00B7 *balance \u20B9'+formatINR(ses.balance)+'*\n\n1/7 *Amount paid?* — reply "ok" for \u20B9'+formatINR(ses.balance)+', or type the actual amount.');
+        return true;
+      }
+      // "paid" on a quoted post — start/continue (instalment-aware).
       if(!/^paid\b/i.test(body)) return false;          // not in a flow, not a trigger
       var item=await resolvePostedItem(msg);
-      if(!item){ await send((who.name?who.name+': ':'')+'I don\'t see a posted approved item to mark paid. Reply "paid" on the approved item I post here.'); return true; }
-      ses={ itemId:item.id, label:item.label, amount:item.amount, entity:item.entity, bankAc:item.bankAc,
-        description:item.description||item.label, step:'amount', answers:{},
-        startedAt:new Date().toISOString(), lastAt:new Date().toISOString(), by:who.name };
+      if(!item){ await send((who.name?who.name+': ':'')+'I don\'t see a posted approved item to mark paid. Reply "paid" on the approved item I post here, or type *summary* and reply with its number.'); return true; }
+      var pStore = loadEventStore();
+      if(isClosed(pStore, item.id)){ await send('*'+(item.label||item.id)+'* is closed.'); return true; }
+      ses = newPaidSession(item, pStore, who.name);
+      if(ses.balance<=0){ await send('*'+ses.label+'* is already fully paid (\u20B9'+formatINR(ses.amount)+').'); return true; }
       st.sessions[who.key]=ses; savePaidState(st);
       try{ if(msg.id) appendThreadMsg(ses.itemId, msg.id._serialized); }catch(e){}   // the "paid" trigger msg
-      await send((who.name?who.name+' \u2014 ':'')+'marking *'+ses.label+'* (approved Rs.'+formatINR(ses.amount)+') as paid.\n\n1/7 *Amount paid?* — reply "ok" for Rs.'+formatINR(ses.amount)+', or type the actual amount.');
+      var pNth = ses.seq>1 ? (' (instalment #'+ses.seq+')') : '';
+      await send((who.name?who.name+' \u2014 ':'')+'marking *'+ses.label+'*'+pNth+' as paid.\nApproved \u20B9'+formatINR(ses.amount)+(ses.paidSoFar>0?(' \u00B7 paid so far \u20B9'+formatINR(ses.paidSoFar)+' \u00B7 *balance \u20B9'+formatINR(ses.balance)+'*'):'')+'\n\n1/7 *Amount paid?* — reply "ok" for \u20B9'+formatINR(ses.balance)+', or type the actual amount.');
       return true;
     }
 
@@ -1477,7 +1629,7 @@ async function handlePaidFlow(msg){
     ses.lastAt=new Date().toISOString();
     var ledgerSuffix='';
     if(out.recordArgs){
-      try{ recordPaidEvent(out.recordArgs.itemId, out.recordArgs.label, out.recordArgs.paidAmount, out.recordArgs.fields); }
+      try{ recordPaidEvent(out.recordArgs.itemId, out.recordArgs.label, out.recordArgs.paidAmount, out.recordArgs.fields, out.recordArgs.seq); }
       catch(e){ console.error('[PaidFlow] recordPaidEvent:', e.message); }
       // v2.10.0-s4: attempt the ledger write (no-op while capture-only; logs in dry-run)
       try{
@@ -4230,7 +4382,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.13',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.16',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -4627,6 +4779,7 @@ var OUTFLOW_QUEUE_HTML = `<!DOCTYPE html>
   th{color:#8b93a3;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
   .amt{text-align:right;white-space:nowrap;} .st{font-size:11px;padding:2px 7px;border-radius:20px;}
   .pending{background:#3a2f12;color:#e5c97a;} .posted{background:#16324a;color:#7fb0e0;} .paid{background:#16402a;color:#76c596;}
+  .part-paid{background:#3a2f12;color:#f0c66b;} .closed{background:#3a1f1f;color:#d98a8a;}
   .push{background:#1f3a5f;border-color:#34507a;color:#cfe3ff;padding:5px 10px;font-size:12px;}
   .msg{margin:10px 0;padding:8px 10px;border-radius:8px;font-size:12px;display:none;}
   .ok{background:#16321f;color:#8fd6a6;} .err{background:#3a1c1c;color:#e09a9a;}
@@ -4992,6 +5145,7 @@ app.get('/api/outflow-catchup',async function(req,res){try{if(!waReady)return re
 app.get('/api/outflow-queue',function(req,res){res.type('html').send(OUTFLOW_QUEUE_HTML);});
 app.get('/api/outflow-log',function(req,res){try{var items=buildOutflowLog();var paidCount=items.filter(function(x){return x.paid;}).length;res.json({count:items.length,paidCount:paidCount,postedCount:items.length-paidCount,items:items});}catch(e){res.json({error:e.message});}});
 app.get('/api/paid-undo',function(req,res){try{var id=req.query.id;if(!id)return res.json({error:'missing id'});res.json(markItemUnpaid(id));}catch(e){res.json({error:e.message});}});
+app.get('/api/payment-reopen',function(req,res){try{var id=req.query.id;if(!id)return res.json({error:'missing id'});res.json(reopenItem(id));}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-unpost',async function(req,res){try{var id=req.query.id;if(!id)return res.json({error:'missing id'});var del=req.query.deleteMsg==='1'||req.query.deleteMsg==='true';res.json(await unpostOutflowItem(id,del));}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-scan',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var count=await scanStalePendings();res.json({success:true,remindersSent:count});}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-state',function(req,res){try{res.json(loadStaleState());}catch(e){res.json({error:e.message});}});
@@ -5077,7 +5231,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.10.0-s5.13 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.10.0-s5.16 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
