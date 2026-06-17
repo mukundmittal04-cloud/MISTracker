@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.10.0-s5.12 — added /api/ledger-test-write (lock-protected rehearsal trigger): builds a row via the same assemblePaymentRow and fires the same gated writeRowToLedger, tagged [bot:test-<ts>] in col L. Lets a same-day or back-dated write be fired from the browser to verify the executor on Copy of Ledger without WhatsApp. Confirmed (live) the new-day clone target: date breaker =DATE(y,m,d) and DAY TOTAL formulas are all RELATIVE (C=SUMIFS IN ref A<daterow>, G=SUMIFS OUT, J=C-G) so copyPaste repoints them; bot clones the 2-row date+total breaker (no repeated header, matching the newest day). entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
+// FIDATO MIS SERVER v2.10.0-s5.13 — added /api/outflow-post-dummy (lock-protected): posts a ⟨TEST⟩-tagged PAYMENT DUE item via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the OUTFLOW_POST toggle so it works while posting is OFF; registered in paid_posted.json so a "paid" reply matches back and it shows in the summary). Item id test-<ts> => any ledger row it produces is tagged [bot:test-…] for cleanup. Params: label, amount, optional entity/account. Also added an on-demand summary/status command in the outflow group (works for accountants AND M/S, who are whitelisted): replies with Approved(due)/Paid/Yet-to-pay counts + ₹ totals, yet-to-pay itemised, in the agreed layout. buildPaymentsSummary is a pure status-partition of the POSTED universe valued at the posted/approved (due) amount, so Approved = Paid + Yet-to-pay always reconciles (self-checking); formatPaymentsSummary renders it; both offline-tested. Held / Do-not-pay deferred (no way to set them yet). Prior: v2.10.0-s5.12 — added /api/ledger-test-write (lock-protected rehearsal trigger): builds a row via the same assemblePaymentRow and fires the same gated writeRowToLedger, tagged [bot:test-<ts>] in col L. Lets a same-day or back-dated write be fired from the browser to verify the executor on Copy of Ledger without WhatsApp. Confirmed (live) the new-day clone target: date breaker =DATE(y,m,d) and DAY TOTAL formulas are all RELATIVE (C=SUMIFS IN ref A<daterow>, G=SUMIFS OUT, J=C-G) so copyPaste repoints them; bot clones the 2-row date+total breaker (no repeated header, matching the newest day). entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -1178,6 +1178,67 @@ function buildOutflowLog(){
   rows.sort(function(a,b){ var ta=Date.parse((a.paidDetails&&a.paidDetails.at)||a.postedAt||0)||0, tb=Date.parse((b.paidDetails&&b.paidDetails.at)||b.postedAt||0)||0; return tb-ta; });
   return rows;
 }
+// ── v2.10.0-s5.13: on-demand payments summary (Approved-due / Paid / Yet-to-pay) ──
+// Pure roll-up over the POSTED universe (everything pushed to the payments group, deduped
+// by item id), partitioned by paid status from the event store. Paid and Yet-to-pay are a
+// partition of the same posted items, each valued at its posted/approved (due) amount, so
+// the identity Approved = Paid + Yet-to-pay ALWAYS holds — the summary is self-checking.
+// (Actual cash paid can differ from the due amount; that is a reconciliation concern, not
+// this summary's — flip `amount`→paidAmount in the paid bucket if you want cash-out totals.)
+// Held / Do-not-pay are NOT modelled yet (no way to set them); deferred.
+function buildPaymentsSummary(pp, store){
+  pp = pp || loadPaidPosted();
+  store = store || loadEventStore();
+  var paidByItem = {};
+  (store.events||[]).forEach(function(e){ if(e.type==='paid' && e.itemId) paidByItem[e.itemId]=e; });
+  var seen={}, approved=[], paid=[], yetToPay=[];
+  (pp.recent||[]).forEach(function(rec){
+    if(!rec || seen[rec.id]) return; seen[rec.id]=true;
+    var entry = { itemId:rec.id, label:rec.label||rec.id, amount:rec.amount||0, entity:rec.entity||'', bankAc:rec.bankAc||'' };
+    approved.push(entry);
+    if(paidByItem[rec.id]) paid.push(entry); else yetToPay.push(entry);
+  });
+  function tot(arr){ return arr.reduce(function(s,x){ return s+(x.amount||0); },0); }
+  return {
+    approved:{ count:approved.length, total:tot(approved), items:approved },
+    paid:{ count:paid.length, total:tot(paid), items:paid },
+    yetToPay:{ count:yetToPay.length, total:tot(yetToPay), items:yetToPay },
+    reconciles: (tot(paid)+tot(yetToPay))===tot(approved)
+  };
+}
+// Render the summary in the agreed WhatsApp layout. `now` is injectable for deterministic tests.
+function formatPaymentsSummary(sum, now){
+  now = now || new Date();
+  var DIV='\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500';
+  if(!sum || sum.approved.count===0){
+    return '\uD83D\uDCCA *PAYMENTS SUMMARY*\n'+DIV+'\nNothing has been posted to the payments group yet.\nApprove an item (or run a \u27E8TEST\u27E9 dummy post) and it will show here.';
+  }
+  var dateStr = now.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',timeZone:'Asia/Kolkata'});
+  var timeStr = now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'Asia/Kolkata'}).toLowerCase();
+  var L=[];
+  L.push('\uD83D\uDCCA *PAYMENTS SUMMARY*');
+  L.push(dateStr+' \u00B7 '+timeStr);
+  L.push(DIV);
+  L.push('\u2705 *Approved (due):*  '+sum.approved.count+' \u00B7 \u20B9'+formatINR(sum.approved.total));
+  L.push('\uD83D\uDCB8 *Paid:*  '+sum.paid.count+' \u00B7 \u20B9'+formatINR(sum.paid.total));
+  L.push('\uD83D\uDD53 *Yet to pay:*  '+sum.yetToPay.count+' \u00B7 \u20B9'+formatINR(sum.yetToPay.total));
+  L.push('');
+  L.push('*Yet to pay \u2014*');
+  if(sum.yetToPay.count===0){
+    L.push('_None \u2014 every approved payment is done._');
+  } else {
+    var CAP=30, list=sum.yetToPay.items.slice(0,CAP);
+    list.forEach(function(it,i){
+      var label=(it.label||'').replace(/\n/g,' ').trim();
+      if(label.length>40) label=label.substring(0,40)+'\u2026';
+      L.push((i+1)+'. '+label+'  \u20B9'+formatINR(it.amount));
+    });
+    if(sum.yetToPay.count>CAP) L.push('\u2026 +'+(sum.yetToPay.count-CAP)+' more');
+  }
+  L.push(DIV);
+  L.push('Approved = Paid + Yet to pay');
+  return L.join('\n');
+}
 // Mark a paid expense back to UNPAID — removes its paid event(s) so it can be re-tested.
 function markItemUnpaid(itemId){
   var store=loadEventStore(); var before=store.events.length;
@@ -1377,6 +1438,16 @@ async function handlePaidFlow(msg){
     if(!body) return false;
     var send=function(t){ return waClient.sendMessage(CONFIG.PAYMENT_OUTFLOW_GROUP_JID, t).then(function(m){ try{ if(ses && m && m.id) appendThreadMsg(ses.itemId, m.id._serialized); }catch(e){} return m; }); };
 
+    // v2.10.0-s5.13: on-demand payments summary. "summary"/"status" replies with the
+    // Approved-due / Paid / Yet-to-pay roll-up. Answered without touching any open paid
+    // session (return true so the word is never fed into a Q&A step). ses is still
+    // undefined here, so send()'s thread-append guard is a no-op for this message.
+    if(/^(summary|status)$/i.test(body)){
+      try{ await send(formatPaymentsSummary(buildPaymentsSummary())); }
+      catch(e){ console.error('[PaidFlow] summary:', e.message); }
+      return true;
+    }
+
     var st=loadPaidState(); prunePaidState(st);
     var ses=st.sessions[who.key];
 
@@ -1439,7 +1510,8 @@ function loadOutflowPostEnabled(){
   return OUTFLOW_POST_ENABLED;   // env-var default until the dashboard toggle overrides it
 }
 function saveOutflowPostEnabled(on){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(OUTFLOW_POST_STATE_FILE, JSON.stringify({enabled:!!on, at:new Date().toISOString()})); }catch(e){ console.error('[Outflow] toggle save:',e.message); } }
-async function postApprovedToOutflow(item, amount, force){
+async function postApprovedToOutflow(item, amount, force, opts){
+  opts = opts || {};
   if(!force && !loadOutflowPostEnabled()) return false;   // auto path respects the live toggle; manual/sweep passes force
   if(!waReady || !waClient || !item || !item.id) return false;
   if(alreadyPosted(item.id)) return false;          // never double-post
@@ -1447,7 +1519,10 @@ async function postApprovedToOutflow(item, amount, force){
     var entity = item.entity || '';
     var bankAc = item.bankAc || '';
     var desc   = item.description || item.label || '';
-    var lines = ['*PAYMENT DUE* \u2014 approved by M+S', '', desc, '*Rs.'+formatINR(amount)+'*'];
+    // v2.10.0-s5.13: a dummy/test post (opts.test) is identical to the real bridge post but carries a
+    // visible \u27E8TEST\u27E9 tag in the header so it can never be mistaken for a real payment-due item.
+    var header = opts.test ? '*PAYMENT DUE*  \u27E8TEST\u27E9 \u2014 approved by M+S' : '*PAYMENT DUE* \u2014 approved by M+S';
+    var lines = [header, '', desc, '*Rs.'+formatINR(amount)+'*'];
     if(entity) lines.push('Company: '+entity);
     if(bankAc) lines.push('From: '+bankAc);
     lines.push('', 'Once paid, reply *paid* on this message to log it.');
@@ -4155,7 +4230,7 @@ function buildReportHTML(data){
   return h;
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.12',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.13',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -4326,6 +4401,7 @@ var TABS = [
     {ep:'/api/outflow-post-status', ico:'\\u2139', label:'Outflow posting status'},
     {ep:'/api/outflow-post-on', ico:'\\uD83D\\uDE80', label:'Outflow posting ON (go live)', act:true, confirm:'Start auto-posting approved items into the payments group for accountants to mark paid? (Still capture-only — no Sheet write.)'},
     {ep:'/api/outflow-post-off', ico:'\\u23F9', label:'Outflow posting OFF', act:true, confirm:'Stop posting approved items to the payments group?'},
+    {ep:'/api/outflow-post-dummy?label=Test%20payment%20due&amount=111190', ico:'\\uD83E\\uDDEA', label:'Post a ⟨TEST⟩ payment-due (dummy)', act:true, confirm:'Post a ⟨TEST⟩-tagged dummy PAYMENT DUE item into the payments group? It is clearly marked test and safe to use freely (it posts even when outflow posting is OFF). Reply paid on it, or type summary in the group, to exercise the flow.'},
     {ep:'/api/ledger-write-status', ico:'\\uD83D\\uDCD2', label:'Ledger write status'},
     {ep:'/api/ledger-dryrun-on', ico:'\\uD83E\\uDDEA', label:'Ledger dry-run ON (rehearsal)', act:true, confirm:'Turn ledger dry-run ON? The bot will log the row it would write but write nothing — this also pauses any real writes.'},
     {ep:'/api/ledger-dryrun-off', ico:'\\u270D', label:'Ledger dry-run OFF', act:true, confirm:'Turn ledger dry-run OFF? If LEDGER_WRITE_ENABLED is on, confirmed rows will then be written to the actual Sheet.'},
@@ -4870,6 +4946,24 @@ app.get('/api/silent-status',function(req,res){try{res.json({silentMode:loadSile
 app.get('/api/outflow-post-on',function(req,res){try{saveOutflowPostEnabled(true);res.json({success:true,outflowPosting:true,message:'Outflow posting ON. Newly approved items will auto-post to the payments group for the accountants to mark paid. (Still capture-only — no Sheet write.)'});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-off',function(req,res){try{saveOutflowPostEnabled(false);res.json({success:true,outflowPosting:false,message:'Outflow posting OFF. Approved items will no longer be posted to the payments group.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-status',function(req,res){try{res.json({outflowPosting:loadOutflowPostEnabled(),envDefault:OUTFLOW_POST_ENABLED,note:'Panel toggle overrides the OUTFLOW_POST_ENABLED env default once set.'});}catch(e){res.json({error:e.message});}});
+// v2.10.0-s5.13: lock-protected dummy payment-due. Posts a \u27E8TEST\u27E9-tagged PAYMENT DUE item into the
+// outflow group via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the toggle, so
+// it works even when outflow posting is OFF), registered so a "paid" reply matches back and it appears in
+// the summary. Item id is test-<ts> => any ledger row it produces is tagged [bot:test-...] for cleanup.
+// Params: label (required-ish; defaults), amount (required), optional entity & account.
+app.get('/api/outflow-post-dummy',async function(req,res){
+  try{
+    if(!waReady) return res.json({error:'WhatsApp not connected'});
+    var label = (req.query.label||'').toString().trim() || 'TEST payment-due item';
+    var amount = parseAmount(String(req.query.amount||'')) || parseFloat(req.query.amount);
+    if(!amount) return res.json({error:'missing/invalid amount \u2014 pass &amount=12345'});
+    var id = 'test-'+Date.now()+'-'+Math.random().toString(36).slice(2,6);
+    var item = { id:id, label:label, description:label, entity:(req.query.entity||'PDC'), bankAc:(req.query.account||'') };
+    var ok = await postApprovedToOutflow(item, amount, true, { test:true });
+    res.json(ok ? { posted:true, itemId:id, label:label, amount:amount, note:'\u27E8TEST\u27E9 payment-due posted to the outflow group. Reply "paid" on it, or type "summary" in the group, to exercise the flow.' }
+                : { error:'post failed (WhatsApp down, or duplicate id)' });
+  }catch(e){ res.json({error:e.message}); }
+});
 app.get('/api/ledger-dryrun-on',function(req,res){try{saveLedgerDryrun(true);res.json({success:true,dryRun:true,message:'Ledger dry-run ON. The bot computes the exact row+target it would write and logs it, but writes nothing — even if LEDGER_WRITE_ENABLED is on. Safe rehearsal / runtime pause.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/ledger-dryrun-off',function(req,res){try{saveLedgerDryrun(false);res.json({success:true,dryRun:false,message:'Ledger dry-run OFF. If LEDGER_WRITE_ENABLED is on, confirmed rows will now actually be written to the Sheet; if it is off, the bot stays capture-only.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/ledger-write-status',function(req,res){try{var dry=loadLedgerDryrun();var live=LEDGER_WRITE_ENABLED;var posture=dry?'DRY-RUN (rehearsal — nothing written)':(live?'LIVE (rows are written to the Sheet)':'CAPTURE-ONLY (no write)');res.json({posture:posture,dryRun:dry,writeEnabled:live,sheetScope:(live?'read/write':'read-only'),writeTab:LEDGER_WRITE_TAB,newDayBlocks:NEWDAY_BLOCK_CREATE_ENABLED,note:'Dry-run wins over write-enabled. LEDGER_WRITE_ENABLED is env+redeploy (it sets the OAuth scope); dry-run is a live panel toggle.'});}catch(e){res.json({error:e.message});}});
@@ -4983,7 +5077,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.10.0-s5.12 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.10.0-s5.13 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
