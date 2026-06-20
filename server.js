@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.10.0-s5.21 — INFLOW + TRANSFER group (one group, INFLOW_GROUP_JID, default 120363429672822928@g.us). Routed by first word: "received …" → INFLOW (writes an IN row; Tag = receivable code from LEDGER_INFLOW_TAGS so the Site+Projections receivables SUMIFS pick it up; Description = payer; bankAc = account received into; questions amount→date→mode→head→tag→entity→into-account→from-whom→CONFIRM). "transfer …" → TRANSFER (writes a TRANSFER row; bankAc = from, transferTo = to, IN/OUT = TRANSFER so it's excluded from IN/OUT day totals; questions amount→date→mode→from-acct→to-acct→entity→CONFIRM). The opening line is parsed for amount (handles "5 lakh"/"1.5 cr"), mode keyword, transfer from/to accounts, and inflow payer/into-account; pre-filled slots are skipped and only the missing answers are asked; CONFIRM always shows the full row preview so any misread is caught before writing. Reuses the existing question validators, writeRowToLedger (same dry-run / LEDGER_WRITE_ENABLED / LEDGER_WRITE_TAB / new-day-block gating + [bot:<id>] dedupe), day-block creation, and accountant auth. New: handleInflowFlow adapter wired into the message dispatcher ahead of handlePaidFlow; sessions namespaced (#io) so they never collide with an outflow paid session. Simple logger for now (no event-store tracking / summary / part-receipt / unit register — those are the later layers). NOTE: the receivable tags must be added to the Ledger Tag dropdown; transfer rows leave Head blank. Prior: v2.10.0-s5.16 — corrected Tag and Head to the VERIFIED live dropdowns (screenshots 17 Jun). TAG is now the project cost-code set (FBD-Contractor/Steel/RMC/Exterior/STP/Road/SCO/Electricity/Diesel/Other, VRN-Contractor/Steel/RMC/Electricity/Site/Other, FBD/VRN Floor/Plot/Other-Collection, and a blank '—'); the old generic Tag values (Office/Legal/Salary/Directors-SM/-MM/Loan) were never real Tags — they are HEADS. HEAD is now the verified expense-nature set (Capital Site, Vrindavan, Office GK-1, Legal, Directors, Salary, Loan, Site, Drawing, Office Exp, Legal Exp, Diesel, Electricity, Other, Noida 153, Noida TS-3) and the Head step (4/7) is now a VALIDATED picklist like Tag/Account/Entity (number / "ok" guess / exact name; off-list rejected) — no longer free-form. Realigned the guessers: aiGuessTag prompt updated to project cost-codes only (Head nature lives in Head; off-list→dash); aiGuessHead now constrained to LEDGER_HEADS; guessHeadFallback returns only in-list heads; guessTagAndPerson rewritten to infer a valid project code (proj×category, else the project's -Other, else none) + promoter Person (SM/MM) from the description/entity, and the tag guess is guarded to in-list. Removed the now-dead TAG_QUICK. Prior: v2.10.0-s5.15 — FULL numbered pickers for Mode, Tag and Head in the paid flow. Mode (3/7) and Tag (5/7) now render the COMPLETE list vertically (Tag = all 19 LEDGER_TAGS, not just the 6 quick picks; a tag number now indexes the full list); Head (4/7) gains a numbered quick-pick list (LEDGER_HEADS, PROVISIONAL) shown alongside the AI guess — "ok"=guess, a number picks from the list, or type any Head (Head stays free-form). paidModeMenu/paidTagMenu now use the shared vertical paidNumberedMenu; added paidHeadMenu. No model/flow changes otherwise. Prior: v2.10.0-s5.14 — PART-PAYMENT TRACKING + interactive two-group summary + close/cancel. The paid flow now allows MANY instalments per approved item: each completed flow records its own paid event (seq-aware dedupe key paid:<id>#<seq>) and its own ledger row tagged [bot:<id>#<seq>] (distinct + idempotent per planLedgerWrite). Per item we derive approved (posted/due), paid (Σ instalments), balance; states fresh/part-paid/settled. The "amount paid?" step now defaults "ok" to the remaining BALANCE, not the full approved. Question order swapped: …tag → 6/7 ENTITY → 7/7 ACCOUNT → CONFIRM (was account then entity). buildPaymentsSummary is now a CUMULATIVE roll-up: Paid = actual cash out; identity Paid + Outstanding + Closed = Approved (Closed term shown only when present). formatPaymentsSummary renders two labelled groups — ⚪ FRESH (not yet paid) on top, 🟡 PART-PAID below — with CONTINUOUS numbering (Fresh first), oldest-approved first; settled items drop off. The summary persists its number→item map (paid_summary_map.json) so in the outflow group a bare NUMBER logs the next instalment for that item (balance pre-filled, instalment-aware "paid so far / balance"), and CLOSE <n> / CLOSE <n> yes closes/cancels an item as-is (accountants allowed): under-settled → remaining written off, never-paid → fully cancelled; closing writes NO ledger row. Reopen via /api/payment-reopen?id=. buildOutflowLog sums instalments and reports status posted/part-paid/paid/closed (+ dashboard pill CSS). Prior: v2.10.0-s5.13 — added /api/outflow-post-dummy (lock-protected): posts a ⟨TEST⟩-tagged PAYMENT DUE item via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the OUTFLOW_POST toggle so it works while posting is OFF; registered in paid_posted.json so a "paid" reply matches back and it shows in the summary). Item id test-<ts> => any ledger row it produces is tagged [bot:test-…] for cleanup. Params: label, amount, optional entity/account. Also added an on-demand summary/status command in the outflow group (works for accountants AND M/S, who are whitelisted): replies with Approved(due)/Paid/Yet-to-pay counts + ₹ totals, yet-to-pay itemised, in the agreed layout. buildPaymentsSummary is a pure status-partition of the POSTED universe valued at the posted/approved (due) amount, so Approved = Paid + Yet-to-pay always reconciles (self-checking); formatPaymentsSummary renders it; both offline-tested. Held / Do-not-pay deferred (no way to set them yet). Prior: v2.10.0-s5.12 — added /api/ledger-test-write (lock-protected rehearsal trigger): builds a row via the same assemblePaymentRow and fires the same gated writeRowToLedger, tagged [bot:test-<ts>] in col L. Lets a same-day or back-dated write be fired from the browser to verify the executor on Copy of Ledger without WhatsApp. Confirmed (live) the new-day clone target: date breaker =DATE(y,m,d) and DAY TOTAL formulas are all RELATIVE (C=SUMIFS IN ref A<daterow>, G=SUMIFS OUT, J=C-G) so copyPaste repoints them; bot clones the 2-row date+total breaker (no repeated header, matching the newest day). entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
+// FIDATO MIS SERVER v2.11.0-s6.1 - PAYABLE CODE (stage 2a+2b of the build). mintPayableCode -> P-YYMMDD-NNN with a DAILY-RESET counter derived from existing approved-event codes for that IST day (single-threaded store, no double-issue). recordApprovedEvent now MINTS + stores `code` on the approved event at full M+S approval (idempotent: re-approval keeps the existing code, adds no dup). payableCodeFor(itemId) resolves it. assemblePaymentRow ledger Notes tag switched from [bot:<id>] to [bot:<P-code>#seq] (falls back to <id> for TEST/inflow/transfer rows that have no code) so bot-written ledger rows reconcile by EXACT JOIN on the code instead of fuzzy matching. One-time back-fill buildPayableCodeBackfill + GET /api/payable-code-backfill[?commit=1] codes the existing approved events in seq order using their recorded `at` date (the 30 historical ones batch as P-260620-NNN since the s5.20 catch-up recorded them on 20 Jun); dry-run by default, idempotent on commit. Offline-tested (14 assertions). BACKEND-ONLY: code is never shown to accountants. STILL TO BUILD (stage 2c+2d): amount-step 3-way branch (=balance settle / <balance part-vs-reduced prompt / >balance BLOCK + no write) and re-approval bounce to the approval group (pick-list reason; mid-stream + final-instalment message variants) with the M+S unlock that lifts the Payable amount. Prior: v2.11.0-s6.0 - CATEGORISED PAYMENTS SUMMARY (STAGE 1 of the Payable-code build). buildPaymentsSummary/formatPaymentsSummary rewritten into three labelled blocks: a header scorecard (Approved-due / Outstanding / Paid-to-date + last-Nd / Part-paid-balance / Closed); APPROVED-NOT-PAID (fresh items, sorted BIGGEST AMOUNT FIRST, NO cap, numbered for reply-to-pay); PART-PAID (paid/of/balance, numbered for next instalment); and PAID-last-N-days (CALENDAR window PAID_WINDOW_DAYS=3 = today + N-1 prior, computed via payDayIndex/payDateLabel on an IST day-index so it does not wobble by time-of-day; shows amount+date, check-marked not numbered). Footer self-checks Paid+Outstanding[+Closed]=Approved. NO P- code shown to accountants. Trigger unchanged: 'summary'/'status' in the outflow group; numbered map (fresh+part-paid only) still drives reply-number. STILL TO BUILD (next stages): P-YYMMDD-NNN daily-reset code minted at full M+S approval + [bot:P-] ledger tag; bot writes REAL Ledger (repoint LEDGER_WRITE_TAB); amount-step 3-way branch (=balance settle / <balance part-vs-reduced prompt / >balance BLOCK + no ledger write); re-approval bounce to approval group with pick-list reason (mid-stream AND final-instalment message variants, auto-selected); test/[See image]/duplicate cleanup of paid_posted.json; 'paid all' full-history command. Prior: v2.10.0-s5.21 - INFLOW + TRANSFER group (one group, INFLOW_GROUP_JID, default 120363429672822928@g.us). Routed by first word: "received …" → INFLOW (writes an IN row; Tag = receivable code from LEDGER_INFLOW_TAGS so the Site+Projections receivables SUMIFS pick it up; Description = payer; bankAc = account received into; questions amount→date→mode→head→tag→entity→into-account→from-whom→CONFIRM). "transfer …" → TRANSFER (writes a TRANSFER row; bankAc = from, transferTo = to, IN/OUT = TRANSFER so it's excluded from IN/OUT day totals; questions amount→date→mode→from-acct→to-acct→entity→CONFIRM). The opening line is parsed for amount (handles "5 lakh"/"1.5 cr"), mode keyword, transfer from/to accounts, and inflow payer/into-account; pre-filled slots are skipped and only the missing answers are asked; CONFIRM always shows the full row preview so any misread is caught before writing. Reuses the existing question validators, writeRowToLedger (same dry-run / LEDGER_WRITE_ENABLED / LEDGER_WRITE_TAB / new-day-block gating + [bot:<id>] dedupe), day-block creation, and accountant auth. New: handleInflowFlow adapter wired into the message dispatcher ahead of handlePaidFlow; sessions namespaced (#io) so they never collide with an outflow paid session. Simple logger for now (no event-store tracking / summary / part-receipt / unit register — those are the later layers). NOTE: the receivable tags must be added to the Ledger Tag dropdown; transfer rows leave Head blank. Prior: v2.10.0-s5.16 — corrected Tag and Head to the VERIFIED live dropdowns (screenshots 17 Jun). TAG is now the project cost-code set (FBD-Contractor/Steel/RMC/Exterior/STP/Road/SCO/Electricity/Diesel/Other, VRN-Contractor/Steel/RMC/Electricity/Site/Other, FBD/VRN Floor/Plot/Other-Collection, and a blank '—'); the old generic Tag values (Office/Legal/Salary/Directors-SM/-MM/Loan) were never real Tags — they are HEADS. HEAD is now the verified expense-nature set (Capital Site, Vrindavan, Office GK-1, Legal, Directors, Salary, Loan, Site, Drawing, Office Exp, Legal Exp, Diesel, Electricity, Other, Noida 153, Noida TS-3) and the Head step (4/7) is now a VALIDATED picklist like Tag/Account/Entity (number / "ok" guess / exact name; off-list rejected) — no longer free-form. Realigned the guessers: aiGuessTag prompt updated to project cost-codes only (Head nature lives in Head; off-list→dash); aiGuessHead now constrained to LEDGER_HEADS; guessHeadFallback returns only in-list heads; guessTagAndPerson rewritten to infer a valid project code (proj×category, else the project's -Other, else none) + promoter Person (SM/MM) from the description/entity, and the tag guess is guarded to in-list. Removed the now-dead TAG_QUICK. Prior: v2.10.0-s5.15 — FULL numbered pickers for Mode, Tag and Head in the paid flow. Mode (3/7) and Tag (5/7) now render the COMPLETE list vertically (Tag = all 19 LEDGER_TAGS, not just the 6 quick picks; a tag number now indexes the full list); Head (4/7) gains a numbered quick-pick list (LEDGER_HEADS, PROVISIONAL) shown alongside the AI guess — "ok"=guess, a number picks from the list, or type any Head (Head stays free-form). paidModeMenu/paidTagMenu now use the shared vertical paidNumberedMenu; added paidHeadMenu. No model/flow changes otherwise. Prior: v2.10.0-s5.14 — PART-PAYMENT TRACKING + interactive two-group summary + close/cancel. The paid flow now allows MANY instalments per approved item: each completed flow records its own paid event (seq-aware dedupe key paid:<id>#<seq>) and its own ledger row tagged [bot:<id>#<seq>] (distinct + idempotent per planLedgerWrite). Per item we derive approved (posted/due), paid (Σ instalments), balance; states fresh/part-paid/settled. The "amount paid?" step now defaults "ok" to the remaining BALANCE, not the full approved. Question order swapped: …tag → 6/7 ENTITY → 7/7 ACCOUNT → CONFIRM (was account then entity). buildPaymentsSummary is now a CUMULATIVE roll-up: Paid = actual cash out; identity Paid + Outstanding + Closed = Approved (Closed term shown only when present). formatPaymentsSummary renders two labelled groups — ⚪ FRESH (not yet paid) on top, 🟡 PART-PAID below — with CONTINUOUS numbering (Fresh first), oldest-approved first; settled items drop off. The summary persists its number→item map (paid_summary_map.json) so in the outflow group a bare NUMBER logs the next instalment for that item (balance pre-filled, instalment-aware "paid so far / balance"), and CLOSE <n> / CLOSE <n> yes closes/cancels an item as-is (accountants allowed): under-settled → remaining written off, never-paid → fully cancelled; closing writes NO ledger row. Reopen via /api/payment-reopen?id=. buildOutflowLog sums instalments and reports status posted/part-paid/paid/closed (+ dashboard pill CSS). Prior: v2.10.0-s5.13 — added /api/outflow-post-dummy (lock-protected): posts a ⟨TEST⟩-tagged PAYMENT DUE item via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the OUTFLOW_POST toggle so it works while posting is OFF; registered in paid_posted.json so a "paid" reply matches back and it shows in the summary). Item id test-<ts> => any ledger row it produces is tagged [bot:test-…] for cleanup. Params: label, amount, optional entity/account. Also added an on-demand summary/status command in the outflow group (works for accountants AND M/S, who are whitelisted): replies with Approved(due)/Paid/Yet-to-pay counts + ₹ totals, yet-to-pay itemised, in the agreed layout. buildPaymentsSummary is a pure status-partition of the POSTED universe valued at the posted/approved (due) amount, so Approved = Paid + Yet-to-pay always reconciles (self-checking); formatPaymentsSummary renders it; both offline-tested. Held / Do-not-pay deferred (no way to set them yet). Prior: v2.10.0-s5.12 — added /api/ledger-test-write (lock-protected rehearsal trigger): builds a row via the same assemblePaymentRow and fires the same gated writeRowToLedger, tagged [bot:test-<ts>] in col L. Lets a same-day or back-dated write be fired from the browser to verify the executor on Copy of Ledger without WhatsApp. Confirmed (live) the new-day clone target: date breaker =DATE(y,m,d) and DAY TOTAL formulas are all RELATIVE (C=SUMIFS IN ref A<daterow>, G=SUMIFS OUT, J=C-G) so copyPaste repoints them; bot clones the 2-row date+total breaker (no repeated header, matching the newest day). entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -800,8 +800,34 @@ function recordVerdictEvent(itemId, label, amount, role, verdict, amendAmount, r
     raw: (raw||'').substring(0,200)
   }, 'verdict:'+itemId+':'+role+':'+verdict+':'+(amendAmount||0));
 }
-function recordApprovedEvent(itemId, label, amount){
-  return recordEvent('approved', { itemId:itemId, label:label, amount:amount }, 'approved:'+itemId);
+// ── v2.11.0-s6.1: Payable code P-YYMMDD-NNN (daily-reset counter, IST date) ──
+// Minted ONCE at full M+S approval and stored on the approved event. It is the durable
+// key carried into the ledger ([bot:P-...]) so reconciliation is an exact join, never a
+// fuzzy match. Counter is derived from existing approved-event codes for that IST day
+// (single-threaded event store => no double-issue). NOT shown to accountants.
+function mintPayableCode(atMs, store){
+  store = store || loadEventStore();
+  var d = new Date((atMs||Date.now()) + 5.5*3600000);   // shift to IST, then read UTC parts
+  var yy=String(d.getUTCFullYear()).slice(-2), mm=('0'+(d.getUTCMonth()+1)).slice(-2), dd=('0'+d.getUTCDate()).slice(-2);
+  var prefix='P-'+yy+mm+dd+'-', max=0;
+  (store.events||[]).forEach(function(e){
+    if(e.type==='approved' && e.code && e.code.indexOf(prefix)===0){
+      var n=parseInt(e.code.slice(prefix.length),10); if(!isNaN(n) && n>max) max=n;
+    }
+  });
+  return prefix + ('00'+(max+1)).slice(-3);
+}
+function findApprovedEvent(store, itemId){
+  var evs=(store && store.events || []).filter(function(e){ return e.type==='approved' && e.itemId===itemId; });
+  return evs.length ? evs[evs.length-1] : null;
+}
+// The Payable code for an item (null if the approval has no code yet, e.g. a TEST item).
+function payableCodeFor(itemId){ var e=findApprovedEvent(loadEventStore(), itemId); return (e && e.code) || null; }
+function recordApprovedEvent(itemId, label, amount, atMs){
+  var store=loadEventStore();
+  if(findApprovedEvent(store, itemId)) return false;   // already approved — keeps its existing code (idempotent)
+  var code=mintPayableCode(atMs||Date.now(), store);
+  return recordEvent('approved', { itemId:itemId, label:label, amount:amount, code:code }, 'approved:'+itemId);
 }
 function recordPaidEvent(itemId, label, paidAmount, fields, seq){
   seq = seq || 1;
@@ -979,7 +1005,7 @@ function assemblePaymentRow(item, answers){
     person: answers.person || '',                // derived from Tag (Directors-SM→SM)
     bankAc: answers.bankAc || item.bankAc || '', // prefer the account captured at payment time (request 'From' is often just the company)
     transferTo: '',                              // always blank (internal transfers manual)
-    notes: '[bot:'+(item.id||'')+(item.seq?('#'+item.seq):'')+']'   // v2.10.0-s5.14: #seq per instalment (distinct, idempotent rows)
+    notes: '[bot:'+(payableCodeFor(item.id)||item.id||'')+(item.seq?('#'+item.seq):'')+']'   // v2.11.0-s6.1: Payable code (falls back to id for TEST/non-coded items)
   };
 }
 // v2.10.0-s5.17: INFLOW row (IN) — money received. Tag = receivable code (drives the receivables
@@ -1258,78 +1284,91 @@ function buildOutflowLog(){
 // close/cancel — its unpaid slice is written off). Paid is now ACTUAL CASH OUT. The self-checking
 // identity becomes  Paid + Outstanding + Closed = Approved  (Closed term omitted when none).
 // Fresh + Part-paid get continuous numbering (Fresh first) so a single reply-number maps to one item.
-function buildPaymentsSummary(pp, store){
+function payDayIndex(e){
+  var d=e&&e.date;
+  if(d){ var m=String(d).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); if(m){ var y=+m[3]; if(y<100)y+=2000; return Math.floor(Date.UTC(y,+m[2]-1,+m[1])/86400000); } }
+  var at=Date.parse(e&&e.at); return isNaN(at)?null:Math.floor((at+5.5*3600000)/86400000);
+}
+function payDateLabel(e){
+  var d=e&&e.date;
+  if(d){ var m=String(d).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/); if(m){ var y=+m[3]; if(y<100)y+=2000; return new Date(Date.UTC(y,+m[2]-1,+m[1])).toLocaleDateString('en-IN',{day:'2-digit',month:'short',timeZone:'UTC'}); } }
+  var at=Date.parse(e&&e.at); return isNaN(at)?'':new Date(at).toLocaleDateString('en-IN',{day:'2-digit',month:'short',timeZone:'Asia/Kolkata'});
+}
+var PAID_WINDOW_DAYS = 3;   // "Paid . last N days" calendar window (today + N-1 prior). Configurable.
+// v2.11.0-s6.0: categorised summary — Approved.not-paid (biggest first) / Part-paid / Paid.last-Nd.
+// Self-checking identity Paid + Outstanding + Closed = Approved (all-time Paid). No P- code shown.
+function buildPaymentsSummary(pp, store, now){
   pp = pp || loadPaidPosted();
   store = store || loadEventStore();
-  var seen={}, fresh=[], partPaid=[], settledCount=0;
-  var approvedTotal=0, paidTotal=0, outstandingTotal=0, closedCount=0, closedWriteOff=0;
-  (pp.recent||[]).forEach(function(rec){
-    if(!rec || seen[rec.id]) return; seen[rec.id]=true;
-    var approved = rec.amount||0;
-    var s = paidStatsForItem(store, rec.id);
-    var paid = s.total;
-    approvedTotal += approved;
-    paidTotal += paid;                                  // actual cash out (incl. partials on closed items)
-    var entry = { itemId:rec.id, label:rec.label||rec.id, approved:approved, paid:paid,
-      balance:Math.max(0,approved-paid), entity:rec.entity||'', bankAc:rec.bankAc||'', at:rec.at };
-    if(isClosed(store, rec.id)){ closedCount++; closedWriteOff += Math.max(0, approved-paid); return; }
-    if(paid<=0){ fresh.push(entry); outstandingTotal += entry.balance; }
-    else if(paid < approved){ partPaid.push(entry); outstandingTotal += entry.balance; }
-    else { settledCount++; }                            // paid≥approved → settled, drops off
+  now = now || Date.now();
+  var todayIdx = Math.floor((now + 5.5*3600000)/86400000);
+  var cutoffIdx = todayIdx - (PAID_WINDOW_DAYS-1);
+  var seen={}, fresh=[], partPaid=[];
+  var approvedTotal=0,paidTotal=0,outstandingTotal=0,partBalanceTotal=0,closedCount=0,closedWriteOff=0,settledCount=0;
+  var paid3dTotal=0, paid3dByItem={};
+  (store.events||[]).forEach(function(e){
+    if(e.type!=='paid') return;
+    var di=payDayIndex(e);
+    if(di!=null && di>=cutoffIdx){
+      paid3dTotal+=(e.paidAmount||0);
+      if(!paid3dByItem[e.itemId]) paid3dByItem[e.itemId]={itemId:e.itemId,label:e.label||e.itemId,amt:0,idx:-1,dlabel:''};
+      paid3dByItem[e.itemId].amt+=(e.paidAmount||0);
+      if(di>paid3dByItem[e.itemId].idx){ paid3dByItem[e.itemId].idx=di; paid3dByItem[e.itemId].dlabel=payDateLabel(e); }
+    }
   });
-  function byOldest(a,b){ return (Date.parse(a.at)||0)-(Date.parse(b.at)||0); }
-  fresh.sort(byOldest); partPaid.sort(byOldest);        // oldest-approved first within each group
+  (pp.recent||[]).forEach(function(rec){
+    if(!rec||seen[rec.id]) return; seen[rec.id]=true;
+    var approved=rec.amount||0, s=paidStatsForItem(store,rec.id), paid=s.total;
+    approvedTotal+=approved; paidTotal+=paid;
+    var entry={itemId:rec.id,label:rec.label||rec.id,approved:approved,paid:paid,balance:Math.max(0,approved-paid),at:rec.at};
+    if(isClosed(store,rec.id)){ closedCount++; closedWriteOff+=Math.max(0,approved-paid); return; }
+    if(paid<=0){ fresh.push(entry); outstandingTotal+=entry.balance; }
+    else if(paid<approved){ partPaid.push(entry); outstandingTotal+=entry.balance; partBalanceTotal+=entry.balance; }
+    else { settledCount++; }
+  });
+  fresh.sort(function(a,b){ return b.approved-a.approved; });                 // biggest amount first
+  partPaid.sort(function(a,b){ return (Date.parse(a.at)||0)-(Date.parse(b.at)||0); });
   var n=0, numbered=[];
-  fresh.forEach(function(e){ e.n=++n; numbered.push(e); });      // Fresh numbered first (on top)
-  partPaid.forEach(function(e){ e.n=++n; numbered.push(e); });   // Part-paid continues the sequence
+  fresh.forEach(function(e){ e.n=++n; numbered.push(e); });
+  partPaid.forEach(function(e){ e.n=++n; numbered.push(e); });
+  var paidRecent=Object.keys(paid3dByItem).map(function(k){return paid3dByItem[k];}).sort(function(a,b){return b.idx-a.idx;});
+  var freshTotal=fresh.reduce(function(t,e){return t+e.approved;},0);
   return {
-    approved:{ count:Object.keys(seen).length, total:approvedTotal },
-    paid:{ total:paidTotal },
-    outstanding:{ total:outstandingTotal },
-    closed:{ count:closedCount, writeOff:closedWriteOff },
-    settledCount:settledCount,
-    fresh:fresh, partPaid:partPaid, numbered:numbered,
-    reconciles: (paidTotal + outstandingTotal + closedWriteOff) === approvedTotal
+    approved:{count:Object.keys(seen).length,total:approvedTotal}, paid:{total:paidTotal},
+    paid3d:{total:paid3dTotal,items:paidRecent,days:PAID_WINDOW_DAYS}, outstanding:{total:outstandingTotal},
+    partPaidBalance:{total:partBalanceTotal,count:partPaid.length}, closed:{count:closedCount,writeOff:closedWriteOff},
+    settledCount:settledCount, fresh:fresh, freshTotal:freshTotal, partPaid:partPaid, numbered:numbered,
+    reconciles:(paidTotal+outstandingTotal+closedWriteOff)===approvedTotal
   };
 }
-// Render the summary in the agreed WhatsApp layout. `now` is injectable for deterministic tests.
+// Render the categorised summary. `now` injectable for deterministic tests.
 function formatPaymentsSummary(sum, now){
-  now = now || new Date();
+  now=now||new Date();
   var DIV='\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500';
-  if(!sum || sum.approved.count===0){
-    return '\uD83D\uDCCA *PAYMENTS SUMMARY*\n'+DIV+'\nNothing has been posted to the payments group yet.\nApprove an item (or run a \u27E8TEST\u27E9 dummy post) and it will show here.';
-  }
-  function lbl(s){ s=(s||'').replace(/\n/g,' ').trim(); return s.length>40 ? s.substring(0,40)+'\u2026' : s; }
-  var dateStr = now.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',timeZone:'Asia/Kolkata'});
-  var timeStr = now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'Asia/Kolkata'}).toLowerCase();
-  var CAP=30, L=[];
-  L.push('\uD83D\uDCCA *PAYMENTS SUMMARY*');
-  L.push(dateStr+' \u00B7 '+timeStr);
-  L.push(DIV);
+  if(!sum||sum.approved.count===0) return '\uD83D\uDCCA *PAYMENTS SUMMARY*\n'+DIV+'\nNothing has been posted to the payments group yet.';
+  function lbl(s){ s=(s||'').replace(/\n/g,' ').trim(); return s.length>38?s.substring(0,38)+'\u2026':s; }
+  var dateStr=now.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric',timeZone:'Asia/Kolkata'});
+  var timeStr=now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true,timeZone:'Asia/Kolkata'}).toLowerCase();
+  var L=[];
+  L.push('\uD83D\uDCCA *PAYMENTS SUMMARY*'); L.push(dateStr+' \u00B7 '+timeStr); L.push(DIV);
   L.push('\u2705 *Approved (due):*  '+sum.approved.count+' \u00B7 \u20B9'+formatINR(sum.approved.total));
-  L.push('\uD83D\uDCB8 *Paid (cash out):*  \u20B9'+formatINR(sum.paid.total));
   L.push('\uD83D\uDD53 *Outstanding:*  \u20B9'+formatINR(sum.outstanding.total));
-  if(sum.closed.count>0) L.push('\uD83D\uDEAB *Closed/cancelled:*  '+sum.closed.count+' \u00B7 \u20B9'+formatINR(sum.closed.writeOff)+' written off');
-  if(sum.fresh.length){
-    L.push('');
-    L.push('\u26AA *FRESH* (not yet paid) \u2014 reply the number to start');
-    sum.fresh.slice(0,CAP).forEach(function(it){ L.push(it.n+'. '+lbl(it.label)+'  \u20B9'+formatINR(it.approved)); });
-    if(sum.fresh.length>CAP) L.push('\u2026 +'+(sum.fresh.length-CAP)+' more');
-  }
-  if(sum.partPaid.length){
-    L.push('');
-    L.push('\uD83D\uDFE1 *PART-PAID* \u2014 reply the number to log the next instalment');
-    sum.partPaid.slice(0,CAP).forEach(function(it){ L.push(it.n+'. '+lbl(it.label)+' \u2014 paid \u20B9'+formatINR(it.paid)+' of \u20B9'+formatINR(it.approved)+' \u00B7 *bal \u20B9'+formatINR(it.balance)+'*'); });
-    if(sum.partPaid.length>CAP) L.push('\u2026 +'+(sum.partPaid.length-CAP)+' more');
-  }
-  if(!sum.fresh.length && !sum.partPaid.length){
-    L.push('');
-    L.push('_Nothing outstanding \u2014 every approved payment is done or closed._');
-  }
+  L.push('\uD83D\uDCB8 *Paid to date:*  \u20B9'+formatINR(sum.paid.total)+'  \u00B7  last '+sum.paid3d.days+'d: \u20B9'+formatINR(sum.paid3d.total));
+  if(sum.partPaidBalance.count>0) L.push('\uD83D\uDFE1 *Part-paid:*  '+sum.partPaidBalance.count+' \u00B7 \u20B9'+formatINR(sum.partPaidBalance.total)+' balance');
+  if(sum.closed.count>0) L.push('\uD83D\uDEAB *Closed:*  '+sum.closed.count+' \u00B7 \u20B9'+formatINR(sum.closed.writeOff)+' written off');
   L.push(DIV);
-  L.push(sum.closed.count>0 ? 'Paid + Outstanding + Closed = Approved' : 'Paid + Outstanding = Approved');
+  L.push('\uD83D\uDD34 *APPROVED \u00B7 NOT PAID*  ('+sum.fresh.length+' \u00B7 \u20B9'+formatINR(sum.freshTotal)+')');
+  if(sum.fresh.length){ L.push('_reply the number to pay_'); sum.fresh.forEach(function(it){ L.push(it.n+'. '+lbl(it.label)+'  \u20B9'+formatINR(it.approved)); }); }
+  else L.push('_none \u2014 all approved items are paid or closed._');
+  if(sum.partPaid.length){ L.push(''); L.push('\uD83D\uDFE1 *PART-PAID*  ('+sum.partPaid.length+')'); L.push('_reply the number to log the next instalment_');
+    sum.partPaid.forEach(function(it){ L.push(it.n+'. '+lbl(it.label)); L.push('    paid \u20B9'+formatINR(it.paid)+' of \u20B9'+formatINR(it.approved)+' \u00B7 *bal \u20B9'+formatINR(it.balance)+'*'); }); }
+  if(sum.paid3d.items.length){ L.push(''); L.push('\uD83D\uDFE2 *PAID \u00B7 last '+sum.paid3d.days+' days*  ('+sum.paid3d.items.length+' \u00B7 \u20B9'+formatINR(sum.paid3d.total)+')');
+    sum.paid3d.items.forEach(function(it){ L.push('\u2713 '+lbl(it.label)+'  \u20B9'+formatINR(it.amt)+'  \u00B7 '+it.dlabel); });
+    L.push('_only the last '+sum.paid3d.days+' days of payments are listed_'); }
+  L.push(DIV); L.push(sum.closed.count>0?'Paid + Outstanding + Closed = Approved':'Paid + Outstanding = Approved');
   return L.join('\n');
 }
+
 // Mark a paid expense back to UNPAID — removes its paid event(s) so it can be re-tested.
 function markItemUnpaid(itemId){
   var store=loadEventStore(); var before=store.events.length;
@@ -4721,8 +4760,36 @@ async function buildVerdictBackfill(days, commit){
   }
   return preview;
 }
+// ── v2.11.0-s6.1: one-time Payable-code back-fill for existing approved events ──
+// Assigns P-YYMMDD-NNN to every approved event that has no code yet, in seq order, using
+// each event's recorded approval date (`at`). Dry-run by default; commit mutates + persists.
+// Idempotent: already-coded events are skipped, so re-running adds nothing.
+// NOTE: the 30 historical approvals were recorded by the s5.20 catch-up on 20 Jun, so their
+// `at` is 20 Jun — they will batch as P-260620-NNN. New approvals from now carry their true date.
+function buildPayableCodeBackfill(commit){
+  var store=loadEventStore();
+  var approved=(store.events||[]).filter(function(e){ return e.type==='approved'; }).sort(function(a,b){ return a.seq-b.seq; });
+  var toCode=approved.filter(function(e){ return !e.code; });
+  var assigned=[];
+  if(commit){
+    toCode.forEach(function(e){
+      var code=mintPayableCode(Date.parse(e.at)||Date.now(), store);   // reads codes already set this pass
+      e.code=code; assigned.push({ itemId:e.itemId, label:e.label, code:code });
+    });
+    if(toCode.length) _persistEventStore();
+  } else {
+    var sim={};
+    toCode.forEach(function(e){
+      var d=new Date((Date.parse(e.at)||Date.now())+5.5*3600000);
+      var pfx='P-'+String(d.getUTCFullYear()).slice(-2)+('0'+(d.getUTCMonth()+1)).slice(-2)+('0'+d.getUTCDate()).slice(-2)+'-';
+      if(sim[pfx]==null){ var mx=0; store.events.forEach(function(x){ if(x.type==='approved'&&x.code&&x.code.indexOf(pfx)===0){ var n=parseInt(x.code.slice(pfx.length),10); if(!isNaN(n)&&n>mx)mx=n; } }); sim[pfx]=mx; }
+      sim[pfx]++; assigned.push({ itemId:e.itemId, label:e.label, code:pfx+('00'+sim[pfx]).slice(-3) });
+    });
+  }
+  return { totalApproved:approved.length, alreadyCoded:approved.length-toCode.length, toAssign:toCode.length, committed:!!commit, assigned:assigned };
+}
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:'2.10.0-s5.21',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:'2.11.0-s6.1',whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -5229,6 +5296,7 @@ app.get('/api/pair',function(req,res){
 app.get('/api/wa-status',function(req,res){res.json({connected:waReady});});
 app.get('/api/approval-backfill',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var days=parseInt(req.query.days)||30;var commit=req.query.commit==='1'||req.query.commit==='true';var result=await buildVerdictBackfill(days,commit);res.json(result);}catch(e){res.json({error:e.message});}});
 app.get('/api/event-store',function(req,res){try{var s=loadEventStore();var limit=parseInt(req.query.limit)||200;var evs=s.events.slice(-limit).reverse();var counts={verdict:0,approved:0,paid:0};s.events.forEach(function(e){if(counts[e.type]!=null)counts[e.type]++;});res.json({version:s.version,createdAt:s.createdAt,totalEvents:s.events.length,counts:counts,showing:evs.length,events:evs});}catch(e){res.json({error:e.message});}});
+app.get('/api/payable-code-backfill',function(req,res){try{res.json(buildPayableCodeBackfill(req.query.commit==='1'||req.query.commit==='true'));}catch(e){res.json({error:e.message});}});
 app.get('/api/event-store-diff',async function(req,res){
   try{
     var days=parseInt(req.query.days)||15;
