@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b1 - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b2 (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -25,6 +25,7 @@ module.exports = function initSales(deps){
   var AUTH_DIR = deps.authDir || './wa_auth';
   var API_URL  = deps.TRACKER_API_URL  || process.env.TRACKER_API_URL  || '';
   var API_SECRET=deps.TRACKER_API_SECRET|| process.env.TRACKER_API_SECRET|| '';
+  var SALES_AGENT_PHONES = deps.SALES_AGENT_PHONES || [];  // extra numbers allowed to raise bookings (beyond accountants)
 
   var PENDING_FILE = AUTH_DIR + '/sales_pending.json';
 
@@ -69,16 +70,23 @@ module.exports = function initSales(deps){
     return { unit: unit, customer: customer || null };
   }
   function parseBrokerage(text, tsv){
-    // "2%" / "2 %" / "0.02" treated as % if <=15; else absolute amount.
-    // "378000" absolute. Returns {pct (fraction), amt} or null.
+    // "2%" / "2" (<=15) / "0.02" => percentage.  "3.78L" / "1 cr" / "378000" => absolute.
+    // Always returns BOTH: {pct (fraction), amt}.
     var t=String(text||'').trim().replace(/,/g,'');
     var m=t.match(/^([\d.]+)\s*%$/);
     if(m){ var p=parseFloat(m[1])/100; return {pct:p, amt:Math.round(p*tsv)}; }
+    // unit suffix => unambiguous absolute amount
+    if(/^[\d.]+\s*(cr|crore|l|lac|lakh|lk|k)$/i.test(t)){
+      var abs=parseAmount(t);
+      if(abs===null||abs<0) return null;
+      return {pct: tsv>0? abs/tsv : 0, amt: abs};
+    }
     var n=parseFloat(t);
     if(isNaN(n)||n<0) return null;
-    if(n>0 && n<=15){ var p2=n/100; return {pct:p2, amt:Math.round(p2*tsv)}; }        // "2" => 2%
-    if(n>0 && n<1){ return {pct:n, amt:Math.round(n*tsv)}; }                           // "0.02"
-    return {pct: tsv>0? n/tsv : 0, amt: Math.round(n)};                                // absolute
+    // RULE: a bare number <=15 is always a PERCENT ("2" => 2%, "0.5" => 0.5%);
+    // anything larger, or unit-suffixed above, is an absolute amount.
+    if(n>0 && n<=15){ var p2=n/100; return {pct:p2, amt:Math.round(p2*tsv)}; }
+    return {pct: tsv>0? n/tsv : 0, amt: Math.round(n)};
   }
   function parseAmount(text){
     var t=String(text||'').toLowerCase().replace(/,/g,'').trim();
@@ -181,11 +189,19 @@ module.exports = function initSales(deps){
   // ---------- session helpers ----------
   function jidOf(msg){ return msg.author || msg.from; }
   function newItemId(){ return 'bk-'+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
-  function isAgent(msg){
+  async function isAgent(msg){
     var j=String(jidOf(msg)||'');
     var num=j.replace(/@.*$/,'');
+    // booking agents = accountants + any explicit sales-agent numbers (deps.SALES_AGENT_PHONES)
     if((CONFIG.ACCOUNTANT_PHONES||[]).indexOf(num)>=0) return true;
-    if((CONFIG.LID_WHITELIST||[]).indexOf(j)>=0) return false; // lids are promoters, not agents
+    if((SALES_AGENT_PHONES||[]).indexOf(num)>=0) return true;
+    // group authors may arrive as @lid: resolve through the server's identifySender
+    if(identifySender){
+      try{
+        var info=await identifySender(j);
+        if(info && /account/i.test(String(info.role||''))) return true;
+      }catch(e){}
+    }
     return false;
   }
   function promoterOf(msg){
@@ -301,7 +317,7 @@ module.exports = function initSales(deps){
       if(!open) return false;
       var isGroupOK = (from===CONFIG.WHATSAPP_GROUP_JID) || /@c\.us$/.test(from); // expense group or DM
       if(!isGroupOK) return false;
-      if(!isAgent(msg)) return false;
+      if(!(await isAgent(msg))) return false;
 
       if(!open.unit){
         await client.sendMessage(from,'Which unit? e.g. "book 214-GF Rajesh Kumar"');
@@ -370,6 +386,11 @@ module.exports = function initSales(deps){
       if(ses.step==='newval'){
         var ok=applyEdit(ses, body);
         if(!ok.done){ await send(ok.msg); return true; }
+        if(!ses.itemId){
+          // editing BEFORE first send (from the preview stage): back to preview, nothing posted yet
+          ses.mode='new'; ses.step='preview';
+          await send(previewText(f)); return true;
+        }
         // re-post for approval with verdicts reset
         var p=loadPending(); var it=p.items[ses.itemId];
         it.fields=f; it.verdicts={}; it.state='await_approval';
@@ -531,7 +552,10 @@ if(require.main===module && process.argv.indexOf('--test')>=0){
   var b=T.parseBrokerage('2%',tsv); assert.strictEqual(b.amt,378000); assert.ok(Math.abs(b.pct-0.02)<1e-9);
   b=T.parseBrokerage('2',tsv); assert.strictEqual(b.amt,378000);
   b=T.parseBrokerage('378000',tsv); assert.ok(Math.abs(b.pct-0.02)<1e-6); assert.strictEqual(b.amt,378000);
-  b=T.parseBrokerage('3.78L'.replace('L',''),tsv); // plain number path
+  b=T.parseBrokerage('3.78L',tsv);  // unit suffix => ABSOLUTE 3.78 lakh, never 3.78%
+  assert.strictEqual(b.amt,378000,'3.78L is 3.78 lakh absolute'); assert.ok(Math.abs(b.pct-0.02)<1e-6);
+  b=T.parseBrokerage('0.5 cr',tsv); assert.strictEqual(b.amt,5000000,'0.5 cr absolute');
+  b=T.parseBrokerage('9L',tsv); assert.strictEqual(b.amt,900000,'9L is 9 lakh, not 9%');
   // amounts
   assert.strictEqual(T.parseAmount('5L'),500000);
   assert.strictEqual(T.parseAmount('1.5 cr'),15000000);
