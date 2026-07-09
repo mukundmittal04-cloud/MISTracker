@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b2 (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b4 (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -26,6 +26,7 @@ module.exports = function initSales(deps){
   var API_URL  = deps.TRACKER_API_URL  || process.env.TRACKER_API_URL  || '';
   var API_SECRET=deps.TRACKER_API_SECRET|| process.env.TRACKER_API_SECRET|| '';
   var SALES_AGENT_PHONES = deps.SALES_AGENT_PHONES || [];  // extra numbers allowed to raise bookings (beyond accountants)
+  var SALES_AGENT_LIDS = deps.SALES_AGENT_LIDS || [];    // group @lid authors allowed to raise bookings (e.g. Umesh in a group)
 
   var PENDING_FILE = AUTH_DIR + '/sales_pending.json';
 
@@ -195,6 +196,7 @@ module.exports = function initSales(deps){
     // booking agents = accountants + any explicit sales-agent numbers (deps.SALES_AGENT_PHONES)
     if((CONFIG.ACCOUNTANT_PHONES||[]).indexOf(num)>=0) return true;
     if((SALES_AGENT_PHONES||[]).indexOf(num)>=0) return true;
+    if((SALES_AGENT_LIDS||[]).indexOf(j)>=0) return true;   // whitelisted group @lid author
     // group authors may arrive as @lid: resolve through the server's identifySender
     if(identifySender){
       try{
@@ -291,7 +293,11 @@ module.exports = function initSales(deps){
             await getClient().sendMessage(from,'Booking '+unitRef+' is not approved yet \u2014 waiting on M+S.');
             return true;
           }
-          var res=await commitBooking(it2.fields);
+          var res;
+          try{ res=await commitBooking(it2.fields); }
+          catch(ce){ console.log('[sales] commit THREW: '+ce.message);
+            await getClient().sendMessage(from,'\u26a0\ufe0f Tracker unreachable while committing '+unitRef+' ('+ce.message+'). Booking NOT written - try "confirm '+unitRef+'" again or tell M.');
+            return true; }
           if(res && res.ok){
             it2.state='committed'; savePending(p2);
             await getClient().sendMessage(from,'\u2705 '+unitRef+' BOOKED & inventory updated.\nCustomer: '+it2.fields.customer+'\nTSV: '+inrFull(res.tsv)+' ('+res.priceList+')\nBalance: '+inrFull(res.balance));
@@ -315,15 +321,25 @@ module.exports = function initSales(deps){
       // ===== 4. opening: "book ..." from an agent =====
       var open=parseOpening(body);
       if(!open) return false;
+      console.log('[sales] book trigger from='+from+' author='+(msg.author||'-')+' body='+JSON.stringify(body));
       var isGroupOK = (from===CONFIG.WHATSAPP_GROUP_JID) || /@c\.us$/.test(from); // expense group or DM
-      if(!isGroupOK) return false;
-      if(!(await isAgent(msg))) return false;
+      if(!isGroupOK){ console.log('[sales] rejected: not expense group or DM (from='+from+')'); return false; }
+      var agentOK = await isAgent(msg);
+      if(!agentOK){ console.log('[sales] rejected: sender not a recognized agent (from='+from+')'); return false; }
+      console.log('[sales] accepted book for unit='+open.unit+' API_URL='+(API_URL?'set':'MISSING'));
+      if(!API_URL || !API_SECRET){
+        await client.sendMessage(from,'\u26a0\ufe0f Booking system not configured: TRACKER_API_URL / TRACKER_API_SECRET missing on the server (Railway env vars). Tell M.');
+        return true;
+      }
 
       if(!open.unit){
         await client.sendMessage(from,'Which unit? e.g. "book 214-GF Rajesh Kumar"');
         return true;
       }
-      var lk=await lookupUnit(open.unit);
+      var lk;
+      try{ lk=await lookupUnit(open.unit); }
+      catch(fe){ console.log('[sales] lookup THREW: '+fe.message); await client.sendMessage(from,'\u26a0\ufe0f Tracker unreachable ('+fe.message+'). Tell M.'); return true; }
+      console.log('[sales] lookup result: '+JSON.stringify(lk).slice(0,200));
       if(!lk || !lk.ok){
         await client.sendMessage(from,'\u26a0\ufe0f '+((lk&&lk.error)||'tracker not reachable')+'.');
         return true;
@@ -356,7 +372,7 @@ module.exports = function initSales(deps){
       return true;
 
     }catch(e){
-      console.error('[sales]', e.message);
+      console.error('[sales] handler error:', e.message, (e.stack||'').split('\n')[1]||'');
       return false;
     }
   }
