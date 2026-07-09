@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b4 (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b5 (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -193,16 +193,26 @@ module.exports = function initSales(deps){
   async function isAgent(msg){
     var j=String(jidOf(msg)||'');
     var num=j.replace(/@.*$/,'');
-    // booking agents = accountants + any explicit sales-agent numbers (deps.SALES_AGENT_PHONES)
+    // 1. direct phone match
     if((CONFIG.ACCOUNTANT_PHONES||[]).indexOf(num)>=0) return true;
     if((SALES_AGENT_PHONES||[]).indexOf(num)>=0) return true;
-    if((SALES_AGENT_LIDS||[]).indexOf(j)>=0) return true;   // whitelisted group @lid author
-    // group authors may arrive as @lid: resolve through the server's identifySender
+    // 2. explicit lid whitelist
+    if((SALES_AGENT_LIDS||[]).indexOf(j)>=0) return true;
+    // 3. resolve @lid (or anything) via server's identifySender, then re-check the RESOLVED phone
     if(identifySender){
       try{
         var info=await identifySender(j);
-        if(info && /account/i.test(String(info.role||''))) return true;
-      }catch(e){}
+        var rphone=info && (info.phone||info.resolvedPhone||'');
+        rphone=String(rphone||'').replace(/@.*$/,'');
+        if(rphone){
+          if((CONFIG.ACCOUNTANT_PHONES||[]).indexOf(rphone)>=0) return true;
+          if((SALES_AGENT_PHONES||[]).indexOf(rphone)>=0) return true;
+        }
+        var role=String((info&&info.role)||'');
+        if(/account/i.test(role)) return true;
+        // MM/SM resolving as a promoter can also raise (raiser != approver is enforced elsewhere)
+        if(/^(m|s|mm|sm)$/i.test(role.trim())) return true;
+      }catch(e){ console.log('[sales] isAgent identifySender error: '+e.message); }
     }
     return false;
   }
@@ -322,8 +332,10 @@ module.exports = function initSales(deps){
       var open=parseOpening(body);
       if(!open) return false;
       console.log('[sales] book trigger from='+from+' author='+(msg.author||'-')+' body='+JSON.stringify(body));
-      var isGroupOK = (from===CONFIG.WHATSAPP_GROUP_JID) || /@c\.us$/.test(from); // expense group or DM
-      if(!isGroupOK){ console.log('[sales] rejected: not expense group or DM (from='+from+')'); return false; }
+      var isGroup = /@g\.us$/.test(from);
+      var isDM = !isGroup;  // @c.us OR @lid direct messages
+      var isGroupOK = (from===CONFIG.WHATSAPP_GROUP_JID) || isDM;  // expense group, or any DM
+      if(!isGroupOK){ console.log('[sales] rejected: other group, not the expense group (from='+from+')'); return false; }
       var agentOK = await isAgent(msg);
       if(!agentOK){ console.log('[sales] rejected: sender not a recognized agent (from='+from+')'); return false; }
       console.log('[sales] accepted book for unit='+open.unit+' API_URL='+(API_URL?'set':'MISSING'));
