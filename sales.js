@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b9 (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b10 (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -27,6 +27,9 @@ module.exports = function initSales(deps){
   var API_SECRET=deps.TRACKER_API_SECRET|| process.env.TRACKER_API_SECRET|| '';
   var SALES_GROUP_JID = deps.SALES_GROUP_JID || CONFIG.SALES_GROUP_JID || '';  // dedicated bookings/collections group
   var skipApprovalFn = deps.skipApproval || function(){ return false; };  // live toggle: bypass M+S when true
+  var SALES_SENIOR_PHONES = deps.SALES_SENIOR_PHONES || [];  // can approve juniors' changes; own changes execute
+  var SALES_JUNIOR_PHONES = deps.SALES_JUNIOR_PHONES || [];  // changes need a senior's approval
+  var NOTIFY_DM_PHONE      = deps.NOTIFY_DM_PHONE || '';       // Mukund: DM'd on every non-booking change
   var SALES_AGENT_PHONES = deps.SALES_AGENT_PHONES || [];  // extra numbers allowed to raise bookings (beyond accountants)
   var SALES_AGENT_LIDS = deps.SALES_AGENT_LIDS || [];    // group @lid authors allowed to raise bookings (e.g. Umesh in a group)
 
@@ -127,6 +130,7 @@ module.exports = function initSales(deps){
     }).then(function(r){ return r.json(); });
   }
   function lookupUnit(unit){ return trackerPost({action:'lookup', unit:unit}); }
+  function commitCancel(f){ return trackerPost({action:'cancel', unit:f.unit, disposition:f.disposition, agent:f.agentName||'', approvedBy:f.approvedBy||''}); }
   function commitBooking(f){
     var payload={
       action:'booking', unit:f.unit, customer:f.customer,
@@ -228,6 +232,27 @@ module.exports = function initSales(deps){
 
   // ---------- session helpers ----------
   function jidOf(msg){ return msg.author || msg.from; }
+  async function resolvePhone(msg){
+    var j=String(jidOf(msg)||''); var num=j.replace(/@.*$/,'');
+    if(/@lid$/.test(j) && identifySender){
+      try{ var info=await identifySender(j); var rp=String((info&&(info.phone||info.resolvedPhone))||'').replace(/@.*$/,''); if(rp) return rp; }catch(e){}
+    }
+    return num;
+  }
+  function seniorityOf(phone){
+    if(SALES_SENIOR_PHONES.indexOf(phone)>=0) return 'senior';
+    if(SALES_JUNIOR_PHONES.indexOf(phone)>=0) return 'junior';
+    if((CONFIG.ACCOUNTANT_PHONES||[]).indexOf(phone)>=0) return 'senior'; // default accountants act as senior for changes
+    return 'none';
+  }
+  async function senderName(msg){
+    if(!identifySender) return '';
+    try{ var i=await identifySender(jidOf(msg)); return (i&&i.contactName)||''; }catch(e){ return ''; }
+  }
+  async function notifyMukund(text){
+    if(!NOTIFY_DM_PHONE) return;
+    try{ await getClient().sendMessage(NOTIFY_DM_PHONE+'@c.us', text); }catch(e){ console.log('[sales] mukund DM failed: '+e.message); }
+  }
   function newItemId(){ return 'bk-'+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
   async function isAgent(msg){
     var j=String(jidOf(msg)||'');
@@ -368,6 +393,56 @@ module.exports = function initSales(deps){
         return await advanceSession(msg, sessions[senderJid]);
       }
 
+      // ===== 3.5 cancellation: "cancel <unit>" (Gautam->Umesh approve; Umesh acts direct) =====
+      var mCancel=body.match(/^cancel\s+(\d{2,3}[A-Z]?-(?:GF|FF|SF|TF|PLOT))\b/i);
+      if(mCancel){
+        var cunit=mCancel[1].toUpperCase();
+        var inSG = SALES_GROUP_JID && from===SALES_GROUP_JID;
+        if(!inSG) return false;                      // cancellations only in the sales group
+        var cphone=await resolvePhone(msg);
+        var role=seniorityOf(cphone);
+        if(role==='none') return false;              // not a sales actor
+        var clk=await lookupUnit(cunit);
+        if(!clk||!clk.ok){ await client.sendMessage(from,'\u26a0\ufe0f '+((clk&&clk.error)||'lookup failed')+'.'); return true; }
+        if(clk.status!=='Sold'){ await client.sendMessage(from,'\u26a0\ufe0f '+cunit+' is not sold (status '+clk.status+') \u2014 nothing to cancel.'); return true; }
+        var cinfo=identifySender?await identifySender(senderJid):null;
+        sessions[senderJid]={ mode:'cancel', step:'disposition', originChat:from,
+          fields:{ unit:cunit, customer:clk.customer, paid:clk.paidToDate||0,
+                   raiserRole:role, raiserName:(cinfo&&cinfo.contactName)||'', raiserPhone:cphone } };
+        await client.sendMessage(from,
+          'CANCEL '+cunit+' \u2014 '+(clk.customer||'(no customer)')+'\nPaid to date: '+inrFull(clk.paidToDate||0)+
+          '\n\nWhat happens to the money?\n1) Refund (into refund pool)\n2) Hold for transfer to another unit\nReply 1 or 2.');
+        return true;
+      }
+      // verdict on a pending cancel approval (senior replies in the sales group, quoting our post)
+      if(SALES_GROUP_JID && from===SALES_GROUP_JID && msg.hasQuotedMsg){
+        var pc=loadPending();
+        var qm=await msg.getQuotedMessage().catch(function(){return null;});
+        var qmid=qm&&qm.id&&qm.id._serialized;
+        var cid=null; if(qmid){ Object.keys(pc.items).forEach(function(k){ if(pc.items[k].msgId===qmid && pc.items[k].kind==='cancel') cid=k; }); }
+        if(cid){
+          var cit=pc.items[cid];
+          if(cit.state!=='await_senior'){ return true; }
+          var aphone=await resolvePhone(msg);
+          if(seniorityOf(aphone)!=='senior'){ await client.sendMessage(from,'Only a senior can approve this cancellation.'); return true; }
+          if(/^(no|reject|n)\b/i.test(body.toLowerCase())){ cit.state='rejected'; savePending(pc);
+            await client.sendMessage(from,'\u274c Cancellation of '+cit.fields.unit+' rejected.'); return true; }
+          if(/^(yes|ok|approve|approved|y)\b/i.test(body.toLowerCase())){
+            cit.fields.approvedBy=(await senderName(msg))||'senior';
+            var res=await commitCancel(cit.fields);
+            if(res&&res.ok){
+              cit.state='done'; savePending(pc);
+              await client.sendMessage(from,'\u2705 '+cit.fields.unit+' CANCELLED. '+inrFull(res.paid)+' \u2192 '+res.disposition+' ('+res.creditId+'). Archived as "'+res.archived+'".');
+              await notifyMukund('\u2139\ufe0f Booking CANCELLED\nUnit: '+cit.fields.unit+'\nCustomer: '+cit.fields.customer+'\nPaid: '+inrFull(res.paid)+'\nDisposition: '+res.disposition+'\nCredit: '+res.creditId+'\nApproved by: '+cit.fields.approvedBy+'\nRaised by: '+cit.fields.raiserName);
+            } else {
+              await client.sendMessage(from,'\u26a0\ufe0f Cancel failed: '+((res&&res.error)||'no response')+'.');
+            }
+            return true;
+          }
+          return true;
+        }
+      }
+
       // ===== 4. opening: "book ..." from an agent =====
       var open=parseOpening(body);
       if(!open) return false;
@@ -441,6 +516,44 @@ module.exports = function initSales(deps){
     var send=function(t){ return client.sendMessage(from,t); };
 
     if(low==='cancel'){ delete sessions[jidOf(msg)]; await send('Booking flow cancelled.'); return true; }
+
+    // ----- cancel mode -----
+    if(ses.mode==='cancel'){
+      if(ses.step==='disposition'){
+        var d = /^1$|refund/i.test(low) ? 'Refund' : /^2$|transfer|hold/i.test(low) ? 'Transfer-pending' : null;
+        if(!d){ await send('Reply 1 (Refund) or 2 (Hold for transfer).'); return true; }
+        f.disposition = d==='Refund' ? 'refund' : 'transfer';
+        var human = d==='Refund' ? 'Refund into pool' : 'Hold for transfer to another unit';
+        if(f.raiserRole==='senior'){
+          // senior acts directly - commit now
+          f.approvedBy=f.raiserName||'senior';
+          var res=await commitCancel(f);
+          delete sessions[jidOf(msg)];
+          if(res&&res.ok){
+            await send('\u2705 '+f.unit+' CANCELLED ('+human+'). '+inrFull(res.paid)+' \u2192 '+res.disposition+' ('+res.creditId+'). Archived as "'+res.archived+'".');
+            await notifyMukund('\u2139\ufe0f Booking CANCELLED\nUnit: '+f.unit+'\nCustomer: '+f.customer+'\nPaid: '+inrFull(res.paid)+'\nDisposition: '+res.disposition+'\nCredit: '+res.creditId+'\nBy: '+f.raiserName+' (senior, direct)');
+          } else { await send('\u26a0\ufe0f Cancel failed: '+((res&&res.error)||'no response')+'.'); }
+          return true;
+        }
+        // junior raised -> post to sales group for a senior to approve
+        var itemId='cx-'+Date.now().toString(36);
+        var seniorTag = SALES_SENIOR_PHONES.length ? (' (needs a senior: e.g. Umesh)') : '';
+        var postText='\ud83d\uddd1 CANCELLATION for senior approval'+
+          '\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500'+
+          '\nUnit: '+f.unit+'\nCustomer: '+f.customer+'\nPaid to date: '+inrFull(f.paid)+
+          '\nDisposition: '+human+'\nRaised by: '+(f.raiserName||'junior')+
+          '\n\nReply to THIS message: yes / no'+seniorTag;
+        var sent=await getClient().sendMessage(from, postText);
+        var p=loadPending();
+        p.items[itemId]={ kind:'cancel', msgId:sent&&sent.id&&sent.id._serialized, fields:f,
+                          state:'await_senior', originChat:from, at:Date.now() };
+        savePending(p);
+        delete sessions[jidOf(msg)];
+        await send('Sent for senior approval. A senior must reply "yes" on that message to commit.');
+        return true;
+      }
+    }
+
 
     // ----- edit mode -----
     if(ses.mode==='edit'){
