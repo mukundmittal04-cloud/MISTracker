@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b12 (b11 + BROKERAGE ADJUST: brokerage adjust <unit> redirects a broker pending commission on a live unit into a target pool; MONEY OUT Brokerage row, non-GST by sheet rule; senior direct / junior needs senior yes; Mukund DM. Cancel still owns refund + adjust-out) (b10 + LID RESOLUTION FIX for changes: resolvePhone now uses an injected server resolveLidPhone(jid) [same logic as the auth layer: waClient.getContactById(jid).number] plus an explicit LID_PHONE_MAP fallback, because identifySender returns {role,contactName} with NO phone field - so cancel from a linked-device @lid now resolves to the real phone and seniorityOf works) (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b13 (b12 + CANCEL REASON AI-CLASSIFY + RECOVER/FORGO + M+S ROUTING + ALLOCATE. cancel now: free-text reason -> aiClassifyReason company_fault|normal (agent can override) -> brokerage recover|forgo -> disposition refund|transfer -> ROUTING: refund OR forgo => M+S in capital approval group, else senior in sales group. New allocate <unit>: apply pooled credit at rate level or to a tranche ("latest" = last with due balance). Verdict handler split so booking(M+S)/cancel(senior or M+S)/brokadjust(senior)/allocate(senior) each resolve correctly across sales + capital groups) (b11 + BROKERAGE ADJUST: brokerage adjust <unit> redirects a broker pending commission on a live unit into a target pool; MONEY OUT Brokerage row, non-GST by sheet rule; senior direct / junior needs senior yes; Mukund DM. Cancel still owns refund + adjust-out) (b10 + LID RESOLUTION FIX for changes: resolvePhone now uses an injected server resolveLidPhone(jid) [same logic as the auth layer: waClient.getContactById(jid).number] plus an explicit LID_PHONE_MAP fallback, because identifySender returns {role,contactName} with NO phone field - so cancel from a linked-device @lid now resolves to the real phone and seniorityOf works) (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -32,6 +32,8 @@ module.exports = function initSales(deps){
   var NOTIFY_DM_PHONE      = deps.NOTIFY_DM_PHONE || '';       // Mukund: DM'd on every non-booking change
   var resolveLidPhone      = deps.resolveLidPhone || null;    // async (jid)->phone, server's lid resolver
   var LID_PHONE_MAP        = deps.LID_PHONE_MAP || {};        // explicit @lid -> phone fallback
+  var aiClassifyReason     = deps.aiClassifyReason || null;   // async (text)->{classification,confidence,reasoning}
+  var CAPITAL_APPROVAL_JID = deps.CAPITAL_APPROVAL_JID || CONFIG.APPROVAL_GROUP_JID || '';  // M+S refund/forgo channel
   var SALES_AGENT_PHONES = deps.SALES_AGENT_PHONES || [];  // extra numbers allowed to raise bookings (beyond accountants)
   var SALES_AGENT_LIDS = deps.SALES_AGENT_LIDS || [];    // group @lid authors allowed to raise bookings (e.g. Umesh in a group)
 
@@ -132,8 +134,10 @@ module.exports = function initSales(deps){
     }).then(function(r){ return r.json(); });
   }
   function lookupUnit(unit){ return trackerPost({action:'lookup', unit:unit}); }
-  function commitCancel(f){ return trackerPost({action:'cancel', unit:f.unit, disposition:f.disposition, agent:f.agentName||'', approvedBy:f.approvedBy||''}); }
+  function commitCancel(f){ return trackerPost({action:'cancel', unit:f.unit, disposition:f.disposition, brokerageTreatment:f.brokerageTreatment||'none', agent:f.agentName||'', approvedBy:f.approvedBy||''}); }
   function brokerageInfo(unit){ return trackerPost({action:'brokerageInfo', unit:unit}); }
+  function poolInfo(unit){ return trackerPost({action:'poolInfo', unit:unit}); }
+  function commitAllocate(f){ return trackerPost({action:'allocate', unit:f.unit, amount:f.amount, method:f.method, tranche:f.tranche||0, side:f.side||'nongst'}); }
   function commitBrokerageAdjust(f){ return trackerPost({action:'brokerageAdjust', unit:f.unit, target:f.target, amount:f.amount, mode:f.mode, approvedBy:f.approvedBy||'', agent:f.agentName||''}); }
   function commitBooking(f){
     var payload={
@@ -324,7 +328,7 @@ module.exports = function initSales(deps){
         var quoted=await msg.getQuotedMessage().catch(function(){return null;});
         var qid=quoted && quoted.id && quoted.id._serialized;
         var itemId=null;
-        if(qid){ Object.keys(p.items).forEach(function(k){ if(p.items[k].msgId===qid) itemId=k; }); }
+        if(qid){ Object.keys(p.items).forEach(function(k){ if(p.items[k].msgId===qid && (!p.items[k].kind || p.items[k].kind==='booking')) itemId=k; }); }
         if(itemId){
           var it=p.items[itemId];
           if(it.state!=='await_approval') { return true; } // stale swipe on decided item
@@ -356,8 +360,12 @@ module.exports = function initSales(deps){
           }
           return true;
         }
-        // not ours - fall through to server's own verdict handling
-        return false;
+        // no BOOKING item matched this quoted msg. If a non-booking sales item (cancel/brokadjust/
+        // allocate) matches, fall through to those verdict handlers below; else defer to server.
+        var otherSales=false;
+        if(qid){ Object.keys(p.items).forEach(function(k){ if(p.items[k].msgId===qid && p.items[k].kind && p.items[k].kind!=='booking') otherSales=true; }); }
+        if(!otherSales) return false;
+        // else: do not return - let execution continue to the cancel/ba/allocate verdict block
       }
 
       // ===== 2. re-confirm / edit after approval (origin chat) =====
@@ -403,6 +411,26 @@ module.exports = function initSales(deps){
         return await advanceSession(msg, sessions[senderJid]);
       }
 
+      // ===== 3.3 allocate: apply a unit's pooled credit at rate level or to a tranche =====
+      var mAlloc=body.match(/^allocate\s+(\d{2,3}[A-Z]?-(?:GF|FF|SF|TF|PLOT))\b/i);
+      if(mAlloc){
+        var aunit=mAlloc[1].toUpperCase();
+        var inSGa = SALES_GROUP_JID && from===SALES_GROUP_JID;
+        if(!inSGa) return false;
+        var aphone2=await resolvePhone(msg);
+        var arole=seniorityOf(aphone2);
+        if(arole==='none') return false;
+        var pinfo=await poolInfo(aunit);
+        if(!pinfo||!pinfo.ok){ await client.sendMessage(from,'\u26a0\ufe0f '+((pinfo&&pinfo.error)||'lookup failed')+'.'); return true; }
+        if(!(pinfo.available>0)){ await client.sendMessage(from,'\u26a0\ufe0f No pooled credit available on '+aunit+' to allocate.'); return true; }
+        var ainfo=identifySender?await identifySender(senderJid):null;
+        sessions[senderJid]={ mode:'allocate', step:'amount', originChat:from,
+          fields:{ unit:aunit, available:pinfo.available, availGst:pinfo.availableGst, availNon:pinfo.availableNonGst,
+                   tranches:pinfo.tranches||[], raiserRole:arole, raiserName:(ainfo&&ainfo.contactName)||'', raiserPhone:aphone2 } };
+        await client.sendMessage(from,'ALLOCATE credit \u2014 '+aunit+'\nAvailable pool credit: '+inrFull(pinfo.available)+'\n\nHow much to allocate? (up to '+inrFull(pinfo.available)+')');
+        return true;
+      }
+
       // ===== 3.4 brokerage adjust: redirect broker pending commission to a target unit =====
       var mBrok=body.match(/^brokerage\s+adjust(?:\s+(\d{2,3}[A-Z]?-(?:GF|FF|SF|TF|PLOT)))?/i);
       if(mBrok){
@@ -440,16 +468,16 @@ module.exports = function initSales(deps){
         if(!clk||!clk.ok){ await client.sendMessage(from,'\u26a0\ufe0f '+((clk&&clk.error)||'lookup failed')+'.'); return true; }
         if(clk.status!=='Sold'){ await client.sendMessage(from,'\u26a0\ufe0f '+cunit+' is not sold (status '+clk.status+') \u2014 nothing to cancel.'); return true; }
         var cinfo=identifySender?await identifySender(senderJid):null;
-        sessions[senderJid]={ mode:'cancel', step:'disposition', originChat:from,
+        sessions[senderJid]={ mode:'cancel', step:'reason', originChat:from,
           fields:{ unit:cunit, customer:clk.customer, paid:clk.paidToDate||0,
                    raiserRole:role, raiserName:(cinfo&&cinfo.contactName)||'', raiserPhone:cphone } };
         await client.sendMessage(from,
           'CANCEL '+cunit+' \u2014 '+(clk.customer||'(no customer)')+'\nPaid to date: '+inrFull(clk.paidToDate||0)+
-          '\n\nWhat happens to the money?\n1) Refund (into refund pool)\n2) Hold for transfer to another unit\nReply 1 or 2.');
+          '\n\nWhat is the reason for cancellation? (type it in your own words)');
         return true;
       }
       // verdict on a pending cancel approval (senior replies in the sales group, quoting our post)
-      if(SALES_GROUP_JID && from===SALES_GROUP_JID && msg.hasQuotedMsg){
+      if((from===SALES_GROUP_JID || from===CAPITAL_APPROVAL_JID || from===CONFIG.APPROVAL_GROUP_JID) && msg.hasQuotedMsg){
         var pc=loadPending();
         var qm=await msg.getQuotedMessage().catch(function(){return null;});
         var qmid=qm&&qm.id&&qm.id._serialized;
@@ -474,23 +502,36 @@ module.exports = function initSales(deps){
         }
         if(cid){
           var cit=pc.items[cid];
-          if(cit.state!=='await_senior'){ return true; }
+          if(cit.state!=='await_senior' && cit.state!=='await_ms'){ return true; }
           var aphone=await resolvePhone(msg);
-          if(seniorityOf(aphone)!=='senior'){ await client.sendMessage(from,'Only a senior can approve this cancellation.'); return true; }
-          if(/^(no|reject|n)\b/i.test(body.toLowerCase())){ cit.state='rejected'; savePending(pc);
-            await client.sendMessage(from,'\u274c Cancellation of '+cit.fields.unit+' rejected.'); return true; }
-          if(/^(yes|ok|approve|approved|y)\b/i.test(body.toLowerCase())){
-            cit.fields.approvedBy=(await senderName(msg))||'senior';
-            var res=await commitCancel(cit.fields);
-            if(res&&res.ok){
+          var isNo=/^(no|reject|n)\b/i.test(body.toLowerCase());
+          var isYes=/^(yes|ok|approve|approved|y)\b/i.test(body.toLowerCase());
+          if(!isNo && !isYes) return true;
+          if(cit.needsMS){
+            // M+S dual approval (capital group). resolve who.
+            var who=await cancelPromoter_(msg);
+            if(!who){ return true; }   // not M or S
+            if(isNo){ cit.state='rejected'; savePending(pc);
+              await client.sendMessage(cit.approvalChat||from,'\u274c Cancellation of '+cit.fields.unit+' rejected by '+who+'.');
+              await client.sendMessage(cit.originChat,'\u274c '+cit.fields.unit+' cancellation rejected by '+who+'. Not committed.');
+              return true; }
+            cit.verdicts=cit.verdicts||{}; cit.verdicts[who]='yes';
+            if(cit.verdicts.M==='yes' && cit.verdicts.S==='yes'){
+              cit.fields.approvedBy='M+S';
+              var resM=await commitCancel(cit.fields);
               cit.state='done'; savePending(pc);
-              await client.sendMessage(from,'\u2705 '+cit.fields.unit+' CANCELLED. '+inrFull(res.paid)+' \u2192 '+res.disposition+' ('+res.creditId+'). Archived as "'+res.archived+'".');
-              await notifyMukund('\u2139\ufe0f Booking CANCELLED\nUnit: '+cit.fields.unit+'\nCustomer: '+cit.fields.customer+'\nPaid: '+inrFull(res.paid)+'\nDisposition: '+res.disposition+'\nCredit: '+res.creditId+'\nApproved by: '+cit.fields.approvedBy+'\nRaised by: '+cit.fields.raiserName);
-            } else {
-              await client.sendMessage(from,'\u26a0\ufe0f Cancel failed: '+((res&&res.error)||'no response')+'.');
-            }
+              await cancelDone_(resM, cit.fields, 'M+S ('+cit.fields.raiserName+' raised)');
+            } else { savePending(pc); }   // one yes, wait for the other
             return true;
           }
+          // single senior (sales group)
+          if(seniorityOf(aphone)!=='senior'){ await client.sendMessage(from,'Only a senior can approve this cancellation.'); return true; }
+          if(isNo){ cit.state='rejected'; savePending(pc);
+            await client.sendMessage(from,'\u274c Cancellation of '+cit.fields.unit+' rejected.'); return true; }
+          cit.fields.approvedBy=(await senderName(msg))||'senior';
+          var res=await commitCancel(cit.fields);
+          cit.state='done'; savePending(pc);
+          await cancelDone_(res, cit.fields, 'senior ('+cit.fields.raiserName+' raised)');
           return true;
         }
       }
@@ -559,6 +600,27 @@ module.exports = function initSales(deps){
   }
 
   // ---------- session state machine ----------
+  async function cancelPromoter_(msg){
+    // returns 'M' | 'S' | null based on identifySender/phone
+    var ph=await resolvePhone(msg);
+    if(ph===CONFIG.MM_PHONE) return 'M';
+    if(ph===CONFIG.SM_PHONE) return 'S';
+    if(identifySender){ try{ var i=await identifySender(jidOf(msg)); var r=String((i&&i.role)||''); if(/^m$|mm|madhur/i.test(r))return 'M'; if(/^s$|sm|sumit/i.test(r))return 'S'; }catch(e){} }
+    return null;
+  }
+  async function cancelDone_(res, f, byWhom){
+    var client=getClient();
+    if(res&&res.ok){
+      var brokLine = (res.brokerageTreatment && res.brokerageTreatment!=='none' && res.broker)
+        ? ('\nBrokerage: '+(res.brokerageTreatment==='recover'?'recoverable ':'written off ')+inrFull(res.brokeragePaid||0)+' ('+res.broker+')')
+        : '';
+      await client.sendMessage(f.originChat,'\u2705 '+f.unit+' CANCELLED ('+(f.human||'')+'). '+inrFull(res.paid)+' \u2192 '+res.disposition+' ('+res.creditId+'). Archived as "'+res.archived+'".'+brokLine);
+      await notifyMukund('\u2139\ufe0f Booking CANCELLED\nUnit: '+f.unit+'\nCustomer: '+f.customer+'\nReason: '+(f.companyFault?'company non-delivery':'customer cancellation')+'\nPaid: '+inrFull(res.paid)+'\nMoney: '+res.disposition+' ('+res.creditId+')'+brokLine+'\nBy: '+byWhom);
+    } else {
+      await client.sendMessage(f.originChat,'\u26a0\ufe0f Cancel failed: '+((res&&res.error)||'no response')+'.');
+    }
+  }
+
   async function advanceSession(msg, ses){
     var client=getClient();
     var from=ses.originChat;
@@ -568,6 +630,63 @@ module.exports = function initSales(deps){
     var send=function(t){ return client.sendMessage(from,t); };
 
     if(low==='cancel'){ delete sessions[jidOf(msg)]; await send('Booking flow cancelled.'); return true; }
+
+    // ----- allocate mode -----
+    if(ses.mode==='allocate'){
+      if(ses.step==='amount'){
+        var av=parseAmount(body);
+        if(av===null||av<=0){ await send('Enter the amount to allocate (e.g. "3L").'); return true; }
+        if(av>f.available+1){ await send('That exceeds available credit ('+inrFull(f.available)+'). Enter a smaller amount.'); return true; }
+        f.amount=av; ses.step='method';
+        await send('Apply how?\n1) Rate level (reduce overall balance)\n2) Against a specific tranche (milestone)\nReply 1 or 2.'); return true;
+      }
+      if(ses.step==='method'){
+        if(/^1\b|rate/i.test(low)){ f.method='rate'; f.side=(f.availNon>=f.amount?'nongst':'gst');
+          ses.step='confirm';
+          await send('ALLOCATE preview\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nUnit: '+f.unit+'\nAllocate: '+inrFull(f.amount)+' at RATE level\n\nReply "yes" to proceed, "cancel" to drop.'); return true; }
+        if(/^2\b|tranche|milestone/i.test(low)){ f.method='tranche'; ses.step='tranche';
+          var tl=['Which tranche / milestone?'];
+          (f.tranches||[]).forEach(function(t){ tl.push('  '+t.idx+') '+(t.label||('Tranche '+t.idx))+(t.due?(' \u2014 due '+inrFull(t.due)):'')); });
+          tl.push('Reply the number, or "latest" for the last one with a due balance.');
+          await send(tl.join('\n')); return true; }
+        await send('Reply 1 (Rate level) or 2 (Tranche).'); return true;
+      }
+      if(ses.step==='tranche'){
+        var ti=null;
+        if(/^latest$/i.test(low)){
+          var withDue=(f.tranches||[]).filter(function(t){return t.due>t.poolApplied;});
+          ti = withDue.length ? withDue[withDue.length-1].idx : ((f.tranches||[]).length||1);
+        } else { var n=parseInt(low,10); if(n>=1&&n<=8) ti=n; }
+        if(!ti){ await send('Reply a tranche number (1-8) or "latest".'); return true; }
+        f.tranche=ti; f.side=(f.availNon>=f.amount?'nongst':'gst');
+        var tobj=(f.tranches||[]).filter(function(t){return t.idx===ti;})[0];
+        ses.step='confirm';
+        await send('ALLOCATE preview\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nUnit: '+f.unit+'\nAllocate: '+inrFull(f.amount)+' to '+(tobj?(tobj.label||('Tranche '+ti)):('Tranche '+ti))+(tobj&&tobj.due?(' (due '+inrFull(tobj.due)+')'):'')+'\n\nReply "yes" to proceed, "cancel" to drop.'); return true;
+      }
+      if(ses.step==='confirm'){
+        if(!/^(yes|y|ok)$/i.test(low)){ await send('Reply "yes" to proceed or "cancel".'); return true; }
+        if(f.raiserRole==='senior'){
+          var res=await commitAllocate(f);
+          delete sessions[jidOf(msg)];
+          if(res&&res.ok){
+            var where = res.method==='rate' ? 'at rate level' : ('to '+(res.trancheLabel||('tranche '+res.tranche)));
+            await send('\u2705 Allocated '+inrFull(res.amount)+' on '+res.unit+' '+where+'. Balance now '+inrFull(res.balanceAfter)+'.');
+            await notifyMukund('\u2139\ufe0f CREDIT ALLOCATED\nUnit: '+res.unit+'\nAmount: '+inrFull(res.amount)+'\nApplied: '+where+'\nBalance after: '+inrFull(res.balanceAfter)+'\nBy: '+f.raiserName+' (senior, direct)');
+          } else { await send('\u26a0\ufe0f Allocate failed: '+((res&&res.error)||'no response')+'.'); }
+          return true;
+        }
+        var itemId='al-'+Date.now().toString(36);
+        var postText='\ud83d\udcd2 ALLOCATE for senior approval'+
+          '\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500'+
+          '\nUnit: '+f.unit+'\nAllocate: '+inrFull(f.amount)+(f.method==='tranche'?(' to tranche '+f.tranche):' at rate level')+
+          '\nRaised by: '+(f.raiserName||'junior')+'\n\nReply to THIS message: yes / no';
+        var sent=await getClient().sendMessage(from, postText);
+        var p=loadPending();
+        p.items[itemId]={ kind:'allocate', msgId:sent&&sent.id&&sent.id._serialized, fields:f, state:'await_senior', originChat:from, at:Date.now() };
+        savePending(p); delete sessions[jidOf(msg)];
+        await send('Sent for senior approval.'); return true;
+      }
+    }
 
     // ----- brokerage-adjust mode -----
     if(ses.mode==='brokadjust'){
@@ -618,41 +737,80 @@ module.exports = function initSales(deps){
 
     // ----- cancel mode -----
     if(ses.mode==='cancel'){
+      // step 1: free-text reason -> AI classifies company-fault vs normal
+      if(ses.step==='reason'){
+        if(!body){ await send('Please type the reason for cancellation.'); return true; }
+        f.reasonText=body;
+        var cls={classification:'normal',confidence:0,reasoning:''};
+        if(aiClassifyReason){ try{ cls=await aiClassifyReason(body)||cls; }catch(e){ console.log('[sales] aiClassifyReason err: '+e.message); } }
+        f.reasonClass=cls.classification;
+        var isCompany = cls.classification==='company_fault';
+        f.companyFault=isCompany;
+        var read = isCompany ? 'COMPANY non-delivery (our fault)' : 'CUSTOMER-side cancellation';
+        ses.step='reasonconfirm';
+        await send('Read as: '+read+(cls.reasoning?('\n("'+cls.reasoning+'")'):'')+
+          '\n\nIs that right?\n1) Yes, '+ (isCompany?'company fault':'customer cancelled') +
+          '\n2) No, it is the '+(isCompany?'customer\u2019s cancellation':'company\u2019s non-delivery'));
+        return true;
+      }
+      if(ses.step==='reasonconfirm'){
+        if(/^2\b|^no\b/i.test(low)){ f.companyFault=!f.companyFault; }         // agent overrides the AI read
+        else if(!/^1\b|^yes\b|^y\b/i.test(low)){ await send('Reply 1 (yes) or 2 (no).'); return true; }
+        // brokerage treatment prompt (recover vs forgo), framed by fault
+        var brokerLine = 'Past brokerage on this unit:';
+        ses.step='brokerage';
+        if(f.companyFault){
+          await send(brokerLine+'\n(Company fault \u2014 forgoing is standard, and needs M+S special approval.)\n1) Recover anyway\n2) Forego (write off) \u2014 M+S approval');
+        } else {
+          await send(brokerLine+'\n(Customer cancellation \u2014 brokerage is revoked; already-paid is normally recovered.)\n1) Recover (log as recoverable from broker)\n2) Forego (write off)');
+        }
+        return true;
+      }
+      if(ses.step==='brokerage'){
+        var bt = /^1\b|recover/i.test(low) ? 'recover' : /^2\b|forego|forgo|write/i.test(low) ? 'forgo' : null;
+        if(!bt){ await send('Reply 1 (Recover) or 2 (Forego).'); return true; }
+        f.brokerageTreatment=bt;
+        ses.step='disposition';
+        await send('What happens to the customer money ('+inrFull(f.paid)+')?\n1) Refund\n2) Hold for transfer to another unit\nReply 1 or 2.'); return true;
+      }
       if(ses.step==='disposition'){
         var d = /^1$|refund/i.test(low) ? 'Refund' : /^2$|transfer|hold/i.test(low) ? 'Transfer-pending' : null;
         if(!d){ await send('Reply 1 (Refund) or 2 (Hold for transfer).'); return true; }
         f.disposition = d==='Refund' ? 'refund' : 'transfer';
-        var human = d==='Refund' ? 'Refund into pool' : 'Hold for transfer to another unit';
-        if(f.raiserRole==='senior'){
-          // senior acts directly - commit now
+        f.human = d==='Refund' ? 'Refund into pool' : 'Hold for transfer to another unit';
+        // ROUTING: refund OR forgo(company) => M+S in capital approval group. else senior in sales group.
+        var needsMS = (f.disposition==='refund') || (f.brokerageTreatment==='forgo');
+        f.needsMS=needsMS;
+        if(f.raiserRole==='senior' && !needsMS){
           f.approvedBy=f.raiserName||'senior';
           var res=await commitCancel(f);
           delete sessions[jidOf(msg)];
-          if(res&&res.ok){
-            await send('\u2705 '+f.unit+' CANCELLED ('+human+'). '+inrFull(res.paid)+' \u2192 '+res.disposition+' ('+res.creditId+'). Archived as "'+res.archived+'".');
-            await notifyMukund('\u2139\ufe0f Booking CANCELLED\nUnit: '+f.unit+'\nCustomer: '+f.customer+'\nPaid: '+inrFull(res.paid)+'\nDisposition: '+res.disposition+'\nCredit: '+res.creditId+'\nBy: '+f.raiserName+' (senior, direct)');
-          } else { await send('\u26a0\ufe0f Cancel failed: '+((res&&res.error)||'no response')+'.'); }
+          await cancelDone_(res,f,'senior direct');
           return true;
         }
-        // junior raised -> post to sales group for a senior to approve
+        // build the approval post
+        var toCapital = needsMS;
+        var chan = toCapital ? CAPITAL_APPROVAL_JID : from;
+        var gate = toCapital ? 'M + S' : 'a senior';
         var itemId='cx-'+Date.now().toString(36);
-        var seniorTag = SALES_SENIOR_PHONES.length ? (' (needs a senior: e.g. Umesh)') : '';
-        var postText='\ud83d\uddd1 CANCELLATION for senior approval'+
+        var postText=(toCapital?'\ud83d\uddd1 CANCELLATION for M+S approval':'\ud83d\uddd1 CANCELLATION for senior approval')+
           '\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500'+
-          '\nUnit: '+f.unit+'\nCustomer: '+f.customer+'\nPaid to date: '+inrFull(f.paid)+
-          '\nDisposition: '+human+'\nRaised by: '+(f.raiserName||'junior')+
-          '\n\nReply to THIS message: yes / no'+seniorTag;
-        var sent=await getClient().sendMessage(from, postText);
+          '\nUnit: '+f.unit+'\nCustomer: '+f.customer+'\nPaid: '+inrFull(f.paid)+
+          '\nReason: '+(f.companyFault?'company non-delivery':'customer cancellation')+
+          '\nMoney: '+f.human+
+          '\nBrokerage: '+(f.brokerageTreatment==='recover'?'recover from broker':'FOREGO (write off)')+
+          '\nRaised by: '+(f.raiserName||'agent')+
+          '\n\nReply to THIS message: yes / no';
+        var sent=await getClient().sendMessage(chan, postText);
         var p=loadPending();
-        p.items[itemId]={ kind:'cancel', msgId:sent&&sent.id&&sent.id._serialized, fields:f,
-                          state:'await_senior', originChat:from, at:Date.now() };
+        p.items[itemId]={ kind:'cancel', needsMS:needsMS, msgId:sent&&sent.id&&sent.id._serialized, fields:f,
+                          verdicts:{}, state: needsMS?'await_ms':'await_senior', originChat:from, approvalChat:chan, at:Date.now() };
         savePending(p);
         delete sessions[jidOf(msg)];
-        await send('Sent for senior approval. A senior must reply "yes" on that message to commit.');
+        await send('Sent for '+gate+' approval'+(toCapital?' (capital approval group).':'.'));
         return true;
       }
     }
-
 
     // ----- edit mode -----
     if(ses.mode==='edit'){
