@@ -894,7 +894,7 @@ var sales = initSales({
   SALES_AGENT_LIDS: ['221195194654728@lid'],  // Umesh group @lid
   SALES_GROUP_JID: '120363427646885753@g.us',  // Capital Sales & Collection Group
   skipApproval: function(){ return loadSalesSkipApproval(); },  // live panel toggle
-  SALES_SENIOR_PHONES: ['919873574180'],           // Umesh - approves juniors' changes, acts direct
+  SALES_SENIOR_PHONES: ['919873574180','917838537000'], // Umesh + Mukund - approve changes, act direct
   SALES_JUNIOR_PHONES: ['919773592304'],           // Gautam - changes need senior approval
   NOTIFY_DM_PHONE: '917838537000',                 // Mukund - DM'd on every non-booking change
   TRACKER_API_URL: process.env.TRACKER_API_URL,
