@@ -893,6 +893,7 @@ var sales = initSales({
   SALES_AGENT_PHONES: ['917838537000'],
   SALES_AGENT_LIDS: ['221195194654728@lid'],  // Umesh group @lid
   SALES_GROUP_JID: '120363427646885753@g.us',  // Capital Sales & Collection Group
+  skipApproval: function(){ return loadSalesSkipApproval(); },  // live panel toggle
   TRACKER_API_URL: process.env.TRACKER_API_URL,
   TRACKER_API_SECRET: process.env.TRACKER_API_SECRET
 });
@@ -2172,6 +2173,12 @@ async function handleInflowFlow(msg){
 // var is the boot DEFAULT used only until the dashboard toggle has been set at least once.
 var OUTFLOW_POST_ENABLED = (process.env.OUTFLOW_POST_ENABLED === 'true');
 var OUTFLOW_POST_STATE_FILE = './wa_auth/outflow_post.json';
+// Sales-approval toggle (v2.11.0-s6.10): when SKIP is ON, bookings bypass the M+S
+// approval gate and go straight to the agent re-confirm before committing. Default OFF
+// (approvals required). Live panel toggle, state on the persistent volume.
+var SALES_SKIP_APPROVAL_STATE_FILE = './wa_auth/sales_skip_approval.json';
+function loadSalesSkipApproval(){ try{ if(fs.existsSync(SALES_SKIP_APPROVAL_STATE_FILE)){ return JSON.parse(fs.readFileSync(SALES_SKIP_APPROVAL_STATE_FILE,'utf8')).enabled===true; } }catch(e){} return false; }
+function saveSalesSkipApproval(on){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(SALES_SKIP_APPROVAL_STATE_FILE, JSON.stringify({enabled:!!on, at:new Date().toISOString()})); }catch(e){ console.error('[Sales] skip-approval toggle save:',e.message); } }
 function loadOutflowPostEnabled(){
   try{ if(fs.existsSync(OUTFLOW_POST_STATE_FILE)){ return JSON.parse(fs.readFileSync(OUTFLOW_POST_STATE_FILE,'utf8')).enabled===true; } }catch(e){}
   return OUTFLOW_POST_ENABLED;   // env-var default until the dashboard toggle overrides it
@@ -5295,6 +5302,9 @@ var TABS = [
     {ep:'/api/outflow-post-on', ico:'\\uD83D\\uDE80', label:'Outflow posting ON (go live)', act:true, confirm:'Start auto-posting approved items into the payments group for accountants to mark paid? (Still capture-only — no Sheet write.)'},
     {ep:'/api/outflow-post-off', ico:'\\u23F9', label:'Outflow posting OFF', act:true, confirm:'Stop posting approved items to the payments group?'},
     {ep:'/api/outflow-post-dummy?label=Test%20payment%20due&amount=111190', ico:'\\uD83E\\uDDEA', label:'Post a ⟨TEST⟩ payment-due (dummy)', act:true, confirm:'Post a ⟨TEST⟩-tagged dummy PAYMENT DUE item into the payments group? It is clearly marked test and safe to use freely (it posts even when outflow posting is OFF). Reply paid on it, or type summary in the group, to exercise the flow.'},
+    {ep:'/api/sales-approval-status', ico:'\\u2139', label:'Sales approval status'},
+    {ep:'/api/sales-approval-skip-on', ico:'\\u26A1', label:'Sales: SKIP M+S approval (testing)', act:true, confirm:'Skip M+S approval for new bookings? The agent will still re-confirm before it commits. Use for testing only.'},
+    {ep:'/api/sales-approval-skip-off', ico:'\\uD83D\\uDD12', label:'Sales: REQUIRE M+S approval', act:true, confirm:'Restore M+S approval requirement for bookings?'},
     {ep:'/api/ledger-write-status', ico:'\\uD83D\\uDCD2', label:'Ledger write status'},
     {ep:'/api/ledger-dryrun-on', ico:'\\uD83E\\uDDEA', label:'Ledger dry-run ON (rehearsal)', act:true, confirm:'Turn ledger dry-run ON? The bot will log the row it would write but write nothing — this also pauses any real writes.'},
     {ep:'/api/ledger-dryrun-off', ico:'\\u270D', label:'Ledger dry-run OFF', act:true, confirm:'Turn ledger dry-run OFF? If LEDGER_WRITE_ENABLED is on, confirmed rows will then be written to the actual Sheet.'},
@@ -5847,6 +5857,9 @@ app.get('/api/silent-off',function(req,res){try{saveSilentMode(false);res.json({
 app.get('/api/silent-status',function(req,res){try{res.json({silentMode:loadSilentMode(),observer:SILENT_OBSERVER});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-on',function(req,res){try{saveOutflowPostEnabled(true);res.json({success:true,outflowPosting:true,message:'Outflow posting ON. Newly approved items will auto-post to the payments group for the accountants to mark paid. (Still capture-only — no Sheet write.)'});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-off',function(req,res){try{saveOutflowPostEnabled(false);res.json({success:true,outflowPosting:false,message:'Outflow posting OFF. Approved items will no longer be posted to the payments group.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/sales-approval-status',function(req,res){try{res.json({skipApproval:loadSalesSkipApproval(),note:(loadSalesSkipApproval()?'SKIP is ON \u2014 bookings bypass M+S and go straight to the agent re-confirm, then commit.':'Approvals REQUIRED \u2014 bookings need M+S both-yes, then agent re-confirm.')});}catch(e){res.json({error:e.message});}});
+app.get('/api/sales-approval-skip-on',function(req,res){try{saveSalesSkipApproval(true);res.json({success:true,skipApproval:true,message:'Sales approval SKIP is ON. New bookings post no approval request; the agent just re-confirms and it commits to the tracker. Use for testing.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/sales-approval-skip-off',function(req,res){try{saveSalesSkipApproval(false);res.json({success:true,skipApproval:false,message:'Sales approval SKIP is OFF. Bookings again require M+S both-yes before the agent can re-confirm and commit.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-status',function(req,res){try{res.json({outflowPosting:loadOutflowPostEnabled(),envDefault:OUTFLOW_POST_ENABLED,note:'Panel toggle overrides the OUTFLOW_POST_ENABLED env default once set.'});}catch(e){res.json({error:e.message});}});
 // v2.10.0-s5.13: lock-protected dummy payment-due. Posts a \u27E8TEST\u27E9-tagged PAYMENT DUE item into the
 // outflow group via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the toggle, so
