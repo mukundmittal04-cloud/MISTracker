@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b6 (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b8 (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -26,6 +26,7 @@ module.exports = function initSales(deps){
   var API_URL  = deps.TRACKER_API_URL  || process.env.TRACKER_API_URL  || '';
   var API_SECRET=deps.TRACKER_API_SECRET|| process.env.TRACKER_API_SECRET|| '';
   var SALES_GROUP_JID = deps.SALES_GROUP_JID || CONFIG.SALES_GROUP_JID || '';  // dedicated bookings/collections group
+  var skipApprovalFn = deps.skipApproval || function(){ return false; };  // live toggle: bypass M+S when true
   var SALES_AGENT_PHONES = deps.SALES_AGENT_PHONES || [];  // extra numbers allowed to raise bookings (beyond accountants)
   var SALES_AGENT_LIDS = deps.SALES_AGENT_LIDS || [];    // group @lid authors allowed to raise bookings (e.g. Umesh in a group)
 
@@ -114,13 +115,15 @@ module.exports = function initSales(deps){
   }
   function lookupUnit(unit){ return trackerPost({action:'lookup', unit:unit}); }
   function commitBooking(f){
-    return trackerPost({
+    var payload={
       action:'booking', unit:f.unit, customer:f.customer,
-      priceList: f.listIndex, broker: f.broker||'',
-      brokeragePct: f.bkPct||0,
+      broker: f.broker||'', brokeragePct: f.bkPct||0,
       advance: { amount:f.advAmt||0, mode:f.advMode||'Cheque', account:f.advAcct||'' },
       agent: f.agentName||'', date: new Date().toISOString().slice(0,10)
-    });
+    };
+    if(f.manualTsv || !f.listIndex){ payload.tsv=f.tsv; }        // manual value -> send TSV directly
+    else { payload.priceList=f.listIndex; }                       // else let the list drive it
+    return trackerPost(payload);
   }
 
   // ---------- message builders ----------
@@ -146,6 +149,7 @@ module.exports = function initSales(deps){
     return out.join('\n');
   }
   function deltaLine(f){
+    if(f.manualTsv) return 'Price: '+inrFull(f.tsv)+' (manual TSV)';
     if(!f.stdPrice || f.tsv===f.stdPrice) return 'Price: '+inrFull(f.tsv)+' ('+f.listName+' = standard)';
     var d=f.tsv-f.stdPrice, dp=f.stdPrice? Math.round(d/f.stdPrice*10000)/100 : 0;
     return 'Price: '+inrFull(f.tsv)+' ('+f.listName+') \u2014 '+inr(Math.abs(d))+' '+(d<0?'BELOW':'ABOVE')+' standard ('+(d<0?'':'+')+dp+'%)';
@@ -312,7 +316,8 @@ module.exports = function initSales(deps){
           if(res && res.ok){
             it2.state='committed'; savePending(p2);
             await getClient().sendMessage(from,'\u2705 '+unitRef+' BOOKED & inventory updated.\nCustomer: '+it2.fields.customer+'\nTSV: '+inrFull(res.tsv)+' ('+res.priceList+')\nBalance: '+inrFull(res.balance));
-            await getClient().sendMessage(CONFIG.APPROVAL_GROUP_JID,'\ud83d\udcd7 '+unitRef+' committed to inventory ('+it2.fields.customer+').');
+            var wasApproved = it2.verdicts && it2.verdicts.M==='yes' && it2.verdicts.S==='yes';
+            if(wasApproved) await getClient().sendMessage(CONFIG.APPROVAL_GROUP_JID,'\ud83d\udcd7 '+unitRef+' committed to inventory ('+it2.fields.customer+').');
           } else {
             await getClient().sendMessage(from,'\u26a0\ufe0f Tracker error for '+unitRef+': '+((res&&res.error)||'no response')+'. Not committed \u2014 try "confirm '+unitRef+'" again or tell M.');
           }
@@ -364,26 +369,25 @@ module.exports = function initSales(deps){
         await client.sendMessage(from,'\u26a0\ufe0f '+open.unit+' is already SOLD'+(lk.customer?(' to '+lk.customer):'')+'.');
         return true;
       }
-      if(!lk.prices || !lk.prices.length){
-        await client.sendMessage(from,'\u26a0\ufe0f No price on any list for '+open.unit+' ('+lk.configKey+'). Ask M to fill the Price Lists tab first.');
-        return true;
-      }
       var info=identifySender ? await identifySender(senderJid) : null;
-      var cur=lk.prices.filter(function(x){return x.isCurrent;})[0]||lk.prices[lk.prices.length-1];
+      var hasPrices = lk.prices && lk.prices.length;
+      var cur = hasPrices ? (lk.prices.filter(function(x){return x.isCurrent;})[0]||lk.prices[lk.prices.length-1]) : null;
       sessions[senderJid]={
-        mode:'new', step: open.customer?'pricelist':'customer', originChat: from,
-        lk: lk,
+        mode:'new', originChat: from, lk: lk, noPrices: !hasPrices,
+        step: open.customer ? (hasPrices?'pricelist':'manualtsv') : 'customer',
         fields:{
           unit: open.unit, configKey: lk.configKey, customer: open.customer,
-          listIndex: cur.list, listName: cur.name, tsv: cur.price,
-          stdPrice: cur.price, mortgaged: lk.mortgaged,
+          listIndex: cur?cur.list:0, listName: cur?cur.name:'Manual', tsv: cur?cur.price:0,
+          stdPrice: cur?cur.price:0, mortgaged: lk.mortgaged, manualTsv: !hasPrices,
           agentName: (info&&info.contactName)||'', agentJid: senderJid
         }
       };
-      if(open.customer){
+      if(!open.customer){
+        await client.sendMessage(from,'Customer name for '+open.unit+'?');
+      } else if(hasPrices){
         await client.sendMessage(from, priceMenu(lk));
       } else {
-        await client.sendMessage(from,'Customer name for '+open.unit+'?');
+        await client.sendMessage(from,'No price list is filled for '+open.unit+' ('+(lk.configKey||'no config')+' ) yet.\nEnter the total sale value (TSV) manually \u2014 e.g. "1.98cr" or "19800000".');
       }
       return true;
 
@@ -423,9 +427,17 @@ module.exports = function initSales(deps){
           ses.mode='new'; ses.step='preview';
           await send(previewText(f)); return true;
         }
-        // re-post for approval with verdicts reset
+        // re-post for approval with verdicts reset (or straight to re-confirm if skipping)
         var p=loadPending(); var it=p.items[ses.itemId];
-        it.fields=f; it.verdicts={}; it.state='await_approval';
+        var skipE=false; try{ skipE=!!skipApprovalFn(); }catch(e){}
+        it.fields=f;
+        if(skipE){
+          it.verdicts={M:'skip',S:'skip'}; it.state='await_reconfirm'; it.msgId=null;
+          savePending(p); delete sessions[jidOf(msg)];
+          await send('\u26a1 Updated (approval skipped). Re-confirm to commit: reply "confirm '+f.unit+'".');
+          return true;
+        }
+        it.verdicts={}; it.state='await_approval';
         var sent=await client.sendMessage(CONFIG.APPROVAL_GROUP_JID, approvalText(f));
         it.msgId=sent && sent.id && sent.id._serialized;
         savePending(p);
@@ -439,9 +451,18 @@ module.exports = function initSales(deps){
     switch(ses.step){
       case 'customer':
         if(!body){ await send('Customer name?'); return true; }
-        f.customer=body; ses.step='pricelist';
+        f.customer=body;
+        if(ses.noPrices){ ses.step='manualtsv'; await send('No price list for '+f.unit+' ('+(f.configKey||'no config')+') yet.\nEnter the total sale value (TSV) manually \u2014 e.g. "1.98cr" or "19800000".'); return true; }
+        ses.step='pricelist';
         await send(priceMenu(ses.lk)); return true;
 
+      case 'manualtsv': {
+        var mv=parseAmount(body);
+        if(mv===null||mv<=0){ await send('Enter a valid amount, e.g. "1.98cr" or "19800000".'); return true; }
+        f.tsv=mv; f.stdPrice=mv; f.listName='Manual'; f.listIndex=0; f.manualTsv=true;
+        ses.step='broker';
+        await send('TSV set to '+inrFull(mv)+' (manual).\nBroker name? (or "none")'); return true;
+      }
       case 'pricelist': {
         var pick=null;
         if(low==='ok'){ pick=ses.lk.prices.filter(function(x){return x.isCurrent;})[0]; }
@@ -493,6 +514,17 @@ module.exports = function initSales(deps){
       case 'preview': {
         if(/^(yes|y|ok|send)$/i.test(low)){
           var itemId=newItemId();
+          var skip = false; try{ skip = !!skipApprovalFn(); }catch(e){}
+          if(skip){
+            // approvals bypassed: go straight to agent re-confirm (still one safety tap)
+            var p0=loadPending();
+            p0.items[itemId]={ msgId:null, fields:f, verdicts:{M:'skip',S:'skip'},
+                               state:'await_reconfirm', originChat: from, at: Date.now() };
+            savePending(p0);
+            delete sessions[jidOf(msg)];
+            await send('\u26a1 Approval skipped (testing mode). Re-confirm to commit: reply "confirm '+f.unit+'"  (or "edit '+f.unit+'").');
+            return true;
+          }
           var sent=await client.sendMessage(CONFIG.APPROVAL_GROUP_JID, approvalText(f));
           var p=loadPending();
           p.items[itemId]={ msgId: sent && sent.id && sent.id._serialized,
