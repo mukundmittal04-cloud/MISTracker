@@ -884,6 +884,34 @@ var LEDGER_INFLOW_TAGS = ['FBD-Plot-Receivable','FBD-Plot-Construction','FBD-Flo
 // v2.10.0-s5.9: paying-account list — exact order/contents of the Ledger Bank A/C dropdown.
 // Used both for the numbered menu (step 6) and to validate a typed account.
 var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','—','MM PDC','SM PDC','PDC'];
+// v2.11.0-s6.10: AI classify a cancellation reason -> company_fault | normal.
+// Used by the sales module's cancel flow. Uses the same Claude API pattern as vision.
+async function aiClassifyReason(reasonText){
+  if(!CONFIG.CLAUDE_API_KEY) return {classification:'normal',confidence:'low',reasoning:'(no AI key)'};
+  try{
+    var prompt='A real-estate booking is being cancelled. Classify the REASON into exactly one of two categories, from the DEVELOPER\'s point of view:\n'+
+      '- "company_fault": the cancellation is due to the DEVELOPER/COMPANY failing to deliver (e.g. possession not given in time, project delayed, our non-delivery, we could not hand over, construction stalled, we breached).\n'+
+      '- "normal": the cancellation is the CUSTOMER\'s own decision or fault (changed mind, arranging finance failed, personal reasons, found another property, could not pay, wants refund by choice).\n'+
+      'Reason text: "'+String(reasonText||'').replace(/"/g,"'").substring(0,400)+'"\n'+
+      'Reply ONLY with JSON on one line: {"classification":"normal","confidence":"high","reasoning":"<max 12 words>"}';
+    var resp=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
+      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:120,messages:[{role:'user',content:[{type:'text',text:prompt}]}]})
+    });
+    if(!resp.ok){ console.error('[AIclassify] API error',resp.status); return {classification:'normal',confidence:'low',reasoning:'(api error)'}; }
+    var data=await resp.json();
+    var text='';
+    if(data.content){ for(var i=0;i<data.content.length;i++){ if(data.content[i].type==='text'){text=data.content[i].text;break;} } }
+    text=(text||'').replace(/```json|```/g,'').trim();
+    var parsed; try{parsed=JSON.parse(text);}catch(e){ var m=text.match(/\{[^}]*\}/); if(m){try{parsed=JSON.parse(m[0]);}catch(e2){parsed=null;}} }
+    if(!parsed||!parsed.classification) return {classification:'normal',confidence:'low',reasoning:'(unparsed)'};
+    var cls = /company/i.test(parsed.classification)?'company_fault':'normal';
+    console.log('[AIclassify]',JSON.stringify({in:String(reasonText).substring(0,60),out:cls}));
+    return {classification:cls,confidence:parsed.confidence||'low',reasoning:(parsed.reasoning||'').toString().substring(0,120)};
+  }catch(e){ console.error('[AIclassify]',e.message); return {classification:'normal',confidence:'low',reasoning:'(exception)'}; }
+}
+
 var sales = initSales({
   CONFIG: CONFIG,
   getClient: function(){ return (typeof waClient!=='undefined') ? waClient : null; },
@@ -897,6 +925,8 @@ var sales = initSales({
   SALES_SENIOR_PHONES: ['919873574180','917838537000'], // Umesh + Mukund - approve changes, act direct
   SALES_JUNIOR_PHONES: ['919773592304'],           // Gautam - changes need senior approval
   NOTIFY_DM_PHONE: '917838537000',                 // Mukund - DM'd on every non-booking change
+  CAPITAL_APPROVAL_JID: CONFIG.APPROVAL_GROUP_JID, // M+S channel for refunds / brokerage forgo
+  aiClassifyReason: aiClassifyReason,              // AI: cancellation reason -> company_fault | normal
   resolveLidPhone: async function(jid){
     try{
       var c = await waClient.getContactById(jid);
