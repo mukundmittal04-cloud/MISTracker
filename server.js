@@ -892,6 +892,7 @@ var sales = initSales({
   fetch: fetch, fs: fs, authDir: './wa_auth',
   SALES_AGENT_PHONES: ['917838537000'],
   SALES_AGENT_LIDS: ['221195194654728@lid'],  // Umesh group @lid
+  SALES_GROUP_JID: '120363427646885753@g.us',  // Capital Sales & Collection Group
   TRACKER_API_URL: process.env.TRACKER_API_URL,
   TRACKER_API_SECRET: process.env.TRACKER_API_SECRET
 });
