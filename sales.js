@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b5 (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b6 (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -25,6 +25,7 @@ module.exports = function initSales(deps){
   var AUTH_DIR = deps.authDir || './wa_auth';
   var API_URL  = deps.TRACKER_API_URL  || process.env.TRACKER_API_URL  || '';
   var API_SECRET=deps.TRACKER_API_SECRET|| process.env.TRACKER_API_SECRET|| '';
+  var SALES_GROUP_JID = deps.SALES_GROUP_JID || CONFIG.SALES_GROUP_JID || '';  // dedicated bookings/collections group
   var SALES_AGENT_PHONES = deps.SALES_AGENT_PHONES || [];  // extra numbers allowed to raise bookings (beyond accountants)
   var SALES_AGENT_LIDS = deps.SALES_AGENT_LIDS || [];    // group @lid authors allowed to raise bookings (e.g. Umesh in a group)
 
@@ -332,13 +333,16 @@ module.exports = function initSales(deps){
       var open=parseOpening(body);
       if(!open) return false;
       console.log('[sales] book trigger from='+from+' author='+(msg.author||'-')+' body='+JSON.stringify(body));
-      var isGroup = /@g\.us$/.test(from);
-      var isDM = !isGroup;  // @c.us OR @lid direct messages
-      var isGroupOK = (from===CONFIG.WHATSAPP_GROUP_JID) || isDM;  // expense group, or any DM
-      if(!isGroupOK){ console.log('[sales] rejected: other group, not the expense group (from='+from+')'); return false; }
-      var agentOK = await isAgent(msg);
-      if(!agentOK){ console.log('[sales] rejected: sender not a recognized agent (from='+from+')'); return false; }
-      console.log('[sales] accepted book for unit='+open.unit+' API_URL='+(API_URL?'set':'MISSING'));
+      // PRIMARY channel: the dedicated sales group. In-group, any member may raise a booking.
+      var inSalesGroup = SALES_GROUP_JID && from===SALES_GROUP_JID;
+      if(!inSalesGroup){
+        // allow known agents to also book via direct message as a convenience
+        var isGroup = /@g\.us$/.test(from);
+        if(isGroup){ console.log('[sales] rejected: booking must be in the sales group (from='+from+')'); return false; }
+        var agentOK = await isAgent(msg);
+        if(!agentOK){ console.log('[sales] rejected: DM sender not a recognized agent (from='+from+')'); return false; }
+      }
+      console.log('[sales] accepted book for unit='+open.unit+' via '+(inSalesGroup?'SALES GROUP':'agent DM')+' API_URL='+(API_URL?'set':'MISSING'));
       if(!API_URL || !API_SECRET){
         await client.sendMessage(from,'\u26a0\ufe0f Booking system not configured: TRACKER_API_URL / TRACKER_API_SECRET missing on the server (Railway env vars). Tell M.');
         return true;
