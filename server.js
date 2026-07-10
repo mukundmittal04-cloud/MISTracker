@@ -897,6 +897,16 @@ var sales = initSales({
   SALES_SENIOR_PHONES: ['919873574180','917838537000'], // Umesh + Mukund - approve changes, act direct
   SALES_JUNIOR_PHONES: ['919773592304'],           // Gautam - changes need senior approval
   NOTIFY_DM_PHONE: '917838537000',                 // Mukund - DM'd on every non-booking change
+  resolveLidPhone: async function(jid){
+    try{
+      var c = await waClient.getContactById(jid);
+      if(c && c.number){ var n=String(c.number).replace(/[^0-9]/g,''); if(n.length>=10 && n.length<=13) return n; }
+      if(c){ var cands=[c.pushname,c.name,c.shortName,c.verifiedName];
+        for(var i=0;i<cands.length;i++){ var m=String(cands[i]||'').match(/\+?(91)?[\s\-]?(\d{5})[\s\-]?(\d{5})/); if(m){ var p='91'+m[2]+m[3]; if(p.length===12) return p; } } }
+    }catch(e){ console.log('[sales] resolveLidPhone:', e.message); }
+    return '';
+  },
+  LID_PHONE_MAP: { '86960253214761@lid': '917838537000' },  // Mukund's known linked-device lid
   TRACKER_API_URL: process.env.TRACKER_API_URL,
   TRACKER_API_SECRET: process.env.TRACKER_API_SECRET
 });
