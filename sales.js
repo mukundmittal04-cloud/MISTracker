@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b8 (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b9 (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -91,6 +91,19 @@ module.exports = function initSales(deps){
     if(n>0 && n<=15){ var p2=n/100; return {pct:p2, amt:Math.round(p2*tsv)}; }
     return {pct: tsv>0? n/tsv : 0, amt: Math.round(n)};
   }
+  function parseEconLine(text, tsv){
+    // returns {skip:true} | {pct} | {amt} | null(invalid)
+    var t=String(text||'').trim().toLowerCase();
+    if(t==='' || t==='0' || t==='skip' || t==='none' || t==='no' || t==='-') return {skip:true};
+    var m=t.match(/^([\d.]+)\s*%$/);
+    if(m){ return {pct: parseFloat(m[1]) }; }                 // "5%" -> 5 (percent)
+    // unit-suffixed => absolute amount
+    if(/^[\d.]+\s*(cr|crore|l|lac|lakh|lk|k)$/i.test(t)){ var a=parseAmount(t); return a?{amt:a}:null; }
+    var n=parseFloat(t.replace(/,/g,''));
+    if(isNaN(n)||n<0) return null;
+    if(n>0 && n<=100) return {pct:n};                          // bare <=100 -> percent
+    return {amt: Math.round(n) };                              // large -> amount
+  }
   function parseAmount(text){
     var t=String(text||'').toLowerCase().replace(/,/g,'').trim();
     var m=t.match(/^([\d.]+)\s*(cr|crore|l|lac|lakh|lk|k)?$/);
@@ -123,6 +136,7 @@ module.exports = function initSales(deps){
     };
     if(f.manualTsv || !f.listIndex){ payload.tsv=f.tsv; }        // manual value -> send TSV directly
     else { payload.priceList=f.listIndex; }                       // else let the list drive it
+    if(f.economics && Object.keys(f.economics).length) payload.economics=f.economics;
     return trackerPost(payload);
   }
 
@@ -154,20 +168,31 @@ module.exports = function initSales(deps){
     var d=f.tsv-f.stdPrice, dp=f.stdPrice? Math.round(d/f.stdPrice*10000)/100 : 0;
     return 'Price: '+inrFull(f.tsv)+' ('+f.listName+') \u2014 '+inr(Math.abs(d))+' '+(d<0?'BELOW':'ABOVE')+' standard ('+(d<0?'':'+')+dp+'%)';
   }
+  function econLines(f){
+    var e=f.economics||{}, out=[];
+    ECON_LINES.forEach(function(L){
+      if(e[L.key+'Pct']!==undefined) out.push('  '+L.label+': '+e[L.key+'Pct']+'%');
+      else if(e[L.key+'Amt']!==undefined) out.push('  '+L.label+': '+inrFull(e[L.key+'Amt']));
+    });
+    return out;
+  }
   function previewText(f){
-    return [
+    var lines=[
       'BOOKING PREVIEW \u2014 confirm before it goes for approval',
       '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500',
       'Unit:      '+f.unit+' ('+f.configKey+')',
       'Customer:  '+f.customer,
       deltaLine(f),
       'Broker:    '+(f.broker||'\u2014'),
-      'Brokerage: '+inrFull(f.bkAmt)+' ('+pct(f.bkPct)+' of TSV)',
-      'Advance:   '+inrFull(f.advAmt)+' via '+f.advMode+(f.advAcct?(' \u2192 '+f.advAcct):''),
-      'Balance:   '+inrFull(f.tsv-(f.advAmt||0)),
-      '',
-      'Reply "yes" to send for M+S approval, "edit" to change, "cancel" to drop.'
-    ].join('\n');
+      'Brokerage: '+inrFull(f.bkAmt)+' ('+pct(f.bkPct)+' of TSV)'
+    ];
+    var el=econLines(f);
+    if(el.length){ lines.push('Adjustments:'); lines=lines.concat(el); }
+    lines.push('Advance:   '+inrFull(f.advAmt)+' via '+f.advMode+(f.advAcct?(' \u2192 '+f.advAcct):''));
+    lines.push('Balance:   '+inrFull(f.tsv-(f.advAmt||0)));
+    lines.push('');
+    lines.push('Reply "yes" to send for M+S approval, "edit" to change, "cancel" to drop.');
+    return lines.join('\n');
   }
   function approvalText(f){
     return [
@@ -177,14 +202,23 @@ module.exports = function initSales(deps){
       'Customer:  '+f.customer,
       deltaLine(f),
       'Broker:    '+(f.broker||'\u2014'),
-      'Brokerage: '+inrFull(f.bkAmt)+' ('+pct(f.bkPct)+' of TSV)',
+      'Brokerage: '+inrFull(f.bkAmt)+' ('+pct(f.bkPct)+' of TSV)'
+    ].concat(econLines(f).length?['Adjustments:'].concat(econLines(f)):[]).concat([
       'Advance:   '+inrFull(f.advAmt)+' via '+f.advMode+(f.advAcct?(' \u2192 '+f.advAcct):''),
       'Balance:   '+inrFull(f.tsv-(f.advAmt||0)),
       'Raised by: '+(f.agentName||'agent'),
       '',
       'Reply to THIS message: yes / no'
-    ].join('\n');
+    ]).join('\n');
   }
+  var ECON_LINES=[
+    {key:'disc',  label:'On-form discount (comes out of broker commission)'},
+    {key:'dp',    label:'Down-payment discount'},
+    {key:'gift',  label:'Gift'},
+    {key:'npv',   label:'NPV adjustment'},
+    {key:'mktg',  label:'Marketing / staff'},
+    {key:'other', label:'Other'}
+  ];
   var EDIT_FIELDS=['customer','price list','broker','brokerage','advance amount','advance mode','advance account'];
   function editMenu(){
     var out=['Which field? Reply the number:'];
@@ -474,7 +508,7 @@ module.exports = function initSales(deps){
       }
       case 'broker':
         f.broker = /^none$/i.test(body)? '' : body;
-        if(!f.broker){ f.bkPct=0; f.bkAmt=0; ses.step='advamt'; await send('Advance received? (amount, e.g. "5L" \u2014 or 0)'); return true; }
+        if(!f.broker){ f.bkPct=0; f.bkAmt=0; ses.step='econ_ask'; await send('No broker. Add discounts / adjustments (on-form discount, DP, gift, NPV, marketing, other)? Reply "yes" or "skip".'); return true; }
         ses.step='brokerage';
         await send('Brokerage? Enter % (e.g. "2%") or amount (e.g. "378000" / "3.78L"). I will show both.'); return true;
 
@@ -482,8 +516,27 @@ module.exports = function initSales(deps){
         var bk=parseBrokerage(body, f.tsv);
         if(!bk){ await send('Could not read that. Enter like "2%" or "3.78L".'); return true; }
         f.bkPct=bk.pct; f.bkAmt=bk.amt;
+        ses.step='econ_ask';
+        await send('Brokerage noted: '+inrFull(bk.amt)+' ('+pct(bk.pct)+').\nAdd discounts / adjustments (on-form discount, DP, gift, NPV, marketing, other)? Reply "yes" to enter them, or "skip" for none.'); return true;
+      }
+      case 'econ_ask': {
+        if(/^(skip|no|n|none)$/i.test(low)){ f.economics={}; ses.step='advamt'; await send('No adjustments. Advance received? (amount \u2014 or 0)'); return true; }
+        if(/^(yes|y|ok)$/i.test(low)){ f.economics={}; ses.econIdx=0; ses.step='econ_line';
+          await send('For each line, reply a % (e.g. "5%"), an amount (e.g. "2L"), or "skip".\n\n'+ECON_LINES[0].label+'?'); return true; }
+        await send('Reply "yes" to enter adjustments or "skip" for none.'); return true;
+      }
+      case 'econ_line': {
+        var line=ECON_LINES[ses.econIdx];
+        var r=parseEconLine(body, f.tsv);
+        if(!r){ await send('Enter a % (e.g. "5%"), an amount (e.g. "2L"), or "skip".'); return true; }
+        if(!r.skip){
+          if(r.pct!==undefined) f.economics[line.key+'Pct']=r.pct;
+          else f.economics[line.key+'Amt']=r.amt;
+        }
+        ses.econIdx++;
+        if(ses.econIdx<ECON_LINES.length){ await send(ECON_LINES[ses.econIdx].label+'?'); return true; }
         ses.step='advamt';
-        await send('Brokerage noted: '+inrFull(bk.amt)+' ('+pct(bk.pct)+').\nAdvance received? (amount \u2014 or 0)'); return true;
+        await send('Adjustments captured. Advance received? (amount \u2014 or 0)'); return true;
       }
       case 'advamt': {
         var a=parseAmount(body);
