@@ -912,6 +912,37 @@ async function aiClassifyReason(reasonText){
   }catch(e){ console.error('[AIclassify]',e.message); return {classification:'normal',confidence:'low',reasoning:'(exception)'}; }
 }
 
+// v2.11.0-s6.11: AI parse a free-form sales message into an ordered plan of operations.
+// Ops: book | cancel | brokerage_adjust | allocate. Returns {steps:[...]} or {steps:[]}.
+async function aiParseSalesIntent(text){
+  if(!CONFIG.CLAUDE_API_KEY) return {steps:[],note:'(no AI key)'};
+  try{
+    var prompt='You convert a real-estate sales instruction (India, WhatsApp shorthand) into an ORDERED JSON plan of operations. Units look like 105-GF / 214-FF / 12-PLOT (floor suffixes GF/FF/SF/TF/PLOT; if the user writes "105" alone with no suffix, keep "105" and set needsSuffix true).\n'+
+      'Operations and their fields:\n'+
+      '1) {"op":"cancel","unit":"","reason":"<verbatim reason if stated>","disposition":"refund"|"transfer"|null,"brokerage":"recover"|"forgo"|null}\n'+
+      '2) {"op":"brokerage_adjust","unit":"<source unit whose broker commission>","amount":<number rupees or null>,"mode":"Cheque"|"Cash"|null,"target":"<receiving unit/customer or null>"}\n'+
+      '3) {"op":"allocate","unit":"<unit whose pool credit>","amount":<number or null>,"method":"rate"|"tranche"|null,"tranche":<1-8 or "latest" or null>}\n'+
+      '4) {"op":"book","unit":"","customer":"","priceList":<1-6 or null>,"broker":"","brokeragePct":<number or null>,"brokerageAmt":<number or null>,"advance":<number or null>,"advanceMode":"Cheque"|"Cash"|"Bank transfer"|null,"account":""}\n'+
+      'Rules: amounts like "5L"/"5 lakh"=500000, "1.5cr"=15000000. Order steps by dependency (a cancel that frees money comes before the allocate that uses it; a brokerage_adjust before the allocate of that credit). "latest milestone/payment" => allocate method tranche, tranche "latest". Money moved from a cancelled unit to another unit = cancel with disposition transfer, then allocate on the TARGET unit. If the instruction is not a sales operation, return {"steps":[]}.\n'+
+      'Reply ONLY one-line JSON: {"steps":[...],"confidence":"high|low"}\n'+
+      'Instruction: "'+String(text||'').replace(/"/g,"'").substring(0,500)+'"';
+    var resp=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
+      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:500,messages:[{role:'user',content:[{type:'text',text:prompt}]}]})
+    });
+    if(!resp.ok){ console.error('[AIparse] API error',resp.status); return {steps:[]}; }
+    var data=await resp.json();
+    var out='';
+    if(data.content){ for(var i=0;i<data.content.length;i++){ if(data.content[i].type==='text'){out=data.content[i].text;break;} } }
+    out=(out||'').replace(/```json|```/g,'').trim();
+    var parsed; try{parsed=JSON.parse(out);}catch(e){ var mm=out.match(/\{[\s\S]*\}/); if(mm){try{parsed=JSON.parse(mm[0]);}catch(e2){parsed=null;}} }
+    if(!parsed||!Array.isArray(parsed.steps)) return {steps:[]};
+    console.log('[AIparse]',JSON.stringify({in:String(text).substring(0,60),steps:parsed.steps.length}));
+    return {steps:parsed.steps.slice(0,4),confidence:parsed.confidence||'low'};
+  }catch(e){ console.error('[AIparse]',e.message); return {steps:[]}; }
+}
+
 var sales = initSales({
   CONFIG: CONFIG,
   getClient: function(){ return (typeof waClient!=='undefined') ? waClient : null; },
@@ -927,6 +958,7 @@ var sales = initSales({
   NOTIFY_DM_PHONE: '917838537000',                 // Mukund - DM'd on every non-booking change
   CAPITAL_APPROVAL_JID: CONFIG.APPROVAL_GROUP_JID, // M+S channel for refunds / brokerage forgo
   aiClassifyReason: aiClassifyReason,              // AI: cancellation reason -> company_fault | normal
+  aiParseIntent: aiParseSalesIntent,               // AI: free-form message -> ordered plan of sales ops
   resolveLidPhone: async function(jid){
     try{
       var c = await waClient.getContactById(jid);
