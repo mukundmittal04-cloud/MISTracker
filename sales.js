@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b13 (b12 + CANCEL REASON AI-CLASSIFY + RECOVER/FORGO + M+S ROUTING + ALLOCATE. cancel now: free-text reason -> aiClassifyReason company_fault|normal (agent can override) -> brokerage recover|forgo -> disposition refund|transfer -> ROUTING: refund OR forgo => M+S in capital approval group, else senior in sales group. New allocate <unit>: apply pooled credit at rate level or to a tranche ("latest" = last with due balance). Verdict handler split so booking(M+S)/cancel(senior or M+S)/brokadjust(senior)/allocate(senior) each resolve correctly across sales + capital groups) (b11 + BROKERAGE ADJUST: brokerage adjust <unit> redirects a broker pending commission on a live unit into a target pool; MONEY OUT Brokerage row, non-GST by sheet rule; senior direct / junior needs senior yes; Mukund DM. Cancel still owns refund + adjust-out) (b10 + LID RESOLUTION FIX for changes: resolvePhone now uses an injected server resolveLidPhone(jid) [same logic as the auth layer: waClient.getContactById(jid).number] plus an explicit LID_PHONE_MAP fallback, because identifySender returns {role,contactName} with NO phone field - so cancel from a linked-device @lid now resolves to the real phone and seniorityOf works) (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b14 (b13 + AI NL LAYER: free-form messages in the sales group are parsed by aiParseIntent into an ordered plan (book/cancel/brokerage_adjust/allocate), each step validated against the live sheet, the WHOLE resolved plan echoed for a yes/no, then executed by driving the existing structured flows with synthetic pre-filled answers - so gates, previews and approval routing are the SAME tested code. Plans pause at approvals and resume on commit; human still confirms the AI reason-classification; blockers (missing suffix, not-sold, over-pending) halt before anything runs) (b12 + CANCEL REASON AI-CLASSIFY + RECOVER/FORGO + M+S ROUTING + ALLOCATE. cancel now: free-text reason -> aiClassifyReason company_fault|normal (agent can override) -> brokerage recover|forgo -> disposition refund|transfer -> ROUTING: refund OR forgo => M+S in capital approval group, else senior in sales group. New allocate <unit>: apply pooled credit at rate level or to a tranche ("latest" = last with due balance). Verdict handler split so booking(M+S)/cancel(senior or M+S)/brokadjust(senior)/allocate(senior) each resolve correctly across sales + capital groups) (b11 + BROKERAGE ADJUST: brokerage adjust <unit> redirects a broker pending commission on a live unit into a target pool; MONEY OUT Brokerage row, non-GST by sheet rule; senior direct / junior needs senior yes; Mukund DM. Cancel still owns refund + adjust-out) (b10 + LID RESOLUTION FIX for changes: resolvePhone now uses an injected server resolveLidPhone(jid) [same logic as the auth layer: waClient.getContactById(jid).number] plus an explicit LID_PHONE_MAP fallback, because identifySender returns {role,contactName} with NO phone field - so cancel from a linked-device @lid now resolves to the real phone and seniorityOf works) (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -33,6 +33,7 @@ module.exports = function initSales(deps){
   var resolveLidPhone      = deps.resolveLidPhone || null;    // async (jid)->phone, server's lid resolver
   var LID_PHONE_MAP        = deps.LID_PHONE_MAP || {};        // explicit @lid -> phone fallback
   var aiClassifyReason     = deps.aiClassifyReason || null;   // async (text)->{classification,confidence,reasoning}
+  var aiParseIntent        = deps.aiParseIntent || null;      // async (text)->{steps:[...]} ordered plan
   var CAPITAL_APPROVAL_JID = deps.CAPITAL_APPROVAL_JID || CONFIG.APPROVAL_GROUP_JID || '';  // M+S refund/forgo channel
   var SALES_AGENT_PHONES = deps.SALES_AGENT_PHONES || [];  // extra numbers allowed to raise bookings (beyond accountants)
   var SALES_AGENT_LIDS = deps.SALES_AGENT_LIDS || [];    // group @lid authors allowed to raise bookings (e.g. Umesh in a group)
@@ -392,6 +393,7 @@ module.exports = function initSales(deps){
             return true; }
           if(res && res.ok){
             it2.state='committed'; savePending(p2);
+            await maybePlanAdvance_(it2.fields);
             await getClient().sendMessage(from,'\u2705 '+unitRef+' BOOKED & inventory updated.\nCustomer: '+it2.fields.customer+'\nTSV: '+inrFull(res.tsv)+' ('+res.priceList+')\nBalance: '+inrFull(res.balance));
             var wasApproved = it2.verdicts && it2.verdicts.M==='yes' && it2.verdicts.S==='yes';
             if(wasApproved) await getClient().sendMessage(CONFIG.APPROVAL_GROUP_JID,'\ud83d\udcd7 '+unitRef+' committed to inventory ('+it2.fields.customer+').');
@@ -425,7 +427,8 @@ module.exports = function initSales(deps){
         if(!(pinfo.available>0)){ await client.sendMessage(from,'\u26a0\ufe0f No pooled credit available on '+aunit+' to allocate.'); return true; }
         var ainfo=identifySender?await identifySender(senderJid):null;
         sessions[senderJid]={ mode:'allocate', step:'amount', originChat:from,
-          fields:{ unit:aunit, available:pinfo.available, availGst:pinfo.availableGst, availNon:pinfo.availableNonGst,
+          fields:{ unit:aunit, available:pinfo.available, availGst:pinfo.availableGst, availNon:pinfo.availableNonGst, originChat:from,
+                   planOwner:(planStore().plans[senderJid]?senderJid:null),
                    tranches:pinfo.tranches||[], raiserRole:arole, raiserName:(ainfo&&ainfo.contactName)||'', raiserPhone:aphone2 } };
         await client.sendMessage(from,'ALLOCATE credit \u2014 '+aunit+'\nAvailable pool credit: '+inrFull(pinfo.available)+'\n\nHow much to allocate? (up to '+inrFull(pinfo.available)+')');
         return true;
@@ -447,7 +450,8 @@ module.exports = function initSales(deps){
         if(!(bi.pendingCommission>0)){ await client.sendMessage(from,'\u26a0\ufe0f No pending broker commission on '+bunit+' ('+(bi.broker||'no broker')+') to set off.'); return true; }
         var binfo=identifySender?await identifySender(senderJid):null;
         sessions[senderJid]={ mode:'brokadjust', step:'amount', originChat:from,
-          fields:{ unit:bunit, broker:bi.broker, pending:bi.pendingCommission,
+          fields:{ unit:bunit, broker:bi.broker, pending:bi.pendingCommission, originChat:from,
+                   planOwner:(planStore().plans[senderJid]?senderJid:null),
                    raiserRole:brole, raiserName:(binfo&&binfo.contactName)||'', raiserPhone:bphone } };
         await client.sendMessage(from,
           'BROKERAGE ADJUST \u2014 '+bunit+'\nBroker: '+(bi.broker||'(none)')+'\nPending commission: '+inrFull(bi.pendingCommission)+
@@ -456,7 +460,7 @@ module.exports = function initSales(deps){
       }
 
       // ===== 3.5 cancellation: "cancel <unit>" (Gautam->Umesh approve; Umesh acts direct) =====
-      var mCancel=body.match(/^cancel\s+(\d{2,3}[A-Z]?-(?:GF|FF|SF|TF|PLOT))\b/i);
+      var mCancel=body.match(/^cancel\s+(\d{2,3}[A-Z]?-(?:GF|FF|SF|TF|PLOT))\s*$/i);  // exact form only; longer text goes to the AI planner
       if(mCancel){
         var cunit=mCancel[1].toUpperCase();
         var inSG = SALES_GROUP_JID && from===SALES_GROUP_JID;
@@ -469,7 +473,8 @@ module.exports = function initSales(deps){
         if(clk.status!=='Sold'){ await client.sendMessage(from,'\u26a0\ufe0f '+cunit+' is not sold (status '+clk.status+') \u2014 nothing to cancel.'); return true; }
         var cinfo=identifySender?await identifySender(senderJid):null;
         sessions[senderJid]={ mode:'cancel', step:'reason', originChat:from,
-          fields:{ unit:cunit, customer:clk.customer, paid:clk.paidToDate||0,
+          fields:{ unit:cunit, customer:clk.customer, paid:clk.paidToDate||0, originChat:from,
+                   planOwner:(planStore().plans[senderJid]?senderJid:null),
                    raiserRole:role, raiserName:(cinfo&&cinfo.contactName)||'', raiserPhone:cphone } };
         await client.sendMessage(from,
           'CANCEL '+cunit+' \u2014 '+(clk.customer||'(no customer)')+'\nPaid to date: '+inrFull(clk.paidToDate||0)+
@@ -495,6 +500,7 @@ module.exports = function initSales(deps){
             if(bres&&bres.ok){ bit.state='done'; savePending(pc);
               await client.sendMessage(from,'\u2705 Brokerage set off: '+inrFull(bres.amount)+' from '+bres.unit+' \u2192 '+bres.target+'. Broker pending now '+inrFull(bres.pendingAfter)+'.');
               await notifyMukund('\u2139\ufe0f BROKERAGE ADJUST\nUnit: '+bres.unit+'\nBroker: '+(bres.broker||'\u2014')+'\nSet off: '+inrFull(bres.amount)+'\nCredited to: '+bres.target+'\nApproved by: '+bit.fields.approvedBy+'\nRaised by: '+bit.fields.raiserName);
+              await maybePlanAdvance_(bit.fields);
             } else { await client.sendMessage(from,'\u26a0\ufe0f Brokerage adjust failed: '+((bres&&bres.error)||'no response')+'.'); }
             return true;
           }
@@ -538,7 +544,7 @@ module.exports = function initSales(deps){
 
       // ===== 4. opening: "book ..." from an agent =====
       var open=parseOpening(body);
-      if(!open) return false;
+      if(!open) return await maybeNL_(msg, from, senderJid, body);
       console.log('[sales] book trigger from='+from+' author='+(msg.author||'-')+' body='+JSON.stringify(body));
       // PRIMARY channel: the dedicated sales group. In-group, any member may raise a booking.
       var inSalesGroup = SALES_GROUP_JID && from===SALES_GROUP_JID;
@@ -581,6 +587,7 @@ module.exports = function initSales(deps){
           unit: open.unit, configKey: lk.configKey, customer: open.customer,
           listIndex: cur?cur.list:0, listName: cur?cur.name:'Manual', tsv: cur?cur.price:0,
           stdPrice: cur?cur.price:0, mortgaged: lk.mortgaged, manualTsv: !hasPrices,
+          originChat: from, planOwner:(planStore().plans[senderJid]?senderJid:null),
           agentName: (info&&info.contactName)||'', agentJid: senderJid
         }
       };
@@ -600,6 +607,150 @@ module.exports = function initSales(deps){
   }
 
   // ---------- session state machine ----------
+  // ============ AI NATURAL-LANGUAGE LAYER (single-op + multi-step planner) ============
+  // Parse -> resolve vs sheet -> ECHO full plan -> confirm -> drive the EXISTING flows
+  // by synthesizing the structured opening + pre-filled answers. Gates unchanged.
+  function planStore(){ var p=loadPending(); p.plans=p.plans||{}; return p; }
+  function fmtStep_(i,s,resolved){
+    var n=(i+1)+') ';
+    if(s.op==='cancel') return n+'CANCEL '+s.unit+(resolved.customer?(' ('+resolved.customer+', paid '+inrFull(resolved.paid||0)+')'):'')+
+      (s.disposition?(' \u2014 money: '+s.disposition):' \u2014 money: (will ask)')+(s.brokerage?(' \u2014 brokerage: '+s.brokerage):'');
+    if(s.op==='brokerage_adjust') return n+'BROKERAGE SET-OFF '+(s.amount?inrFull(s.amount):'(amount?)')+' from '+s.unit+
+      (resolved.broker?(' ('+resolved.broker+', pending '+inrFull(resolved.pending||0)+')'):'')+' \u2192 '+(s.target||'(target?)');
+    if(s.op==='allocate') return n+'ALLOCATE '+(s.amount?inrFull(s.amount):'(amount?)')+' on '+s.unit+
+      (s.tranche==='latest'?' to the LATEST due milestone':(s.tranche?(' to tranche '+s.tranche):(s.method==='rate'?' at rate level':' (how? will ask)')))+
+      (resolved.available!==undefined?(' [pool available '+inrFull(resolved.available)+']'):'');
+    if(s.op==='book') return n+'BOOK '+s.unit+' for '+(s.customer||'(customer?)')+(s.broker?(' \u2014 broker '+s.broker):'')+
+      (s.brokeragePct?(' @'+s.brokeragePct+'%'):'')+(s.advance?(' \u2014 advance '+inrFull(s.advance)):'');
+    return n+JSON.stringify(s);
+  }
+  function answersFor_(s){
+    // ordered synthetic answers for each op's session; stop-gaps (nulls) are omitted so the flow pauses for the human
+    var q=[];
+    if(s.op==='cancel'){
+      q.push(s.reason||'cancelled by customer');
+      // reasonconfirm intentionally NOT queued - human confirms the AI classification
+      // brokerage + disposition queued AFTER the human confirm resumes the drain? drain stops at reasonconfirm;
+      // store the remainder so the human's single "1/2" continues, then the queued rest applies.
+      var rest=[];
+      if(s.brokerage) rest.push(s.brokerage==='forgo'?'2':'1');
+      if(s.disposition) rest.push(s.disposition==='refund'?'1':'2');
+      return {pre:q, post:rest};
+    }
+    if(s.op==='brokerage_adjust'){
+      if(s.amount) q.push(String(s.amount));
+      if(s.mode) q.push(/cash/i.test(s.mode)?'2':'1'); else if(s.amount) q.push('1');
+      if(s.target) q.push(s.target);
+      q.push('yes');
+      return {pre:q, post:[]};
+    }
+    if(s.op==='allocate'){
+      if(s.amount) q.push(String(s.amount));
+      if(s.tranche){ q.push('2'); q.push(String(s.tranche)); }
+      else if(s.method==='rate') q.push('1');
+      q.push('yes');
+      return {pre:q, post:[]};
+    }
+    if(s.op==='book'){
+      if(s.customer) q.push(s.customer);
+      q.push(s.priceList?String(s.priceList):'ok');
+      q.push(s.broker||'none');
+      if(s.broker) q.push(s.brokeragePct?String(s.brokeragePct)+'%':(s.brokerageAmt?String(s.brokerageAmt):'2%'));
+      q.push('skip');                                  // economics: none unless stated (use structured flow for discounts)
+      q.push(s.advance?String(s.advance):'0');
+      if(s.advance){ q.push(/cash/i.test(s.advanceMode||'')?'2':(/transfer|bank/i.test(s.advanceMode||'')?'3':'1'));
+                     if(!/cash/i.test(s.advanceMode||'') && s.account) q.push(s.account); }
+      q.push('yes');
+      return {pre:q, post:[]};
+    }
+    return {pre:[], post:[]};
+  }
+  function openingFor_(s){
+    if(s.op==='cancel') return 'cancel '+s.unit;
+    if(s.op==='brokerage_adjust') return 'brokerage adjust '+s.unit;
+    if(s.op==='allocate') return 'allocate '+s.unit;
+    if(s.op==='book') return 'book '+s.unit+(s.customer?(' '+s.customer):'');
+    return '';
+  }
+  async function runPlanStep_(ownerJid, originChat){
+    var p=planStore(); var pl=p.plans[ownerJid];
+    if(!pl || pl.idx>=pl.steps.length){ if(pl){ delete p.plans[ownerJid]; savePending(p);} return; }
+    var s=pl.steps[pl.idx];
+    var ans=answersFor_(s);
+    pl.postQueue = ans.post||[];
+    savePending(p);
+    var client=getClient();
+    await client.sendMessage(originChat,'\u25b6\ufe0f Plan step '+(pl.idx+1)+'/'+pl.steps.length+': '+openingFor_(s));
+    // synthesize the opening, then drain the pre answers
+    await feedSynthetic_(ownerJid, originChat, openingFor_(s));
+    for(var i=0;i<ans.pre.length;i++){
+      if(!sessions[ownerJid]) break;                      // committed or went to approval
+      await feedSynthetic_(ownerJid, originChat, ans.pre[i]);
+    }
+  }
+  async function feedSynthetic_(ownerJid, chat, text){
+    var fake={ from: chat, author: ownerJid, body: String(text), hasQuotedMsg:false, _synthetic:true };
+    try{ await handleSalesMessage(fake); }catch(e){ console.log('[plan] synthetic err '+e.message); }
+  }
+  async function planStepDone_(ownerJid, originChat){
+    var p=planStore(); var pl=p.plans[ownerJid];
+    if(!pl) return;
+    pl.idx++; savePending(p);
+    if(pl.idx>=pl.steps.length){
+      delete p.plans[ownerJid]; savePending(p);
+      await getClient().sendMessage(originChat,'\u2705 Plan complete \u2014 all '+pl.steps.length+' step(s) done.');
+      return;
+    }
+    await runPlanStep_(ownerJid, originChat);
+  }
+  async function maybePlanAdvance_(f){
+    // called after any op commits; f carries planOwner when running under a plan
+    if(f && f.planOwner){ await planStepDone_(f.planOwner, f.originChat||SALES_GROUP_JID); }
+  }
+
+  async function maybeNL_(msg, from, senderJid, body){
+    if(msg._synthetic) return false;
+    if(!aiParseIntent) return false;
+    if(!SALES_GROUP_JID || from!==SALES_GROUP_JID) return false;
+    var t=String(body||'');
+    if(t.length<10) return false;
+    if(!/\d{2,3}\s*-?\s*(GF|FF|SF|TF|PLOT)?/i.test(t)) return false;
+    if(!/(book|cancel|refund|transfer|broker|brokerage|allocate|adjust|milestone|credit|set\s*off|move)/i.test(t)) return false;
+    var ph=await resolvePhone(msg);
+    if(seniorityOf(ph)==='none') return false;
+    var parsed=null;
+    try{ parsed=await aiParseIntent(t); }catch(e){ console.log('[plan] parse err '+e.message); return false; }
+    if(!parsed||!parsed.steps||!parsed.steps.length) return false;
+    var client=getClient();
+    // validate units + resolve live facts per step
+    var lines=[], blockers=[];
+    for(var i=0;i<parsed.steps.length;i++){
+      var s=parsed.steps[i]; var r={};
+      s.unit=String(s.unit||'').toUpperCase().replace(/\s+/g,'');
+      if(!/^\d{2,3}[A-Z]?-(GF|FF|SF|TF|PLOT)$/.test(s.unit)){ blockers.push('Step '+(i+1)+': which unit exactly? "'+(s.unit||'?')+'" needs the floor suffix (e.g. 105-GF).'); lines.push(fmtStep_(i,s,r)); continue; }
+      try{
+        if(s.op==='cancel'){ var lk=await lookupUnit(s.unit); if(lk&&lk.ok){ r.customer=lk.customer; r.paid=lk.paidToDate; if(lk.status!=='Sold') blockers.push('Step '+(i+1)+': '+s.unit+' is not sold (status '+lk.status+').'); } }
+        else if(s.op==='brokerage_adjust'){ var bi=await brokerageInfo(s.unit); if(bi&&bi.ok){ r.broker=bi.broker; r.pending=bi.pendingCommission; if(!(bi.pendingCommission>0)) blockers.push('Step '+(i+1)+': no pending brokerage on '+s.unit+'.'); if(s.amount&&s.amount>bi.pendingCommission+1) blockers.push('Step '+(i+1)+': '+inrFull(s.amount)+' exceeds pending '+inrFull(bi.pendingCommission)+'.'); } }
+        else if(s.op==='allocate'){ var pi=await poolInfo(s.unit); if(pi&&pi.ok){ r.available=pi.available; } }
+        else if(s.op==='book'){ var lb=await lookupUnit(s.unit); if(lb&&lb.ok&&lb.status==='Sold') blockers.push('Step '+(i+1)+': '+s.unit+' already sold'+(lb.customer?(' to '+lb.customer):'')+'.'); }
+      }catch(e){}
+      lines.push(fmtStep_(i,s,r));
+    }
+    var head='\ud83e\udd16 I read that as '+(parsed.steps.length>1?('a '+parsed.steps.length+'-step plan'):'this operation')+':';
+    var msgTxt=head+'\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n'+lines.join('\n');
+    if(blockers.length){
+      msgTxt+='\n\n\u26a0\ufe0f Cannot run yet:\n'+blockers.join('\n')+'\n\nFix and resend, or use the structured commands.';
+      await client.sendMessage(from,msgTxt); return true;
+    }
+    msgTxt+='\n\nApprovals still apply per step (refund/forgo \u2192 M+S; changes \u2192 senior).\nReply "yes" to run this plan, "no" to drop.';
+    var info=identifySender?await identifySender(senderJid):null;
+    sessions[senderJid]={ mode:'plan', step:'confirm', originChat:from,
+      fields:{ raiserName:(info&&info.contactName)||'', raiserPhone:ph },
+      planSteps: parsed.steps };
+    await client.sendMessage(from,msgTxt);
+    return true;
+  }
+
   async function cancelPromoter_(msg){
     // returns 'M' | 'S' | null based on identifySender/phone
     var ph=await resolvePhone(msg);
@@ -619,6 +770,7 @@ module.exports = function initSales(deps){
     } else {
       await client.sendMessage(f.originChat,'\u26a0\ufe0f Cancel failed: '+((res&&res.error)||'no response')+'.');
     }
+    if(res&&res.ok) await maybePlanAdvance_(f);
   }
 
   async function advanceSession(msg, ses){
@@ -630,6 +782,19 @@ module.exports = function initSales(deps){
     var send=function(t){ return client.sendMessage(from,t); };
 
     if(low==='cancel'){ delete sessions[jidOf(msg)]; await send('Booking flow cancelled.'); return true; }
+
+    // ----- plan confirm mode -----
+    if(ses.mode==='plan'){
+      if(/^(no|n|cancel|drop)$/i.test(low)){ delete sessions[jidOf(msg)]; await send('Plan dropped.'); return true; }
+      if(!/^(yes|y|ok|run)$/i.test(low)){ await send('Reply "yes" to run the plan or "no" to drop.'); return true; }
+      var ownerJid=jidOf(msg);
+      var p=planStore();
+      p.plans[ownerJid]={ steps: ses.planSteps, idx: 0, originChat: from, raiserName: f.raiserName };
+      savePending(p);
+      delete sessions[ownerJid];
+      await runPlanStep_(ownerJid, from);
+      return true;
+    }
 
     // ----- allocate mode -----
     if(ses.mode==='allocate'){
@@ -672,6 +837,7 @@ module.exports = function initSales(deps){
             var where = res.method==='rate' ? 'at rate level' : ('to '+(res.trancheLabel||('tranche '+res.tranche)));
             await send('\u2705 Allocated '+inrFull(res.amount)+' on '+res.unit+' '+where+'. Balance now '+inrFull(res.balanceAfter)+'.');
             await notifyMukund('\u2139\ufe0f CREDIT ALLOCATED\nUnit: '+res.unit+'\nAmount: '+inrFull(res.amount)+'\nApplied: '+where+'\nBalance after: '+inrFull(res.balanceAfter)+'\nBy: '+f.raiserName+' (senior, direct)');
+            await maybePlanAdvance_(f);
           } else { await send('\u26a0\ufe0f Allocate failed: '+((res&&res.error)||'no response')+'.'); }
           return true;
         }
@@ -717,6 +883,7 @@ module.exports = function initSales(deps){
           if(res&&res.ok){
             await send('\u2705 Brokerage set off: '+inrFull(res.amount)+' from '+res.unit+' ('+(res.broker||'broker')+') \u2192 '+res.target+'. Broker pending now '+inrFull(res.pendingAfter)+'.');
             await notifyMukund('\u2139\ufe0f BROKERAGE ADJUST\nUnit: '+res.unit+'\nBroker: '+(res.broker||'\u2014')+'\nSet off: '+inrFull(res.amount)+' ('+f.mode+')\nCredited to: '+res.target+'\nBroker pending after: '+inrFull(res.pendingAfter)+'\nBy: '+f.raiserName+' (senior, direct)');
+            await maybePlanAdvance_(f);
           } else { await send('\u26a0\ufe0f Brokerage adjust failed: '+((res&&res.error)||'no response')+'.'); }
           return true;
         }
@@ -763,6 +930,14 @@ module.exports = function initSales(deps){
           await send(brokerLine+'\n(Company fault \u2014 forgoing is standard, and needs M+S special approval.)\n1) Recover anyway\n2) Forego (write off) \u2014 M+S approval');
         } else {
           await send(brokerLine+'\n(Customer cancellation \u2014 brokerage is revoked; already-paid is normally recovered.)\n1) Recover (log as recoverable from broker)\n2) Forego (write off)');
+        }
+        // if this cancel is a plan step, feed the queued brokerage/disposition answers now
+        if(f.planOwner){
+          var pq=planStore(); var plq=pq.plans[f.planOwner];
+          if(plq && plq.postQueue && plq.postQueue.length){
+            var q=plq.postQueue.slice(); plq.postQueue=[]; savePending(pq);
+            for(var qi=0;qi<q.length;qi++){ if(!sessions[f.planOwner]) break; await feedSynthetic_(f.planOwner, ses.originChat, q[qi]); }
+          }
         }
         return true;
       }
