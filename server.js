@@ -953,6 +953,7 @@ var sales = initSales({
   SALES_AGENT_LIDS: ['221195194654728@lid'],  // Umesh group @lid
   SALES_GROUP_JID: '120363427646885753@g.us',  // Capital Sales & Collection Group
   skipApproval: function(){ return loadSalesSkipApproval(); },  // live panel toggle
+  salesFeatures: function(){ return loadSalesFeatures(); },     // per-feature on/off flags from the dashboard
   SALES_SENIOR_PHONES: ['919873574180','917838537000'], // Umesh + Mukund - approve changes, act direct
   SALES_JUNIOR_PHONES: ['919773592304'],           // Gautam - changes need senior approval
   NOTIFY_DM_PHONE: '917838537000',                 // Mukund - DM'd on every non-booking change
@@ -2251,6 +2252,15 @@ var OUTFLOW_POST_STATE_FILE = './wa_auth/outflow_post.json';
 // Sales-approval toggle (v2.11.0-s6.10): when SKIP is ON, bookings bypass the M+S
 // approval gate and go straight to the agent re-confirm before committing. Default OFF
 // (approvals required). Live panel toggle, state on the persistent volume.
+var SALES_FEATURES_STATE_FILE = './wa_auth/sales_features.json';
+// Shippable default: booking ONLY. Everything else off until deliberately enabled from the dashboard.
+var SALES_FEATURES_DEFAULT = { booking:true, cancel:false, brokerage_adjust:false, allocate:false, ai_planner:false };
+function loadSalesFeatures(){
+  try{ if(fs.existsSync(SALES_FEATURES_STATE_FILE)){ var s=JSON.parse(fs.readFileSync(SALES_FEATURES_STATE_FILE,'utf8'))||{}; return Object.assign({}, SALES_FEATURES_DEFAULT, s.features||s); } }catch(e){}
+  return Object.assign({}, SALES_FEATURES_DEFAULT);
+}
+function saveSalesFeatures(feats){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(SALES_FEATURES_STATE_FILE, JSON.stringify({features:feats, at:new Date().toISOString()})); }catch(e){ console.error('[Sales] features save:',e.message); } }
+function setSalesFeature(name, on){ var f=loadSalesFeatures(); if(f.hasOwnProperty(name)){ f[name]=!!on; saveSalesFeatures(f); } return f; }
 var SALES_SKIP_APPROVAL_STATE_FILE = './wa_auth/sales_skip_approval.json';
 function loadSalesSkipApproval(){ try{ if(fs.existsSync(SALES_SKIP_APPROVAL_STATE_FILE)){ return JSON.parse(fs.readFileSync(SALES_SKIP_APPROVAL_STATE_FILE,'utf8')).enabled===true; } }catch(e){} return false; }
 function saveSalesSkipApproval(on){ try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(SALES_SKIP_APPROVAL_STATE_FILE, JSON.stringify({enabled:!!on, at:new Date().toISOString()})); }catch(e){ console.error('[Sales] skip-approval toggle save:',e.message); } }
@@ -5380,6 +5390,15 @@ var TABS = [
     {ep:'/api/sales-approval-status', ico:'\\u2139', label:'Sales approval status'},
     {ep:'/api/sales-approval-skip-on', ico:'\\u26A1', label:'Sales: SKIP M+S approval (testing)', act:true, confirm:'Skip M+S approval for new bookings? The agent will still re-confirm before it commits. Use for testing only.'},
     {ep:'/api/sales-approval-skip-off', ico:'\\uD83D\\uDD12', label:'Sales: REQUIRE M+S approval', act:true, confirm:'Restore M+S approval requirement for bookings?'},
+    {ep:'/api/sales-features-status', ico:'\\u2699', label:'Sales features \u2014 status'},
+    {ep:'/api/sales-feature?name=cancel&state=on', ico:'\\u2705', label:'Enable: Cancellation / refund', act:true, confirm:'Enable the cancellation + refund request flow in the sales group? It routes refunds/forego to M+S. Leave OFF if you only want booking live.'},
+    {ep:'/api/sales-feature?name=cancel&state=off', ico:'\\u26D4', label:'Disable: Cancellation / refund', act:true, confirm:'Turn the cancellation flow OFF for the team?'},
+    {ep:'/api/sales-feature?name=brokerage_adjust&state=on', ico:'\\u2705', label:'Enable: Brokerage adjust', act:true, confirm:'Enable brokerage set-off (moves broker commission to a target pool)? Money-moving \u2014 keep OFF unless you are supervising.'},
+    {ep:'/api/sales-feature?name=brokerage_adjust&state=off', ico:'\\u26D4', label:'Disable: Brokerage adjust', act:true, confirm:'Turn brokerage adjust OFF?'},
+    {ep:'/api/sales-feature?name=allocate&state=on', ico:'\\u2705', label:'Enable: Allocate credit', act:true, confirm:'Enable pooled-credit allocation? Money-moving \u2014 keep OFF unless supervising.'},
+    {ep:'/api/sales-feature?name=allocate&state=off', ico:'\\u26D4', label:'Disable: Allocate credit', act:true, confirm:'Turn allocate OFF?'},
+    {ep:'/api/sales-feature?name=ai_planner&state=on', ico:'\\u2705', label:'Enable: AI multi-step planner', act:true, confirm:'Enable free-form AI instructions that chain multiple money operations? Highest-risk \u2014 keep OFF for the team.'},
+    {ep:'/api/sales-feature?name=ai_planner&state=off', ico:'\\u26D4', label:'Disable: AI multi-step planner', act:true, confirm:'Turn the AI planner OFF?'},
     {ep:'/api/ledger-write-status', ico:'\\uD83D\\uDCD2', label:'Ledger write status'},
     {ep:'/api/ledger-dryrun-on', ico:'\\uD83E\\uDDEA', label:'Ledger dry-run ON (rehearsal)', act:true, confirm:'Turn ledger dry-run ON? The bot will log the row it would write but write nothing — this also pauses any real writes.'},
     {ep:'/api/ledger-dryrun-off', ico:'\\u270D', label:'Ledger dry-run OFF', act:true, confirm:'Turn ledger dry-run OFF? If LEDGER_WRITE_ENABLED is on, confirmed rows will then be written to the actual Sheet.'},
@@ -5932,6 +5951,8 @@ app.get('/api/silent-off',function(req,res){try{saveSilentMode(false);res.json({
 app.get('/api/silent-status',function(req,res){try{res.json({silentMode:loadSilentMode(),observer:SILENT_OBSERVER});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-on',function(req,res){try{saveOutflowPostEnabled(true);res.json({success:true,outflowPosting:true,message:'Outflow posting ON. Newly approved items will auto-post to the payments group for the accountants to mark paid. (Still capture-only — no Sheet write.)'});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-off',function(req,res){try{saveOutflowPostEnabled(false);res.json({success:true,outflowPosting:false,message:'Outflow posting OFF. Approved items will no longer be posted to the payments group.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/sales-features-status',function(req,res){try{res.json({features:loadSalesFeatures(),note:'Only enabled features respond in the sales group. Booking is the shipped default; the rest stay off until you switch them on here.'});}catch(e){res.json({error:e.message});}});
+app.get('/api/sales-feature',function(req,res){try{var name=String(req.query.name||'');var st=String(req.query.state||'').toLowerCase();if(!SALES_FEATURES_DEFAULT.hasOwnProperty(name))return res.json({error:'unknown feature '+name});if(st!=='on'&&st!=='off')return res.json({error:'state must be on|off'});var f=setSalesFeature(name,st==='on');res.json({success:true,feature:name,enabled:f[name],features:f});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-approval-status',function(req,res){try{res.json({skipApproval:loadSalesSkipApproval(),note:(loadSalesSkipApproval()?'SKIP is ON \u2014 bookings bypass M+S and go straight to the agent re-confirm, then commit.':'Approvals REQUIRED \u2014 bookings need M+S both-yes, then agent re-confirm.')});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-approval-skip-on',function(req,res){try{saveSalesSkipApproval(true);res.json({success:true,skipApproval:true,message:'Sales approval SKIP is ON. New bookings post no approval request; the agent just re-confirms and it commits to the tracker. Use for testing.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-approval-skip-off',function(req,res){try{saveSalesSkipApproval(false);res.json({success:true,skipApproval:false,message:'Sales approval SKIP is OFF. Bookings again require M+S both-yes before the agent can re-confirm and commit.'});}catch(e){res.json({error:e.message});}});
