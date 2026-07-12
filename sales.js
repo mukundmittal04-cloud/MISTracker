@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b15 (b14 + FIXES from live: (1) plan answers are STEP-KEYED not positional - a parsed disposition can no longer be swallowed by the brokerage question (the 114-GF bug where "transfer" was consumed as "forgo" and wrongly routed to M+S); drain runs after reasonconfirm AND after a human brokerage answer. (2) the sales skip-approval toggle now also silences the M+S capital-group routing on cancel (refund/forgo commit directly with approvedBy=skip-toggle) so testing stays out of the capital group) (b13 + AI NL LAYER: free-form messages in the sales group are parsed by aiParseIntent into an ordered plan (book/cancel/brokerage_adjust/allocate), each step validated against the live sheet, the WHOLE resolved plan echoed for a yes/no, then executed by driving the existing structured flows with synthetic pre-filled answers - so gates, previews and approval routing are the SAME tested code. Plans pause at approvals and resume on commit; human still confirms the AI reason-classification; blockers (missing suffix, not-sold, over-pending) halt before anything runs) (b12 + CANCEL REASON AI-CLASSIFY + RECOVER/FORGO + M+S ROUTING + ALLOCATE. cancel now: free-text reason -> aiClassifyReason company_fault|normal (agent can override) -> brokerage recover|forgo -> disposition refund|transfer -> ROUTING: refund OR forgo => M+S in capital approval group, else senior in sales group. New allocate <unit>: apply pooled credit at rate level or to a tranche ("latest" = last with due balance). Verdict handler split so booking(M+S)/cancel(senior or M+S)/brokadjust(senior)/allocate(senior) each resolve correctly across sales + capital groups) (b11 + BROKERAGE ADJUST: brokerage adjust <unit> redirects a broker pending commission on a live unit into a target pool; MONEY OUT Brokerage row, non-GST by sheet rule; senior direct / junior needs senior yes; Mukund DM. Cancel still owns refund + adjust-out) (b10 + LID RESOLUTION FIX for changes: resolvePhone now uses an injected server resolveLidPhone(jid) [same logic as the auth layer: waClient.getContactById(jid).number] plus an explicit LID_PHONE_MAP fallback, because identifySender returns {role,contactName} with NO phone field - so cancel from a linked-device @lid now resolves to the real phone and seniorityOf works) (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b16 (b15 + TRANSFER TARGET: cancel-transfer now asks "which unit NOW or hold"; the tracker writes the CLEAN target unit id in the MONEY OUT To cell so the target pool picks the credit up (was writing a descriptive label that pooled nowhere). Planner auto-links the target from the following allocate step. Tracker rebuilds the Allocations hub after money-out writes and before pool reads (pools were stale: 115-GF showed inflow 0 / used 1cr). apiCancel idempotent on already-cancelled) (b14 + FIXES from live: (1) plan answers are STEP-KEYED not positional - a parsed disposition can no longer be swallowed by the brokerage question (the 114-GF bug where "transfer" was consumed as "forgo" and wrongly routed to M+S); drain runs after reasonconfirm AND after a human brokerage answer. (2) the sales skip-approval toggle now also silences the M+S capital-group routing on cancel (refund/forgo commit directly with approvedBy=skip-toggle) so testing stays out of the capital group) (b13 + AI NL LAYER: free-form messages in the sales group are parsed by aiParseIntent into an ordered plan (book/cancel/brokerage_adjust/allocate), each step validated against the live sheet, the WHOLE resolved plan echoed for a yes/no, then executed by driving the existing structured flows with synthetic pre-filled answers - so gates, previews and approval routing are the SAME tested code. Plans pause at approvals and resume on commit; human still confirms the AI reason-classification; blockers (missing suffix, not-sold, over-pending) halt before anything runs) (b12 + CANCEL REASON AI-CLASSIFY + RECOVER/FORGO + M+S ROUTING + ALLOCATE. cancel now: free-text reason -> aiClassifyReason company_fault|normal (agent can override) -> brokerage recover|forgo -> disposition refund|transfer -> ROUTING: refund OR forgo => M+S in capital approval group, else senior in sales group. New allocate <unit>: apply pooled credit at rate level or to a tranche ("latest" = last with due balance). Verdict handler split so booking(M+S)/cancel(senior or M+S)/brokadjust(senior)/allocate(senior) each resolve correctly across sales + capital groups) (b11 + BROKERAGE ADJUST: brokerage adjust <unit> redirects a broker pending commission on a live unit into a target pool; MONEY OUT Brokerage row, non-GST by sheet rule; senior direct / junior needs senior yes; Mukund DM. Cancel still owns refund + adjust-out) (b10 + LID RESOLUTION FIX for changes: resolvePhone now uses an injected server resolveLidPhone(jid) [same logic as the auth layer: waClient.getContactById(jid).number] plus an explicit LID_PHONE_MAP fallback, because identifySender returns {role,contactName} with NO phone field - so cancel from a linked-device @lid now resolves to the real phone and seniorityOf works) (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -135,7 +135,7 @@ module.exports = function initSales(deps){
     }).then(function(r){ return r.json(); });
   }
   function lookupUnit(unit){ return trackerPost({action:'lookup', unit:unit}); }
-  function commitCancel(f){ return trackerPost({action:'cancel', unit:f.unit, disposition:f.disposition, brokerageTreatment:f.brokerageTreatment||'none', agent:f.agentName||'', approvedBy:f.approvedBy||''}); }
+  function commitCancel(f){ return trackerPost({action:'cancel', unit:f.unit, disposition:f.disposition, transferTarget:f.transferTarget||'', brokerageTreatment:f.brokerageTreatment||'none', agent:f.agentName||'', approvedBy:f.approvedBy||''}); }
   function brokerageInfo(unit){ return trackerPost({action:'brokerageInfo', unit:unit}); }
   function poolInfo(unit){ return trackerPost({action:'poolInfo', unit:unit}); }
   function commitAllocate(f){ return trackerPost({action:'allocate', unit:f.unit, amount:f.amount, method:f.method, tranche:f.tranche||0, side:f.side||'nongst'}); }
@@ -683,6 +683,11 @@ module.exports = function initSales(deps){
     var s=pl.steps[pl.idx];
     var ans=answersFor_(s);
     pl.stepAnswers = ans.answers||{};
+    // link: a transfer-cancel followed by an allocate on unit X transfers straight to X
+    if(s.op==='cancel' && s.disposition==='transfer'){
+      var nxt=pl.steps[pl.idx+1];
+      pl.stepAnswers.transfertarget = (nxt && nxt.op==='allocate' && nxt.unit) ? String(nxt.unit).toUpperCase() : 'hold';
+    }
     savePending(p);
     var client=getClient();
     await client.sendMessage(originChat,'\u25b6\ufe0f Plan step '+(pl.idx+1)+'/'+pl.steps.length+': '+openingFor_(s));
@@ -763,6 +768,51 @@ module.exports = function initSales(deps){
     return true;
   }
 
+  async function cancelRoute_(msg, ses, f){
+    var from=ses.originChat;
+    var send=function(t){ return getClient().sendMessage(from,t); };
+    // ROUTING: refund OR forgo(company) => M+S in capital approval group. else senior in sales group.
+    var needsMS = (f.disposition==='refund') || (f.brokerageTreatment==='forgo');
+    var skipT=false; try{ skipT=!!skipApprovalFn(); }catch(e){}
+    if(needsMS && skipT && f.raiserRole==='senior'){
+      // TESTING MODE: skip-approval toggle is ON - commit directly, do NOT post to the capital group
+      f.needsMS=false; f.approvedBy='(skip-toggle testing)';
+      var resT=await commitCancel(f);
+      delete sessions[jidOf(msg)];
+      await send('\u26a1 (Testing: M+S skipped) ');
+      await cancelDone_(resT,f,'senior direct, skip-toggle');
+      return true;
+    }
+    f.needsMS=needsMS;
+    if(f.raiserRole==='senior' && !needsMS){
+      f.approvedBy=f.raiserName||'senior';
+      var res=await commitCancel(f);
+      delete sessions[jidOf(msg)];
+      await cancelDone_(res,f,'senior direct');
+      return true;
+    }
+    // build the approval post
+    var toCapital = needsMS;
+    var chan = toCapital ? CAPITAL_APPROVAL_JID : from;
+    var gate = toCapital ? 'M + S' : 'a senior';
+    var itemId='cx-'+Date.now().toString(36);
+    var postText=(toCapital?'\ud83d\uddd1 CANCELLATION for M+S approval':'\ud83d\uddd1 CANCELLATION for senior approval')+
+      '\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500'+
+      '\nUnit: '+f.unit+'\nCustomer: '+f.customer+'\nPaid: '+inrFull(f.paid)+
+      '\nReason: '+(f.companyFault?'company non-delivery':'customer cancellation')+
+      '\nMoney: '+f.human+
+      '\nBrokerage: '+(f.brokerageTreatment==='recover'?'recover from broker':'FOREGO (write off)')+
+      '\nRaised by: '+(f.raiserName||'agent')+
+      '\n\nReply to THIS message: yes / no';
+    var sent=await getClient().sendMessage(chan, postText);
+    var p=loadPending();
+    p.items[itemId]={ kind:'cancel', needsMS:needsMS, msgId:sent&&sent.id&&sent.id._serialized, fields:f,
+              verdicts:{}, state: needsMS?'await_ms':'await_senior', originChat:from, approvalChat:chan, at:Date.now() };
+    savePending(p);
+    delete sessions[jidOf(msg)];
+    await send('Sent for '+gate+' approval'+(toCapital?' (capital approval group).':'.'));
+    return true;
+  }
   async function cancelPromoter_(msg){
     // returns 'M' | 'S' | null based on identifySender/phone
     var ph=await resolvePhone(msg);
@@ -773,6 +823,11 @@ module.exports = function initSales(deps){
   }
   async function cancelDone_(res, f, byWhom){
     var client=getClient();
+    if(res&&res.ok&&res.alreadyCancelled){
+      await client.sendMessage(f.originChat,'\u2139\ufe0f '+f.unit+' was already cancelled \u2014 nothing re-done.');
+      await maybePlanAdvance_(f);
+      return;
+    }
     if(res&&res.ok){
       var brokLine = (res.brokerageTreatment && res.brokerageTreatment!=='none' && res.broker)
         ? ('\nBrokerage: '+(res.brokerageTreatment==='recover'?'recoverable ':'written off ')+inrFull(res.brokeragePaid||0)+' ('+res.broker+')')
@@ -956,52 +1011,27 @@ module.exports = function initSales(deps){
         if(f.planOwner) await drainPlanAnswers_(f.planOwner, ses.originChat);
         return true;
       }
+      if(ses.step==='transfertarget'){
+        var tt=String(body||'').trim().toUpperCase();
+        if(/^HOLD$/i.test(tt)){ f.transferTarget=''; }
+        else if(/^\d{2,3}[A-Z]?-(GF|FF|SF|TF|PLOT)$/.test(tt)){ f.transferTarget=tt; }
+        else { await send('Reply a unit id like "114-FF", or "hold".'); return true; }
+        f.human = f.transferTarget ? ('Transfer credit to '+f.transferTarget) : 'Hold in pool for later';
+        // fall through to the routing logic by simulating the disposition tail
+        return await cancelRoute_(msg, ses, f);
+      }
       if(ses.step==='disposition'){
         var d = /^1$|refund/i.test(low) ? 'Refund' : /^2$|transfer|hold/i.test(low) ? 'Transfer-pending' : null;
         if(!d){ await send('Reply 1 (Refund) or 2 (Hold for transfer).'); return true; }
         f.disposition = d==='Refund' ? 'refund' : 'transfer';
-        f.human = d==='Refund' ? 'Refund into pool' : 'Hold for transfer to another unit';
-        // ROUTING: refund OR forgo(company) => M+S in capital approval group. else senior in sales group.
-        var needsMS = (f.disposition==='refund') || (f.brokerageTreatment==='forgo');
-        var skipT=false; try{ skipT=!!skipApprovalFn(); }catch(e){}
-        if(needsMS && skipT && f.raiserRole==='senior'){
-          // TESTING MODE: skip-approval toggle is ON - commit directly, do NOT post to the capital group
-          f.needsMS=false; f.approvedBy='(skip-toggle testing)';
-          var resT=await commitCancel(f);
-          delete sessions[jidOf(msg)];
-          await send('\u26a1 (Testing: M+S skipped) ');
-          await cancelDone_(resT,f,'senior direct, skip-toggle');
+        f.human = d==='Refund' ? 'Refund into pool' : 'Transfer credit out';
+        if(f.disposition==='transfer' && !f.transferTarget){
+          ses.step='transfertarget';
+          await send('Transfer the credit to which unit NOW? (e.g. "114-FF")\nOr reply "hold" to park it in the pool for later.');
+          if(f.planOwner) await drainPlanAnswers_(f.planOwner, ses.originChat);
           return true;
         }
-        f.needsMS=needsMS;
-        if(f.raiserRole==='senior' && !needsMS){
-          f.approvedBy=f.raiserName||'senior';
-          var res=await commitCancel(f);
-          delete sessions[jidOf(msg)];
-          await cancelDone_(res,f,'senior direct');
-          return true;
-        }
-        // build the approval post
-        var toCapital = needsMS;
-        var chan = toCapital ? CAPITAL_APPROVAL_JID : from;
-        var gate = toCapital ? 'M + S' : 'a senior';
-        var itemId='cx-'+Date.now().toString(36);
-        var postText=(toCapital?'\ud83d\uddd1 CANCELLATION for M+S approval':'\ud83d\uddd1 CANCELLATION for senior approval')+
-          '\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500'+
-          '\nUnit: '+f.unit+'\nCustomer: '+f.customer+'\nPaid: '+inrFull(f.paid)+
-          '\nReason: '+(f.companyFault?'company non-delivery':'customer cancellation')+
-          '\nMoney: '+f.human+
-          '\nBrokerage: '+(f.brokerageTreatment==='recover'?'recover from broker':'FOREGO (write off)')+
-          '\nRaised by: '+(f.raiserName||'agent')+
-          '\n\nReply to THIS message: yes / no';
-        var sent=await getClient().sendMessage(chan, postText);
-        var p=loadPending();
-        p.items[itemId]={ kind:'cancel', needsMS:needsMS, msgId:sent&&sent.id&&sent.id._serialized, fields:f,
-                          verdicts:{}, state: needsMS?'await_ms':'await_senior', originChat:from, approvalChat:chan, at:Date.now() };
-        savePending(p);
-        delete sessions[jidOf(msg)];
-        await send('Sent for '+gate+' approval'+(toCapital?' (capital approval group).':'.'));
-        return true;
+        return await cancelRoute_(msg, ses, f);
       }
     }
 
