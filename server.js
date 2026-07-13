@@ -5391,6 +5391,8 @@ var TABS = [
     {ep:'/api/sales-approval-skip-on', ico:'\\u26A1', label:'Sales: SKIP M+S approval (testing)', act:true, confirm:'Skip M+S approval for new bookings? The agent will still re-confirm before it commits. Use for testing only.'},
     {ep:'/api/sales-approval-skip-off', ico:'\\uD83D\\uDD12', label:'Sales: REQUIRE M+S approval', act:true, confirm:'Restore M+S approval requirement for bookings?'},
     {ep:'/api/sales-features-status', ico:'\\u2699', label:'Sales features \u2014 status'},
+    {ep:'/api/approvals-report?days=14', ico:'\\uD83D\\uDCCB', label:'Approvals report \u2014 last 14 days'},
+    {ep:'/ask', ico:'\\uD83D\\uDCAC', label:'Ask the MIS \u2014 chat with your data'},
     {ep:'/api/sales-feature?name=cancel&state=on', ico:'\\u2705', label:'Enable: Cancellation / refund', act:true, confirm:'Enable the cancellation + refund request flow in the sales group? It routes refunds/forego to M+S. Leave OFF if you only want booking live.'},
     {ep:'/api/sales-feature?name=cancel&state=off', ico:'\\u26D4', label:'Disable: Cancellation / refund', act:true, confirm:'Turn the cancellation flow OFF for the team?'},
     {ep:'/api/sales-feature?name=brokerage_adjust&state=on', ico:'\\u2705', label:'Enable: Brokerage adjust', act:true, confirm:'Enable brokerage set-off (moves broker commission to a target pool)? Money-moving \u2014 keep OFF unless you are supervising.'},
@@ -5951,6 +5953,167 @@ app.get('/api/silent-off',function(req,res){try{saveSilentMode(false);res.json({
 app.get('/api/silent-status',function(req,res){try{res.json({silentMode:loadSilentMode(),observer:SILENT_OBSERVER});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-on',function(req,res){try{saveOutflowPostEnabled(true);res.json({success:true,outflowPosting:true,message:'Outflow posting ON. Newly approved items will auto-post to the payments group for the accountants to mark paid. (Still capture-only — no Sheet write.)'});}catch(e){res.json({error:e.message});}});
 app.get('/api/outflow-post-off',function(req,res){try{saveOutflowPostEnabled(false);res.json({success:true,outflowPosting:false,message:'Outflow posting OFF. Approved items will no longer be posted to the payments group.'});}catch(e){res.json({error:e.message});}});
+// v2.11.0-s6.12: Approvals report — pull the last N days of payment approvals from the
+// event store and categorise them. Join: approved -> verdicts (who) -> paid (head/tag/mode).
+function buildApprovalsReport(days){
+  days = Math.max(1, Math.min(90, parseInt(days,10)||14));
+  var store = loadEventStore();
+  var cutoff = Date.now() - days*86400000;
+  var evs = (store.events||[]);
+  // index verdicts + paid by itemId
+  var verdictsBy = {}, paidBy = {}, closedBy = {};
+  evs.forEach(function(e){
+    if(e.type==='verdict'){ (verdictsBy[e.itemId]=verdictsBy[e.itemId]||[]).push(e); }
+    if(e.type==='paid'){ (paidBy[e.itemId]=paidBy[e.itemId]||[]).push(e); }
+    if(e.type==='closed'){ closedBy[e.itemId]=e; }
+  });
+  var rows = [];
+  evs.forEach(function(e){
+    if(e.type!=='approved') return;
+    var at = new Date(e.at||0).getTime();
+    if(!(at>=cutoff)) return;
+    var pays = paidBy[e.itemId]||[];
+    var paidTotal = pays.reduce(function(s,p){return s+(p.paidAmount||0);},0);
+    var lastPay = pays.length?pays[pays.length-1]:null;
+    // category: prefer the ledger head from the paid event; else keyword-classify the label
+    var head = (lastPay && lastPay.head) || classifyHead_(e.label||'');
+    var vs = verdictsBy[e.itemId]||[];
+    var approvers = {};
+    vs.forEach(function(v){ if(v.verdict==='yes'||v.verdict==='amend') approvers[v.party]=true; });
+    var status = closedBy[e.itemId] ? 'closed'
+               : paidTotal<=0 ? 'approved-unpaid'
+               : paidTotal < (e.amount||0)-1 ? 'part-paid'
+               : 'settled';
+    rows.push({
+      code:e.code||'', at:e.at, label:(e.label||'').substring(0,80), amount:e.amount||0,
+      head:head, status:status, paid:paidTotal,
+      approvedBy:Object.keys(approvers).sort().join('+')||'-',
+      mode:(lastPay&&lastPay.mode)||'', entity:(lastPay&&lastPay.entity)||'', person:(lastPay&&lastPay.person)||''
+    });
+  });
+  rows.sort(function(a,b){ return new Date(b.at)-new Date(a.at); });
+  // categorise
+  var byHead = {}, byStatus = {}, total=0, paidTotal=0;
+  rows.forEach(function(r){
+    total += r.amount; paidTotal += r.paid;
+    var h = byHead[r.head] = byHead[r.head]||{count:0, amount:0, paid:0};
+    h.count++; h.amount+=r.amount; h.paid+=r.paid;
+    var s = byStatus[r.status] = byStatus[r.status]||{count:0, amount:0};
+    s.count++; s.amount+=r.amount;
+  });
+  return { days:days, from:new Date(cutoff).toISOString().slice(0,10), to:new Date().toISOString().slice(0,10),
+           approvals:rows.length, totalApproved:total, totalPaid:paidTotal,
+           byHead:byHead, byStatus:byStatus, rows:rows };
+}
+// keyword fallback when a payment has no ledger head yet (approved but unpaid)
+function classifyHead_(label){
+  var l=String(label).toLowerCase();
+  if(/salary|wages|staff|payroll/.test(l)) return 'Salaries';
+  if(/cement|steel|sariya|brick|material|aggregate|sand/.test(l)) return 'Material';
+  if(/contractor|labour|labor|mason|shuttering|rcc/.test(l)) return 'Contractor';
+  if(/broker|commission|brokerage/.test(l)) return 'Brokerage';
+  if(/legal|court|advocate|stamp|registry/.test(l)) return 'Legal';
+  if(/electric|water|diesel|fuel|genset/.test(l)) return 'Utilities';
+  if(/office|rent|stationery|tea|misc/.test(l)) return 'Office';
+  if(/refund/.test(l)) return 'Refund';
+  return 'Other';
+}
+app.get('/api/approvals-report',function(req,res){
+  try{ res.json(buildApprovalsReport(req.query.days||14)); }
+  catch(e){ res.json({error:e.message}); }
+});
+
+// v2.11.0-s6.13: ASK — natural-language questions over the bot's own data.
+// Gathers a compact data context (approvals, payments, pending, features) and lets
+// Claude answer ONLY from that context. UI at /ask, API at POST /api/ask-query.
+function buildAskContext(){
+  var ctx={ generatedAt:new Date().toISOString() };
+  try{
+    var rep=buildApprovalsReport(30);
+    ctx.approvalsLast30Days={ from:rep.from, to:rep.to, count:rep.approvals,
+      totalApproved:rep.totalApproved, totalPaid:rep.totalPaid,
+      byHead:rep.byHead, byStatus:rep.byStatus,
+      rows:rep.rows.slice(0,120) };
+  }catch(e){ ctx.approvalsError=e.message; }
+  try{
+    var store=loadEventStore();
+    var cutoff=Date.now()-30*86400000;
+    ctx.recentPayments=(store.events||[]).filter(function(e){
+      return e.type==='paid' && new Date(e.at||0).getTime()>=cutoff;
+    }).slice(-120).map(function(e){
+      return { at:e.at, label:(e.label||'').substring(0,60), amount:e.paidAmount,
+               head:e.head, mode:e.mode, entity:e.entity, person:e.person };
+    });
+    ctx.recentContributions=(store.events||[]).filter(function(e){
+      return e.type==='contribution' && new Date(e.at||0).getTime()>=cutoff;
+    }).slice(-40);
+  }catch(e){ ctx.eventsError=e.message; }
+  try{ ctx.salesFeatures=loadSalesFeatures(); }catch(e){}
+  try{
+    var p=JSON.parse(fs.readFileSync('./wa_auth/sales_pending.json','utf8'));
+    var open=[]; Object.keys(p.items||{}).forEach(function(k){
+      var it=p.items[k];
+      if(it.state&&it.state.indexOf('await')===0) open.push({ kind:it.kind||'booking', unit:it.fields&&it.fields.unit, state:it.state, since:new Date(it.at||0).toISOString() });
+    });
+    ctx.openApprovals=open;
+  }catch(e){}
+  return ctx;
+}
+app.post('/api/ask-query', express.json({limit:'200kb'}), async function(req,res){
+  try{
+    if(!CONFIG.CLAUDE_API_KEY) return res.json({answer:'AI key not configured on this server.'});
+    var q=String((req.body&&req.body.question)||'').substring(0,600);
+    if(!q) return res.json({answer:'Ask a question.'});
+    var hist=Array.isArray(req.body.history)?req.body.history.slice(-6):[];
+    var ctx=buildAskContext();
+    var sys='You are the MIS data assistant for a real-estate group (Fidato / Orion). Answer the question using ONLY the JSON data provided. Amounts are INR; format large amounts in lakh/crore notation (e.g. \u20b912.5 L, \u20b93.2 Cr). Be concise and factual. If the data cannot answer the question, say exactly what is missing - never invent numbers. Today is '+new Date().toISOString().slice(0,10)+'.\n\nDATA:\n'+JSON.stringify(ctx);
+    var msgs=[];
+    hist.forEach(function(h){ if(h&&h.role&&h.text) msgs.push({role:h.role==='user'?'user':'assistant',content:[{type:'text',text:String(h.text).substring(0,800)}]}); });
+    msgs.push({role:'user',content:[{type:'text',text:q}]});
+    var resp=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
+      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:900,system:sys,messages:msgs})
+    });
+    if(!resp.ok){ return res.json({answer:'AI error '+resp.status}); }
+    var data=await resp.json();
+    var text=''; (data.content||[]).forEach(function(c){ if(c.type==='text') text+=c.text; });
+    res.json({answer:text||'(no answer)'});
+  }catch(e){ res.json({answer:'Error: '+e.message}); }
+});
+var ASK_HTML='<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ask the MIS</title><style>'+
+'body{margin:0;background:#0E1220;color:#E9EAF0;font:14px/1.55 system-ui;display:flex;flex-direction:column;height:100vh}'+
+'header{padding:14px 18px;border-bottom:1px solid #262E47;font-weight:600;letter-spacing:1px}header span{color:#E8A33D}'+
+'#log{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px}'+
+'.m{max-width:78%;padding:10px 14px;border-radius:12px;white-space:pre-wrap}'+
+'.u{align-self:flex-end;background:#1D2B4A}'+
+'.a{align-self:flex-start;background:#161B2C;border:1px solid #262E47}'+
+'.a.think{color:#5A6178;font-style:italic}'+
+'form{display:flex;gap:8px;padding:12px 16px;border-top:1px solid #262E47}'+
+'input{flex:1;background:#161B2C;border:1px solid #262E47;border-radius:10px;color:#E9EAF0;padding:11px 14px;font-size:14px}'+
+'input:focus{outline:1px solid #5B8DDB}'+
+'button{background:#E8A33D;color:#0E1220;border:none;border-radius:10px;padding:0 18px;font-weight:600;cursor:pointer}'+
+'.hint{color:#5A6178;font-size:12px;padding:0 18px 10px}'+
+'</style></head><body>'+
+'<header>Ask the <span>MIS</span></header>'+
+'<div id="log"><div class="m a">Ask me about your approvals, payments, pending items \u2014 e.g. \u201chow much did we approve for material this month\u201d or \u201cwhat is still unpaid\u201d.</div></div>'+
+'<div class="hint">Answers come only from the bot\u2019s own data (last 30 days of events).</div>'+
+'<form id="f"><input id="q" placeholder="Ask about the data\u2026" autocomplete="off"><button>Ask</button></form>'+
+'<script>'+
+'var hist=[];var log=document.getElementById("log");'+
+'document.getElementById("f").onsubmit=async function(ev){ev.preventDefault();'+
+'var q=document.getElementById("q").value.trim();if(!q)return;'+
+'document.getElementById("q").value="";'+
+'add("u",q);var t=add("a think","thinking\u2026");'+
+'try{var r=await fetch("/api/ask-query",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:q,history:hist})});'+
+'var j=await r.json();t.textContent=j.answer;t.className="m a";'+
+'hist.push({role:"user",text:q});hist.push({role:"assistant",text:j.answer});hist=hist.slice(-6);'+
+'}catch(e){t.textContent="Error: "+e.message;t.className="m a";}'+
+'log.scrollTop=log.scrollHeight;};'+
+'function add(cls,txt){var d=document.createElement("div");d.className="m "+cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}'+
+'</script></body></html>';
+app.get('/ask', function(req,res){ res.type('html').send(ASK_HTML); });
+
 app.get('/api/sales-features-status',function(req,res){try{res.json({features:loadSalesFeatures(),note:'Only enabled features respond in the sales group. Booking is the shipped default; the rest stay off until you switch them on here.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-feature',function(req,res){try{var name=String(req.query.name||'');var st=String(req.query.state||'').toLowerCase();if(!SALES_FEATURES_DEFAULT.hasOwnProperty(name))return res.json({error:'unknown feature '+name});if(st!=='on'&&st!=='off')return res.json({error:'state must be on|off'});var f=setSalesFeature(name,st==='on');res.json({success:true,feature:name,enabled:f[name],features:f});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-approval-status',function(req,res){try{res.json({skipApproval:loadSalesSkipApproval(),note:(loadSalesSkipApproval()?'SKIP is ON \u2014 bookings bypass M+S and go straight to the agent re-confirm, then commit.':'Approvals REQUIRED \u2014 bookings need M+S both-yes, then agent re-confirm.')});}catch(e){res.json({error:e.message});}});
