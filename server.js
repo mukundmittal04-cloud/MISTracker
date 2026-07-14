@@ -883,7 +883,7 @@ var LEDGER_HEADS = ['Capital Site','Vrindavan','Office GK-1','Legal','Directors'
 var LEDGER_INFLOW_TAGS = ['FBD-Plot-Receivable','FBD-Plot-Construction','FBD-Floor-Receivable','FBD-Floor-Possession','FBD-Floor-Buyback','VRN-Floor','VRN-Plot','\u2014'];
 // v2.10.0-s5.9: paying-account list — exact order/contents of the Ledger Bank A/C dropdown.
 // Used both for the numbered menu (step 6) and to validate a typed account.
-var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','—','MM PDC','SM PDC','PDC'];
+var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','Fervor Marketing HDFC','Tremendous HDFC','RMS HDFC','—','MM PDC','SM PDC','PDC'];
 // v2.11.0-s6.10: AI classify a cancellation reason -> company_fault | normal.
 // Used by the sales module's cancel flow. Uses the same Claude API pattern as vision.
 async function aiClassifyReason(reasonText){
@@ -974,7 +974,7 @@ var sales = initSales({
   TRACKER_API_SECRET: process.env.TRACKER_API_SECRET
 });
 // v2.10.0-s5.11: entity/company list — exact order/contents of the Ledger Entity dropdown (verified).
-var LEDGER_ENTITIES = ['Fidatocity - 70%','Fidatocity - 30%','Fidato City Homes','Fidatocity Homes','Trinity Landspace','Pitam','Hansaflon Buildcon','Hansaflon Buildwell','Dholpur Developers','Trinity Tulsivan','Beatific Hospitality','Chahat Garments','Fidato Buildcon','Fidato Maintenance','Maximal Infrastructure','Others (combined)','MM PDC','SM PDC','PDC','MM','SM'];
+var LEDGER_ENTITIES = ['Fidatocity - 70%','Fidatocity - 30%','Fidato City Homes','Fidatocity Homes','Trinity Landspace','Pitam','Hansaflon Buildcon','Hansaflon Buildwell','Dholpur Developers','Trinity Tulsivan','Beatific Hospitality','Chahat Garments','Fidato Buildcon','Fidato Maintenance','Maximal Infrastructure','Others (combined)','MM PDC','SM PDC','PDC','MM','SM','Fervor Marketing','Tremendous','Fervor Marketing HDFC','Tremendous HDFC','RMS'];
 
 // Rule-based Tag pre-guess from a description. Returns {tag, person} or null.
 function guessTagAndPerson(desc, entity){
