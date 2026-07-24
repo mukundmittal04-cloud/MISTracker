@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO SALES MODULE v1.0.0-b20 (b19 + BOOKING MATH FIX: the preview/approval showed Balance = TSV - advance, ignoring every discount, and never showed the discounted price. Now econCalc() reproduces the cover waterfall exactly - TSV less on-form/DP/gift/NPV = PAYABLE BY CUSTOMER, then less broker net comm (gross channel - on-form disc) / marketing / other = NET REALIZATION - and the card shows TSV, each deduction, PAYABLE, advance, BALANCE and the company side. Also: "book unit 218-FF" no longer captures the filler word "unit" as the customer name) (b18 + FEATURE FLAGS: deps.salesFeatures() from the dashboard gates each command. SHIP DEFAULT = booking ONLY; cancel / brokerage_adjust / allocate / ai_planner all OFF until switched on from the control panel. Disabled commands return false (silent, fall through) so the team only sees booking. Booking is never gated - it is the shipped feature) (b17 + ESCAPE HATCH: a stuck/half-open session from an earlier stalled run was swallowing every new message (line-414 session intercept) with no way out - now "reset"/"abort"/"clear"/"stop" clears any session+plan for the sender, AND a fresh high-level command (book/cancel/brokerage/allocate or an NL cancel-transfer) breaks OUT of a stale session instead of being eaten, EXCEPT at decisive money steps (confirm/disposition/transfertarget/brokerage) where we do not silently abandon an approval-ready flow) (b16 + STATUS FIX: the live inventory status is "Allotted" (per the sheet dropdown Unbooked/Allotted/Cancelled/Adjusted), NOT "Sold" - every cancel/brokerage/allocate/planner gate was checking !==Sold and so silently rejected or STALLED on real booked units (the 115-GF plan hang). Now isLiveBooked() accepts Allotted/Sold/Booked and isCancelledStatus() accepts Cancelled/Adjusted; a plan step that cannot open (already cancelled / not live) now advances the plan instead of hanging) (b15 + TRANSFER TARGET: cancel-transfer now asks "which unit NOW or hold"; the tracker writes the CLEAN target unit id in the MONEY OUT To cell so the target pool picks the credit up (was writing a descriptive label that pooled nowhere). Planner auto-links the target from the following allocate step. Tracker rebuilds the Allocations hub after money-out writes and before pool reads (pools were stale: 115-GF showed inflow 0 / used 1cr). apiCancel idempotent on already-cancelled) (b14 + FIXES from live: (1) plan answers are STEP-KEYED not positional - a parsed disposition can no longer be swallowed by the brokerage question (the 114-GF bug where "transfer" was consumed as "forgo" and wrongly routed to M+S); drain runs after reasonconfirm AND after a human brokerage answer. (2) the sales skip-approval toggle now also silences the M+S capital-group routing on cancel (refund/forgo commit directly with approvedBy=skip-toggle) so testing stays out of the capital group) (b13 + AI NL LAYER: free-form messages in the sales group are parsed by aiParseIntent into an ordered plan (book/cancel/brokerage_adjust/allocate), each step validated against the live sheet, the WHOLE resolved plan echoed for a yes/no, then executed by driving the existing structured flows with synthetic pre-filled answers - so gates, previews and approval routing are the SAME tested code. Plans pause at approvals and resume on commit; human still confirms the AI reason-classification; blockers (missing suffix, not-sold, over-pending) halt before anything runs) (b12 + CANCEL REASON AI-CLASSIFY + RECOVER/FORGO + M+S ROUTING + ALLOCATE. cancel now: free-text reason -> aiClassifyReason company_fault|normal (agent can override) -> brokerage recover|forgo -> disposition refund|transfer -> ROUTING: refund OR forgo => M+S in capital approval group, else senior in sales group. New allocate <unit>: apply pooled credit at rate level or to a tranche ("latest" = last with due balance). Verdict handler split so booking(M+S)/cancel(senior or M+S)/brokadjust(senior)/allocate(senior) each resolve correctly across sales + capital groups) (b11 + BROKERAGE ADJUST: brokerage adjust <unit> redirects a broker pending commission on a live unit into a target pool; MONEY OUT Brokerage row, non-GST by sheet rule; senior direct / junior needs senior yes; Mukund DM. Cancel still owns refund + adjust-out) (b10 + LID RESOLUTION FIX for changes: resolvePhone now uses an injected server resolveLidPhone(jid) [same logic as the auth layer: waClient.getContactById(jid).number] plus an explicit LID_PHONE_MAP fallback, because identifySender returns {role,contactName} with NO phone field - so cancel from a linked-device @lid now resolves to the real phone and seniorityOf works) (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
+// FIDATO SALES MODULE v1.0.0-b21 (b20 + CLEARER BOOKING CARD: the money section is now a WhatsApp monospace block so columns align - total sale value, each deduction, PAYABLE BY CUSTOMER, advance (with its cash/cheque split), BALANCE DUE, and the company side. + SPLIT ADVANCES: parseAdvanceSplit accepts "80L cash 10L cheque" in either word order at the amount or mode step; the tracker writes cheque/bank into the cover cheque column (GST-bearing) and cash into the cash column (non-GST) instead of dumping the whole advance in one. Unit-less input like "80 cash 10 chq" is rejected rather than read as rupees) (b19 + BOOKING MATH FIX: the preview/approval showed Balance = TSV - advance, ignoring every discount, and never showed the discounted price. Now econCalc() reproduces the cover waterfall exactly - TSV less on-form/DP/gift/NPV = PAYABLE BY CUSTOMER, then less broker net comm (gross channel - on-form disc) / marketing / other = NET REALIZATION - and the card shows TSV, each deduction, PAYABLE, advance, BALANCE and the company side. Also: "book unit 218-FF" no longer captures the filler word "unit" as the customer name) (b18 + FEATURE FLAGS: deps.salesFeatures() from the dashboard gates each command. SHIP DEFAULT = booking ONLY; cancel / brokerage_adjust / allocate / ai_planner all OFF until switched on from the control panel. Disabled commands return false (silent, fall through) so the team only sees booking. Booking is never gated - it is the shipped feature) (b17 + ESCAPE HATCH: a stuck/half-open session from an earlier stalled run was swallowing every new message (line-414 session intercept) with no way out - now "reset"/"abort"/"clear"/"stop" clears any session+plan for the sender, AND a fresh high-level command (book/cancel/brokerage/allocate or an NL cancel-transfer) breaks OUT of a stale session instead of being eaten, EXCEPT at decisive money steps (confirm/disposition/transfertarget/brokerage) where we do not silently abandon an approval-ready flow) (b16 + STATUS FIX: the live inventory status is "Allotted" (per the sheet dropdown Unbooked/Allotted/Cancelled/Adjusted), NOT "Sold" - every cancel/brokerage/allocate/planner gate was checking !==Sold and so silently rejected or STALLED on real booked units (the 115-GF plan hang). Now isLiveBooked() accepts Allotted/Sold/Booked and isCancelledStatus() accepts Cancelled/Adjusted; a plan step that cannot open (already cancelled / not live) now advances the plan instead of hanging) (b15 + TRANSFER TARGET: cancel-transfer now asks "which unit NOW or hold"; the tracker writes the CLEAN target unit id in the MONEY OUT To cell so the target pool picks the credit up (was writing a descriptive label that pooled nowhere). Planner auto-links the target from the following allocate step. Tracker rebuilds the Allocations hub after money-out writes and before pool reads (pools were stale: 115-GF showed inflow 0 / used 1cr). apiCancel idempotent on already-cancelled) (b14 + FIXES from live: (1) plan answers are STEP-KEYED not positional - a parsed disposition can no longer be swallowed by the brokerage question (the 114-GF bug where "transfer" was consumed as "forgo" and wrongly routed to M+S); drain runs after reasonconfirm AND after a human brokerage answer. (2) the sales skip-approval toggle now also silences the M+S capital-group routing on cancel (refund/forgo commit directly with approvedBy=skip-toggle) so testing stays out of the capital group) (b13 + AI NL LAYER: free-form messages in the sales group are parsed by aiParseIntent into an ordered plan (book/cancel/brokerage_adjust/allocate), each step validated against the live sheet, the WHOLE resolved plan echoed for a yes/no, then executed by driving the existing structured flows with synthetic pre-filled answers - so gates, previews and approval routing are the SAME tested code. Plans pause at approvals and resume on commit; human still confirms the AI reason-classification; blockers (missing suffix, not-sold, over-pending) halt before anything runs) (b12 + CANCEL REASON AI-CLASSIFY + RECOVER/FORGO + M+S ROUTING + ALLOCATE. cancel now: free-text reason -> aiClassifyReason company_fault|normal (agent can override) -> brokerage recover|forgo -> disposition refund|transfer -> ROUTING: refund OR forgo => M+S in capital approval group, else senior in sales group. New allocate <unit>: apply pooled credit at rate level or to a tranche ("latest" = last with due balance). Verdict handler split so booking(M+S)/cancel(senior or M+S)/brokadjust(senior)/allocate(senior) each resolve correctly across sales + capital groups) (b11 + BROKERAGE ADJUST: brokerage adjust <unit> redirects a broker pending commission on a live unit into a target pool; MONEY OUT Brokerage row, non-GST by sheet rule; senior direct / junior needs senior yes; Mukund DM. Cancel still owns refund + adjust-out) (b10 + LID RESOLUTION FIX for changes: resolvePhone now uses an injected server resolveLidPhone(jid) [same logic as the auth layer: waClient.getContactById(jid).number] plus an explicit LID_PHONE_MAP fallback, because identifySender returns {role,contactName} with NO phone field - so cancel from a linked-device @lid now resolves to the real phone and seniorityOf works) (b9 + CANCELLATION: "cancel <unit>" in the sales group -> shows paid-to-date -> disposition refund/hold-for-transfer. Senior (Umesh/accountant) acts directly; junior (Gautam) posts for a senior yes in-group. On commit the tracker archives+hides the cover as "<unit> - Cancelled - N", moves paid-to-date to the Refund Register, flips inventory to Cancelled. Mukund DM notified every time) (b8 + ECONOMICS BLOCK: after brokerage the bot asks yes/skip to add on-form discount (shares broker commission) / DP discount / gift / NPV / marketing / other, each as % or amount; written to the cover economics cells by the tracker, which returns balance-payable + net-realization. Preview + approval post show the adjustment lines) (b7 + SKIP-APPROVAL TOGGLE: deps.skipApproval() live panel switch; when ON, preview "yes" bypasses the M+S approval post and goes straight to agent re-confirm -> commit. Default OFF (M+S required). Edits honour the toggle too) (b6 + MANUAL TSV: if a unit has no price list filled, the bot asks for the sale value directly instead of dead-ending; commit sends tsv so the API writes it. Lets bookings proceed before Price Lists are populated) (b5 + SALES GROUP ROUTING: primary channel is the dedicated sales group JID (deps.SALES_GROUP_JID); any member may raise a booking there - stable @g.us routing, no @lid/@c.us guessing. Agent DMs still accepted as a fallback. Origin chat for group bookings is the sales group, so re-confirm pings land there) (b4 + GATE FIX: WhatsApp delivers DMs from linked-device users as @lid, not @c.us; the book gate now accepts ANY non-group jid as a DM and rejects only OTHER groups. isAgent resolves @lid via identifySender and re-checks the RESOLVED phone against the agent lists, so 86960253214761@lid -> 917838537000 is recognized) (b3 + FAIL-LOUD: missing TRACKER env vars or a thrown tracker call now CLAIM the message with a clear error instead of silently falling through to the expense flow; commit wrapped; outer catch logs stack head; SALES_AGENT_LIDS whitelist for group @lid authors) (b2 + diagnostic logging on the book path: prints trigger/gate/agent/API-URL/lookup so Railway logs show exactly why a booking is or is not claimed) (b1 + fixes: edit-from-preview no longer crashes; brokerage unit-suffix "3.78L" reads as absolute lakh not %; isAgent resolves group @lid authors via identifySender) - UNIT BOOKING over WhatsApp.
 // Separate module; server.js wires it with 3 lines (see WIRING at bottom).
 // Flow: accountant/agent says "book <unit> <customer>" (expense group or DM)
 //   -> bot LOOKUPs the tracker API, shows price menu (current list = standard,
@@ -150,7 +150,8 @@ module.exports = function initSales(deps){
     var payload={
       action:'booking', unit:f.unit, customer:f.customer,
       broker: f.broker||'', brokeragePct: f.bkPct||0,
-      advance: { amount:f.advAmt||0, mode:f.advMode||'Cheque', account:f.advAcct||'' },
+      advance: { amount:f.advAmt||0, mode:f.advMode||'Cheque', account:f.advAcct||'',
+                 cash:f.advCash||0, cheque:f.advCheque||0 },   // split lands in the cover's separate cheque/cash columns
       agent: f.agentName||'', date: new Date().toISOString().slice(0,10)
     };
     if(f.manualTsv || !f.listIndex){ payload.tsv=f.tsv; }        // manual value -> send TSV directly
@@ -201,6 +202,37 @@ module.exports = function initSales(deps){
   //   PAYABLE - broker net comm - mktg - other = NET REALIZATION     (rows 26-29)
   //   broker net commission = gross channel - on-form discount
   // Marketing/Other sit AFTER payable: they reduce the company's take, not the customer's bill.
+  // "80L cash 10L cheque" / "cash 80 lakh, cheque 10 lakh" / "80 cash + 10 chq"
+  // Returns {cash, cheque, total, label} or null when it is a single plain amount.
+  function parseAdvanceSplit(text){
+    var t=String(text||'').toLowerCase().replace(/,/g,' ').replace(/\+/g,' ').replace(/\s+/g,' ');
+    if(!/(cash|cheque|chq|check|bank|transfer|neft|rtgs|imps|upi)/.test(t)) return null;
+    var NUM='([\\d.]+\\s*(?:cr|crore|l|lac|lakh|lk|k)?)';
+    var WORD='(cash|cheques?|chq|checks?|bank\\s*transfer|bank|neft|rtgs|imps|upi)';
+    function collect(re, numFirst){
+      var cash=0, banked=0, hits=0, bankWord='Cheque', m;
+      re.lastIndex=0;
+      while((m=re.exec(t))){
+        var raw = numFirst ? m[1] : m[2];
+        var w   = numFirst ? m[2] : m[1];
+        var v=parseAmount(raw); if(v===null||v<=0) continue;
+        if(/cash/.test(w)) cash+=v;
+        else { banked+=v; if(!/che|chq|check/.test(w)) bankWord='Bank transfer'; }
+        hits++;
+      }
+      return {cash:cash, cheque:banked, hits:hits, bankWord:bankWord};
+    }
+    var a=collect(new RegExp(NUM+'\\s*'+WORD,'g'), true);      // "80L cash"
+    var b=collect(new RegExp(WORD+'\\s*'+NUM,'g'), false);     // "cash 80L"
+    var r=(b.hits>a.hits)?b:a;
+    if(r.hits<2) return null;                                 // a split needs both sides named
+    var total=r.cash+r.cheque;
+    if(total<1000) return null;                               // bare "80 cash 10 chq" is ambiguous - make them add units
+    var lab=[];
+    if(r.cash>0)   lab.push('Cash '+inrFull(r.cash));
+    if(r.cheque>0) lab.push(r.bankWord+' '+inrFull(r.cheque));
+    return {cash:r.cash, cheque:r.cheque, total:total, label:lab.join(' + '), bankWord:r.bankWord};
+  }
   function econCalc(f){
     var e=f.economics||{}, tsv=Number(f.tsv)||0;
     function amt(k){
@@ -216,44 +248,59 @@ module.exports = function initSales(deps){
             payable:payable,gross:gross,netComm:netComm,
             netReal:payable-netComm-mktg-other,advance:adv,balanceDue:payable-adv};
   }
-  function moneyLines(f){
-    var c=econCalc(f), e=f.economics||{}, out=[];
-    out.push('TSV:       '+inrFull(c.tsv));
-    var CUST=[{k:'disc',l:'On-form discount (from broker comm)'},{k:'dp',l:'Down-payment discount'},
+  function padRow(l,a,w){
+    w=w||32; l=String(l); a=String(a);
+    var pad=Math.max(1,w-l.length-a.length);
+    return l+new Array(pad+1).join(' ')+a;
+  }
+  // WhatsApp renders ``` blocks in monospace, so the columns actually line up.
+  function moneyBlock(f){
+    var c=econCalc(f), e=f.economics||{}, L=[];
+    L.push(padRow('Total sale value', inrFull(c.tsv)));
+    var CUST=[{k:'disc',l:'On-form discount'},{k:'dp',l:'Down-payment disc'},
               {k:'gift',l:'Gift'},{k:'npv',l:'NPV adjustment'}];
-    var any=false;
-    CUST.forEach(function(L){
-      var v=c[L.k]; if(!v) return;
-      if(!any){ out.push('Less:'); any=true; }
-      var how=(e[L.k+'Pct']!==undefined)?(' '+e[L.k+'Pct']+'%'):'';
-      out.push('  '+L.l+how+': ('+inrFull(v)+')');
+    CUST.forEach(function(X){
+      var v=c[X.k]; if(!v) return;
+      var how=(e[X.k+'Pct']!==undefined)?('  '+e[X.k+'Pct']+'%'):'';
+      L.push(padRow('  '+X.l+how, '('+inrFull(v)+')'));
     });
-    if(any) out.push('PAYABLE:   '+inrFull(c.payable)+'  \u2190 what the customer owes');
-    out.push('Advance:   '+inrFull(c.advance)+' via '+f.advMode+(f.advAcct?(' \u2192 '+f.advAcct):''));
-    out.push('BALANCE:   '+inrFull(c.balanceDue));
-    var comp=[];
-    if(c.gross)  comp.push('  Broker gross '+inrFull(c.gross)+' \u2212 on-form disc = net comm '+inrFull(c.netComm));
-    if(c.mktg)   comp.push('  Marketing / staff: ('+inrFull(c.mktg)+')');
-    if(c.other)  comp.push('  Other: ('+inrFull(c.other)+')');
-    if(comp.length){
-      out.push('');
-      out.push('Company side:');
-      out=out.concat(comp);
-      out.push('NET REALIZATION: '+inrFull(c.netReal));
+    L.push('\u2500'.repeat(32));
+    L.push(padRow('PAYABLE BY CUSTOMER', inrFull(c.payable)));
+    L.push('');
+    if(c.advance>0){
+      L.push(padRow('Advance received', '('+inrFull(c.advance)+')'));
+      if(f.advCash>0 || f.advCheque>0){
+        if(f.advCash>0)   L.push(padRow('  \u00b7 cash', inrFull(f.advCash)));
+        if(f.advCheque>0) L.push(padRow('  \u00b7 '+(f.advBankWord||'cheque').toLowerCase(), inrFull(f.advCheque)));
+      } else if(f.advMode){
+        L.push(padRow('  \u00b7 '+String(f.advMode).toLowerCase()+(f.advAcct?(' \u2192 '+f.advAcct):''), ''));
+      }
+    } else {
+      L.push(padRow('Advance received', '\u2013'));
     }
-    return out;
+    L.push('\u2500'.repeat(32));
+    L.push(padRow('BALANCE DUE', inrFull(c.balanceDue)));
+    var comp=[];
+    if(c.gross)  comp.push(padRow('  broker net comm', '('+inrFull(c.netComm)+')'));
+    if(c.mktg)   comp.push(padRow('  marketing / staff', '('+inrFull(c.mktg)+')'));
+    if(c.other)  comp.push(padRow('  other', '('+inrFull(c.other)+')'));
+    if(comp.length){
+      L.push('');
+      L.push('Company side');
+      L=L.concat(comp);
+      L.push(padRow('NET REALIZATION', inrFull(c.netReal)));
+    }
+    return '```\n'+L.join('\n')+'\n```';
   }
   function previewText(f){
     var lines=[
-      'BOOKING PREVIEW \u2014 confirm before it goes for approval',
-      '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500',
-      'Unit:      '+f.unit+(f.configKey?(' ('+f.configKey+')'):''),
-      'Customer:  '+f.customer,
+      '\ud83c\udfe0 *BOOKING PREVIEW* \u2014 '+f.unit+(f.configKey?(' \u00b7 '+f.configKey):''),
+      'Customer: '+f.customer,
+      'Broker:   '+(f.broker||'\u2014')+(f.bkAmt?('  \u00b7  brokerage '+inrFull(f.bkAmt)+' ('+pct(f.bkPct)+')'):''),
       deltaLine(f),
-      'Broker:    '+(f.broker||'\u2014'),
-      'Brokerage: '+inrFull(f.bkAmt)+' ('+pct(f.bkPct)+' of TSV)',
-      ''
-    ].concat(moneyLines(f));
+      '',
+      moneyBlock(f)
+    ];
     lines.push('');
     lines.push('Reply "yes" to send for M+S approval, "edit" to change, "cancel" to drop.');
     return lines.join('\n');
@@ -262,13 +309,13 @@ module.exports = function initSales(deps){
     return [
       '\ud83c\udfe0 BOOKING for approval',
       '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500',
-      'Unit:      '+f.unit+(f.configKey?(' ('+f.configKey+')'):''),
-      'Customer:  '+f.customer,
+      'Unit:     '+f.unit+(f.configKey?(' \u00b7 '+f.configKey):''),
+      'Customer: '+f.customer,
+      'Broker:   '+(f.broker||'\u2014')+(f.bkAmt?('  \u00b7  brokerage '+inrFull(f.bkAmt)+' ('+pct(f.bkPct)+')'):''),
       deltaLine(f),
-      'Broker:    '+(f.broker||'\u2014'),
-      'Brokerage: '+inrFull(f.bkAmt)+' ('+pct(f.bkPct)+' of TSV)',
-      ''
-    ].concat(moneyLines(f)).concat([
+      '',
+      moneyBlock(f)
+    ].concat([
       'Raised by: '+(f.agentName||'agent'),
       '',
       'Reply to THIS message: yes / no'
@@ -1216,18 +1263,35 @@ module.exports = function initSales(deps){
         await send('Adjustments captured. Advance received? (amount \u2014 or 0)'); return true;
       }
       case 'advamt': {
+        var sp=parseAdvanceSplit(body);                       // "80L cash 10L cheque" in one line
+        if(sp){
+          f.advAmt=sp.total; f.advCash=sp.cash; f.advCheque=sp.cheque;
+          f.advBankWord=sp.bankWord; f.advMode=sp.label;
+          if(sp.cheque>0){ ses.step='advacct'; await send('Split noted: '+sp.label+'.\n'+acctMenu()); return true; }
+          f.advAcct=''; ses.step='preview'; await send(previewText(f)); return true;
+        }
         var a=parseAmount(body);
-        if(a===null){ await send('Enter the advance amount (e.g. "5L", "500000", or 0).'); return true; }
-        f.advAmt=a;
+        if(a===null){ await send('Enter the advance amount (e.g. 5L, 500000, or 0).\nA split is fine too \u2014 e.g. "80L cash 10L cheque".'); return true; }
+        f.advAmt=a; f.advCash=0; f.advCheque=0;
         if(a===0){ f.advMode=''; f.advAcct=''; ses.step='preview'; await send(previewText(f)); return true; }
         ses.step='advmode';
-        await send('Advance received via? 1) Cheque  2) Cash  3) Bank transfer  (number or word)'); return true;
+        await send('Advance received via? 1) Cheque  2) Cash  3) Bank transfer\nOr type the split, e.g. "80L cash 10L cheque".'); return true;
       }
       case 'advmode': {
+        var sp2=parseAdvanceSplit(body);                      // they may give the split here instead
+        if(sp2){
+          f.advAmt=sp2.total; f.advCash=sp2.cash; f.advCheque=sp2.cheque;
+          f.advBankWord=sp2.bankWord; f.advMode=sp2.label;
+          if(sp2.cheque>0){ ses.step='advacct'; await send('Split noted: '+sp2.label+'.\n'+acctMenu()); return true; }
+          f.advAcct=''; ses.step='preview'; await send(previewText(f)); return true;
+        }
         var mmap={'1':'Cheque','2':'Cash','3':'Bank transfer','cheque':'Cheque','cash':'Cash','transfer':'Bank transfer','bank':'Bank transfer','neft':'Bank transfer','rtgs':'Bank transfer','upi':'Bank transfer'};
         var mode=mmap[low]||null;
-        if(!mode){ await send('Reply 1 (Cheque), 2 (Cash) or 3 (Bank transfer).'); return true; }
+        if(!mode){ await send('Reply 1 (Cheque), 2 (Cash) or 3 (Bank transfer) \u2014 or a split like "80L cash 10L cheque".'); return true; }
         f.advMode=mode;
+        f.advCash=(mode==='Cash')?f.advAmt:0;
+        f.advCheque=(mode==='Cash')?0:f.advAmt;
+        f.advBankWord=(mode==='Bank transfer')?'Bank transfer':'Cheque';
         if(mode==='Cash'){ f.advAcct=''; ses.step='preview'; await send(previewText(f)); return true; }
         ses.step='advacct';
         await send(acctMenu()); return true;
@@ -1319,7 +1383,7 @@ module.exports = function initSales(deps){
     return {done:false,msg:'?'};
   }
 
-  return { handleSalesMessage: handleSalesMessage, _test:{parseOpening:parseOpening,parseBrokerage:parseBrokerage,parseAmount:parseAmount,previewText:previewText,approvalText:approvalText,inr:inr,econCalc:econCalc} };
+  return { handleSalesMessage: handleSalesMessage, _test:{parseOpening:parseOpening,parseBrokerage:parseBrokerage,parseAmount:parseAmount,previewText:previewText,approvalText:approvalText,inr:inr,econCalc:econCalc,parseAdvanceSplit:parseAdvanceSplit} };
 };
 
 // ============================================================
