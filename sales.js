@@ -163,19 +163,29 @@ module.exports = function initSales(deps){
 
   // ---------- message builders ----------
   function priceMenu(lk){
-    var lines=['Unit '+lk.unit+' ('+lk.configKey+')'];
+    // Clear, aligned menu. Current list highlighted; older lists shown with how far below.
     var cur=lk.prices.filter(function(p){return p.isCurrent;})[0];
-    if(cur) lines.push('Standard ('+cur.name+', current): '+inrFull(cur.price));
-    var alts=lk.prices.filter(function(p){return !p.isCurrent;});
+    var alts=lk.prices.filter(function(p){return !p.isCurrent;})
+                      .sort(function(a,b){return b.list-a.list;});   // newest older-list first
+    var L=[];
+    L.push('\ud83d\udccb *'+lk.unit+'*'+(lk.configKey?('  \u00b7  '+lk.configKey):''));
+    L.push('');
+    L.push('```');
+    if(cur){
+      L.push('CURRENT ('+cur.name+' list)');
+      L.push('  '+inrFull(cur.price));
+    }
     if(alts.length){
-      lines.push('Other lists:');
+      L.push('');
+      L.push('Earlier lists (below current):');
       alts.forEach(function(p){
-        lines.push('  '+p.list+') '+p.name+': '+inrFull(p.price)+'  ('+(p.delta>=0?'+':'')+inr(p.delta)+' / '+(p.deltaPct>=0?'+':'')+p.deltaPct+'% vs standard)');
+        L.push('  '+p.list+') '+p.name+'   '+inrFull(p.price));
       });
     }
-    lines.push('');
-    lines.push('Reply "ok" for standard, or the list number.');
-    return lines.join('\n');
+    L.push('```');
+    L.push('');
+    L.push('Reply *ok* for the current price, or a *list number* for an earlier one.');
+    return L.join('\n');
   }
   function acctMenu(){
     var out=['Advance received in which account?'];
@@ -1405,7 +1415,7 @@ module.exports = function initSales(deps){
     return {done:false,msg:'?'};
   }
 
-  return { handleSalesMessage: handleSalesMessage, _test:{parseOpening:parseOpening,parseBrokerage:parseBrokerage,parseAmount:parseAmount,previewText:previewText,approvalText:approvalText,inr:inr,econCalc:econCalc,parseAdvanceSplit:parseAdvanceSplit} };
+  return { handleSalesMessage: handleSalesMessage, _test:{parseOpening:parseOpening,parseBrokerage:parseBrokerage,parseAmount:parseAmount,previewText:previewText,approvalText:approvalText,inr:inr,econCalc:econCalc,parseAdvanceSplit:parseAdvanceSplit,priceMenu:priceMenu} };
 };
 
 // ============================================================
