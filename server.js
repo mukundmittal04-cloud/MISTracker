@@ -6209,6 +6209,8 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 .pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px}
 .pill.warn{background:rgba(196,85,77,.18);color:#e8877f}.pill.ok{background:rgba(75,168,139,.18);color:#6fc4a8}
 .load{color:var(--dim);padding:40px;text-align:center}
+.btn{background:var(--card);border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer}
+.btn:hover{border-color:var(--gold)}
 </style></head><body>
 <h1>Capital Central Market \u2014 <span>Master Dashboard</span></h1>
 <div class="sub" id="ts">loading\u2026</div>
@@ -6216,6 +6218,123 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 <script>
 function cr(n){n=Number(n)||0;if(n>=1e7)return '\u20b9'+(n/1e7).toFixed(2)+' Cr';if(n>=1e5)return '\u20b9'+(n/1e5).toFixed(2)+' L';return '\u20b9'+n.toLocaleString('en-IN');}
 function pct(a,b){b=Number(b)||0;return b>0?Math.round(Number(a)/b*100):0;}
+
+
+async function askAI(){
+  const inp=document.getElementById('aiq'), out=document.getElementById('aians');
+  const q=(inp.value||'').trim(); if(!q) return;
+  out.innerHTML='<span style="color:var(--dim)">thinking\u2026</span>';
+  try{
+    const r=await fetch(window.location.origin+'/api/dashboard-ask',{method:'POST',
+      credentials:'same-origin',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:q})});
+    const j=await r.json();
+    if(!j.ok){ out.innerHTML='<span style="color:#e8877f">'+(j.error||'failed')+'</span>'; return; }
+    window.__spec=j.spec||{};
+    out.innerHTML='<div>'+(window.__spec.answer||'')+'</div>'+
+      (window.__spec.title?('<div style="color:var(--gold);font-size:12px;margin-top:6px">'+window.__spec.title+'</div>'):'');
+    renderUnits();
+  }catch(e){ out.innerHTML='<span style="color:#e8877f">'+e.message+'</span>'; }
+}
+function clearAI(){ window.__spec=null; const a=document.getElementById('aians'); if(a) a.innerHTML='';
+  const i=document.getElementById('aiq'); if(i) i.value=''; renderUnits(); }
+function applySpec(rows){
+  const sp=window.__spec; if(!sp) return rows;
+  (sp.filters||[]).forEach(f=>{
+    if(!f||!f.field) return;
+    rows=rows.filter(x=>{
+      const v=x[f.field], t=f.value;
+      switch(f.op){
+        case 'eq': return String(v).toLowerCase()===String(t).toLowerCase();
+        case 'ne': return String(v).toLowerCase()!==String(t).toLowerCase();
+        case 'gt': return Number(v)>Number(t);
+        case 'gte': return Number(v)>=Number(t);
+        case 'lt': return Number(v)<Number(t);
+        case 'lte': return Number(v)<=Number(t);
+        case 'contains': return String(v||'').toLowerCase().indexOf(String(t).toLowerCase())>=0;
+        case 'isTrue': return v===true;
+        case 'isFalse': return v===false||v===undefined;
+        default: return true;
+      }
+    });
+  });
+  if(sp.sort&&sp.sort.field){
+    const f=sp.sort.field, dir=(sp.sort.dir==='asc')?1:-1;
+    rows.sort((a,b)=>{ const x=a[f],y=b[f];
+      return (typeof x==='number'&&typeof y==='number') ? (x-y)*dir : String(x).localeCompare(String(y))*dir; });
+  }
+  return rows;
+}
+const MONEY_F=['tsv','disc','dp','gift','npv','payable','netReal','paid','balance','bkNetComm','bkPaid','bkPending'];
+const LABEL={unit:'Unit',customer:'Customer',broker:'Broker',booked:'Booked on',soldOn:'Sold on',
+  activeThen:'Active then',mismatch:'Mismatch',isPlot:'Plot',tsv:'TSV',disc:'Discount',dp:'DP disc',
+  gift:'Gift',npv:'NPV',payable:'Payable',netReal:'Net realization',paid:'Paid',balance:'Balance',
+  bkNetComm:'Commission',bkPaid:'Comm paid',bkPending:'Comm pending'};
+function cellVal(x,f){
+  if(MONEY_F.indexOf(f)>=0) return cr(x[f]||0);
+  if(f==='mismatch'||f==='isPlot') return x[f]?'yes':'no';
+  return (x[f]===undefined||x[f]==='')?'\u2014':String(x[f]);
+}
+function setSort(k){ if(window.__sort===k){ window.__dir*=-1; } else { window.__sort=k; window.__dir=(k==='date'?-1:1); } renderUnits(); }
+function setFilt(f){ window.__filt=f; renderUnits(); }
+function renderUnits(){
+  const t=document.getElementById('utab'); if(!t) return;
+  let rows=(window.__U||[]).slice();
+  const sp=window.__spec;
+  if(sp){
+    rows=applySpec(rows);
+    const cols=(sp.columns&&sp.columns.length)?sp.columns:['unit','booked','soldOn','tsv','paid'];
+    let hh='<tr>'+cols.map(c=>'<th'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+(LABEL[c]||c)+'</th>').join('')+'</tr>';
+    rows.forEach(x=>{ hh+='<tr>'+cols.map(c=>'<td'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+cellVal(x,c)+'</td>').join('')+'</tr>'; });
+    // totals for any money columns in the view
+    const mcols=cols.filter(c=>MONEY_F.indexOf(c)>=0);
+    if(mcols.length&&rows.length){
+      hh+='<tr style="border-top:2px solid var(--line);font-weight:600">'+cols.map(c=>{
+        if(c===cols[0]) return '<td>TOTAL ('+rows.length+')</td>';
+        if(MONEY_F.indexOf(c)>=0) return '<td class="n">'+cr(rows.reduce((s,x)=>s+(Number(x[c])||0),0))+'</td>';
+        return '<td></td>'; }).join('')+'</tr>';
+    }
+    t.innerHTML=hh; window.__rows=rows; return;
+  }
+  if(window.__filt==='mismatch') rows=rows.filter(x=>x.mismatch);
+  if(window.__filt==='pending')  rows=rows.filter(x=>(x.bkPending||0)>0);
+  rows.sort((a,b)=> window.__sort==='date'
+    ? ((a.bookedTs||0)-(b.bookedTs||0))*window.__dir
+    : a.unit.localeCompare(b.unit)*window.__dir);
+  const sd=document.getElementById('sdir'); if(sd) sd.textContent=(window.__sort==='date'?(window.__dir<0?'\u2193':'\u2191'):'');
+  let h='<tr><th>Unit</th><th>Booked on</th><th>Sold on</th><th>Active then</th><th class="n">TSV</th><th class="n">Paid</th><th class="n">Bkg pending</th></tr>';
+  rows.forEach((x,i)=>{
+    const bg=x.mismatch?' style="background:rgba(196,85,77,.10)"':'';
+    h+='<tr'+bg+' onclick="toggleUnit('+i+')" style="cursor:pointer">'+
+       '<td>'+x.unit+'</td><td style="color:var(--dim)">'+(x.booked||'\u2014')+'</td><td>'+x.soldOn+'</td>'+
+       '<td'+(x.mismatch?' class="pill warn"':' style="color:var(--dim)"')+'>'+x.activeThen+'</td>'+
+       '<td class="n">'+cr(x.tsv)+'</td><td class="n">'+cr(x.paid)+'</td>'+
+       '<td class="n"'+((x.bkPending||0)>0?' style="color:#e8877f"':' style="color:var(--dim)"')+'>'+((x.bkPending||0)>0?cr(x.bkPending):'\u2014')+'</td></tr>';
+    h+='<tr id="det'+i+'" style="display:none"><td colspan="7" style="background:#10152a;padding:12px 14px">'+detail(x)+'</td></tr>';
+  });
+  t.innerHTML=h; window.__rows=rows;
+}
+function toggleUnit(i){ const r=document.getElementById('det'+i); if(r) r.style.display=(r.style.display==='none'?'table-row':'none'); }
+function row2(l,v,dim){ return '<div style="display:flex;justify-content:space-between;padding:3px 0'+(dim?';color:var(--dim)':'')+'"><span>'+l+'</span><span style="font-variant-numeric:tabular-nums">'+v+'</span></div>'; }
+function detail(x){
+  let a='<div style="font-weight:600;margin-bottom:6px">'+x.unit+' \u00b7 '+(x.customer||'\u2014')+'</div>';
+  a+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px">';
+  a+='<div>'+row2('Booked on',x.booked||'\u2014')+row2('Sold on list',x.soldOn)+
+     row2('List active then',x.activeThen)+row2('Broker',x.broker||'\u2014')+
+     (x.mismatch?'<div style="color:#e8877f;font-size:12px;margin-top:4px">sold on a list that was not active that day</div>':'')+'</div>';
+  a+='<div>'+row2('TSV',cr(x.tsv))+
+     (x.disc?row2('less on-form discount','('+cr(x.disc)+')',1):'')+
+     (x.dp?row2('less DP discount','('+cr(x.dp)+')',1):'')+
+     (x.gift?row2('less gift','('+cr(x.gift)+')',1):'')+
+     (x.npv?row2('less NPV','('+cr(x.npv)+')',1):'')+
+     row2('Payable by customer',cr(x.payable))+
+     row2('Net realization',cr(x.netReal))+'</div>';
+  a+='<div>'+row2('Paid to date',cr(x.paid))+row2('Balance',cr(x.balance))+
+     row2('Broker commission',cr(x.bkNetComm))+row2('Commission paid',cr(x.bkPaid),1)+
+     row2('Commission pending',cr(x.bkPending))+'</div>';
+  a+='</div>';
+  return a;
+}
 function tile(k,v,sm){return '<div class="card"><div class="k">'+k+'</div><div class="v'+(sm?' sm':'')+'">'+v+'</div></div>';}
 async function load(){
   const app=document.getElementById('app');
@@ -6255,11 +6374,13 @@ async function load(){
   h+='<div class="sec">Inventory still available'+(UV.atList?(' \u00b7 valued at the '+UV.atList+' (current) list'):'')+'</div>';
   h+='<div class="grid g3">'+
      tile('Unsold units',AV.total)+
-     tile('Unsold value',cr(UV.total))+
-     tile('Free to sell',AV.free+' \u00b7 '+cr(UV.free))+'</div>';
-  h+='<div class="grid g2" style="margin-top:12px">'+
-     tile('Mortgaged (encumbered)',AV.mortgaged+' \u00b7 '+cr(UV.mortgaged))+
-     tile('Not valued (no list price)',(UV.unvaluedUnits||0)+' unit(s)'+(UV.unvaluedPlots?(' \u00b7 '+UV.unvaluedPlots+' plots'):''))+'</div>';
+     tile('Gross value (list)',cr(UV.total))+
+     tile('Net after '+(UV.allowancePct||20)+'% brokerage/disc',cr(UV.netTotal||Math.round(UV.total*0.8)))+'</div>';
+  h+='<div class="grid g3" style="margin-top:12px">'+
+     tile('Free to sell',AV.free+' \u00b7 '+cr(UV.netFree||0)+' net')+
+     tile('Mortgaged',AV.mortgaged+' \u00b7 '+cr(UV.netMortgaged||0)+' net')+
+     tile('Not valued',(UV.unvaluedUnits||0)+' unit(s)'+(UV.unvaluedPlots?(' \u00b7 '+UV.unvaluedPlots+' plots'):''))+'</div>';
+
   const BC=UV.byConfig||{};
   const bcKeys=Object.keys(BC).sort((a,b)=>BC[b].value-BC[a].value);
   if(bcKeys.length){
@@ -6276,6 +6397,23 @@ async function load(){
     h+='<tr><td>'+k+'</td><td style="color:var(--dim)">'+(win[k]||'\u2014')+'</td><td class="n">'+b.units+'</td><td class="n">'+cr(b.tsv)+'</td><td class="n">'+cr(b.paid)+'</td></tr>';});
   h+='</table></div>';
 
+  // brokerage
+  const BK=d.brokerage||{entitled:0,paid:0,pending:0,byBroker:{}};
+  h+='<div class="sec">Brokerage</div><div class="grid g3">'+
+     tile('Commission entitled',cr(BK.entitled))+
+     tile('Paid to brokers',cr(BK.paid))+
+     tile('Still pending',cr(BK.pending))+'</div>';
+  const BBk=Object.keys(BK.byBroker||{}).filter(k=>BK.byBroker[k].entitled>0||BK.byBroker[k].pending>0)
+              .sort((a,b)=>BK.byBroker[b].pending-BK.byBroker[a].pending);
+  if(BBk.length){
+    h+='<div class="card" style="margin-top:12px"><table><tr><th>Broker</th><th class="n">Units</th><th class="n">Sales value</th><th class="n">Commission</th><th class="n">Paid</th><th class="n">Pending</th></tr>';
+    BBk.forEach(k=>{const b=BK.byBroker[k];
+      h+='<tr><td>'+k+'</td><td class="n">'+b.units+'</td><td class="n">'+cr(b.tsv)+'</td><td class="n">'+cr(b.entitled)+'</td>'+
+         '<td class="n" style="color:var(--dim)">'+cr(b.paid)+'</td>'+
+         '<td class="n"'+(b.pending>0?' style="color:#e8877f"':'')+'>'+cr(b.pending)+'</td></tr>';});
+    h+='</table></div>';
+  }
+
   // per-unit: booking date, list sold on, list active at that date
   const U=d.units||[];
   const mism=U.filter(x=>x.mismatch).length;
@@ -6283,15 +6421,22 @@ async function load(){
   h+= mism? ('<span class="pill warn">'+mism+' unit(s) sold on a list that was not active on the booking date</span>')
           : '<span class="pill ok">Every sold unit matches the list active on its booking date</span>';
   if(d.soldWithoutList) h+=' <span style="color:var(--dim);font-size:12px">\u00b7 '+d.soldWithoutList+' with no list set (plots / manual)</span>';
-  h+='<div style="max-height:520px;overflow:auto;margin-top:10px"><table>'+
-     '<tr><th>Unit</th><th>Booked on</th><th>Sold on list</th><th>List active then</th><th class="n">TSV</th><th class="n">Paid</th></tr>';
-  U.forEach(x=>{
-    const flag=x.mismatch?' style="background:rgba(196,85,77,.10)"':'';
-    h+='<tr'+flag+'><td>'+x.unit+'</td><td style="color:var(--dim)">'+(x.booked||'\u2014')+'</td><td>'+x.soldOn+'</td>'+
-       '<td'+(x.mismatch?' class="pill warn"':' style="color:var(--dim)"')+'>'+x.activeThen+'</td>'+
-       '<td class="n">'+cr(x.tsv)+'</td><td class="n">'+cr(x.paid)+'</td></tr>';
-  });
-  h+='</table></div></div>';
+  h+='<div class="card" style="margin-top:10px">'+
+     '<div style="font-size:12px;color:var(--dim);margin-bottom:8px">Ask for any cut of this data \u2014 e.g. \u201cunits sold below the active list, biggest gap first\u201d, \u201cbrokerage owed by broker\u201d, \u201cfloors booked in 2025 with balance over 50 lakh\u201d</div>'+
+     '<div style="display:flex;gap:8px"><input id="aiq" placeholder="Describe the report you want\u2026" '+
+       'style="flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--ink);padding:9px 12px;font-size:13px">'+
+     '<button class="btn" style="background:var(--gold);color:#0E1220;border-color:var(--gold);font-weight:600" onclick="askAI()">Build</button>'+
+     '<button class="btn" onclick="clearAI()">Reset</button></div>'+
+     '<div id="aians" style="margin-top:10px;font-size:13px"></div></div>';
+  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">'+
+     '<button class="btn" onclick="setSort(&quot;date&quot;)">Booking date <span id="sdir"></span></button>'+
+     '<button class="btn" onclick="setSort(&quot;unit&quot;)">Unit</button>'+
+     '<button class="btn" onclick="setFilt(&quot;all&quot;)">All</button>'+
+     '<button class="btn" onclick="setFilt(&quot;mismatch&quot;)">Mismatches only</button>'+
+     '<button class="btn" onclick="setFilt(&quot;pending&quot;)">Brokerage pending</button>'+
+     '</div>';
+  h+='<div style="max-height:560px;overflow:auto"><table id="utab"></table></div>';
+  h+='<div style="color:var(--dim);font-size:12px;margin-top:6px">Tap any row for the full breakdown.</div></div>';
 
   // by tower
   h+='<div class="sec">By tower</div><div class="card"><table><tr><th>Tower</th><th class="n">Sold</th><th class="n">Sales value</th><th class="n">Collected</th><th class="n">Collection</th></tr>';
@@ -6305,9 +6450,74 @@ async function load(){
      '<div class="card"><div class="k">Plots sold</div><div class="v sm">'+d.byType.plot.n+' \u00b7 '+cr(d.byType.plot.tsv)+'</div><div style="color:var(--dim);font-size:12px;margin-top:4px">collected '+cr(d.byType.plot.paid)+'</div></div>'+
      '</div>';
   document.getElementById('app').innerHTML=h;
+  window.__U=U; window.__sort='date'; window.__dir=-1; window.__filt='all';
+  renderUnits();
 }
 load();   // manual reload only - the aggregation is heavy
 </script></body></html>`;
+
+// ---- AI report builder: turns a plain-English request into a VIEW SPEC that the
+// dashboard applies to the already-loaded unit rows. The model never sees all 253
+// rows (token cost) and never returns code (safety) - only a declarative spec that
+// the client applies deterministically.
+var UNIT_FIELDS={
+  unit:'unit id, e.g. 218-FF or 230A-PLOT',
+  customer:'customer name', broker:'broker name (or Direct)',
+  booked:'booking date as dd-MMM-yyyy text', bookedTs:'booking date as epoch ms - use this for date compares',
+  soldOn:'price list the unit was sold on: 1st..6th or (none)',
+  activeThen:'price list that was actually active on the booking date',
+  mismatch:'true when soldOn differs from activeThen',
+  isPlot:'true for plots, false for floors',
+  tsv:'total sale value', disc:'on-form discount', dp:'down-payment discount',
+  gift:'gift', npv:'NPV adjustment',
+  payable:'balance payable by customer after discounts', netReal:'net realization to company',
+  paid:'principal paid to date', balance:'balance still payable',
+  bkNetComm:'broker net commission', bkPaid:'commission paid to broker', bkPending:'commission still owed to broker'
+};
+app.post('/api/dashboard-ask', express.json({limit:'100kb'}), async function(req,res){
+  try{
+    if(!CONFIG.CLAUDE_API_KEY) return res.json({ok:false,error:'CLAUDE_API_KEY is not set on the server.'});
+    var q=String((req.body&&req.body.question)||'').substring(0,500);
+    if(!q) return res.json({ok:false,error:'Ask something.'});
+    var d=await fetchDashboard();
+    if(!d||!d.ok) return res.json({ok:false,error:(d&&d.error)||'dashboard data unavailable'});
+    // compact context: aggregates + schema + a few sample rows (never the whole book)
+    var ctx={
+      totals:{units:d.inventory&&d.inventory.units, sold:d.inventory&&d.inventory.sold,
+              unsold:d.inventory&&d.inventory.unsold},
+      money:d.money, unsoldValue:d.unsoldValue&&{atList:d.unsoldValue.atList,total:d.unsoldValue.total,
+              netTotal:d.unsoldValue.netTotal,allowancePct:d.unsoldValue.allowancePct},
+      brokerage:d.brokerage&&{entitled:d.brokerage.entitled,paid:d.brokerage.paid,pending:d.brokerage.pending},
+      byList:d.byList, byTower:d.byTower, listWindows:d.listWindows,
+      unitCount:(d.units||[]).length, unitFields:UNIT_FIELDS,
+      sampleRows:(d.units||[]).slice(0,3)
+    };
+    var sys='You turn a property developer\'s plain-English request into a JSON view spec for their sales dashboard.\n'+
+      'Return ONLY JSON, no prose, no markdown fences. Shape:\n'+
+      '{"answer":"one or two sentences answering the request in INR lakh/crore where relevant",\n'+
+      ' "title":"short heading for the table",\n'+
+      ' "filters":[{"field":"<unitField>","op":"eq|ne|gt|gte|lt|lte|contains|isTrue|isFalse","value":<number|string>}],\n'+
+      ' "sort":{"field":"<unitField>","dir":"asc|desc"},\n'+
+      ' "columns":["unit","booked","..."],\n'+
+      ' "groupBy":"<unitField or empty>",\n'+
+      ' "aggregate":[{"field":"tsv","fn":"sum|avg|count|max|min"}]}\n'+
+      'Rules: use ONLY field names from unitFields. For date comparisons use bookedTs with epoch ms. '+
+      'Amounts are plain INR rupees (1 crore = 10000000). Keep columns to at most 7. '+
+      'If the request is a pure question needing no table, return filters/columns empty and just the answer. '+
+      'Today is '+new Date().toISOString().slice(0,10)+'.\n\nDATA CONTEXT:\n'+JSON.stringify(ctx);
+    var resp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
+      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:900,system:sys,
+        messages:[{role:'user',content:[{type:'text',text:q}]}]})});
+    if(!resp.ok) return res.json({ok:false,error:'AI error HTTP '+resp.status});
+    var data=await resp.json();
+    var text=''; (data.content||[]).forEach(function(c){ if(c.type==='text') text+=c.text; });
+    text=text.replace(/```json|```/g,'').trim();
+    var spec; try{ spec=JSON.parse(text); }
+    catch(e){ return res.json({ok:true,spec:{answer:text||'(no answer)',filters:[],columns:[]}}); }
+    res.json({ok:true,spec:spec});
+  }catch(e){ res.json({ok:false,error:e.message}); }
+});
 
 app.get('/api/auth-bind',function(req,res){
   // Bind an @lid identifier to a phone number so that sender is recognised from now on.
