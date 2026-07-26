@@ -6155,7 +6155,7 @@ function cr(n){n=Number(n)||0;if(n>=1e7)return '\u20b9'+(n/1e7).toFixed(2)+' Cr'
 function pct(a,b){b=Number(b)||0;return b>0?Math.round(Number(a)/b*100):0;}
 function tile(k,v,sm){return '<div class="card"><div class="k">'+k+'</div><div class="v'+(sm?' sm':'')+'">'+v+'</div></div>';}
 async function load(){
-  let d; try{ d=await (await fetch('/api/dashboard-data')).json(); }catch(e){ document.getElementById('app').innerHTML='<div class="load">Error: '+e.message+'</div>'; return; }
+  let d; try{ d=await (await fetch(window.location.origin+'/api/dashboard-data')).json(); }catch(e){ document.getElementById('app').innerHTML='<div class="load">Error: '+e.message+'</div>'; return; }
   if(!d||!d.ok){ document.getElementById('app').innerHTML='<div class="load">'+((d&&d.error)||'No data')+'</div>'; return; }
   document.getElementById('ts').textContent='live \u00b7 '+new Date(d.generated).toLocaleString('en-IN');
   const I=d.inventory,M=d.money;
