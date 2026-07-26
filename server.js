@@ -6223,20 +6223,27 @@ function pct(a,b){b=Number(b)||0;return b>0?Math.round(Number(a)/b*100):0;}
 async function askAI(){
   const inp=document.getElementById('aiq'), out=document.getElementById('aians');
   const q=(inp.value||'').trim(); if(!q) return;
-  out.innerHTML='<span style="color:var(--dim)">thinking\u2026</span>';
+  out.innerHTML='<span style="color:var(--dim)">working\u2026</span>';
+  const t=document.getElementById('utab'); if(t) t.innerHTML='';        // clear stale results
+  window.__ai=null;
   try{
+    const ctl=new AbortController(); const to=setTimeout(()=>ctl.abort(),45000);
     const r=await fetch(window.location.origin+'/api/dashboard-ask',{method:'POST',
       credentials:'same-origin',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question:q})});
+      body:JSON.stringify({question:q}),signal:ctl.signal});
+    clearTimeout(to);
     const j=await r.json();
-    if(!j.ok){ out.innerHTML='<span style="color:#e8877f">'+(j.error||'failed')+'</span>'; return; }
-    window.__spec=j.spec||{};
-    out.innerHTML='<div>'+(window.__spec.answer||'')+'</div>'+
-      (window.__spec.title?('<div style="color:var(--gold);font-size:12px;margin-top:6px">'+window.__spec.title+'</div>'):'');
+    if(!j.ok){ out.innerHTML='<span style="color:#e8877f">'+(j.error||'failed')+'</span>'; renderUnits(); return; }
+    window.__ai=j;                                    // server already filtered, sorted, totalled
+    let msg='<div style="font-size:15px;font-weight:600">'+(j.answer||'')+'</div>';
+    if(j.title) msg+='<div style="color:var(--gold);font-size:12px;margin-top:4px">'+j.title+'</div>';
+    if(j.totalMatched>400) msg+='<div style="color:var(--dim);font-size:12px;margin-top:4px">showing the first 400 of '+j.totalMatched+'</div>';
+    if((j.skippedFilters||[]).length) msg+='<div style="color:#e8877f;font-size:12px;margin-top:4px">ignored filter(s) on '+j.skippedFilters.join(', ')+' \u2014 not in the current data; rebuild the cache</div>';
+    out.innerHTML=msg;
     renderUnits();
-  }catch(e){ out.innerHTML='<span style="color:#e8877f">'+e.message+'</span>'; }
+  }catch(e){ out.innerHTML='<span style="color:#e8877f">'+(e.name==='AbortError'?'timed out':e.message)+'</span>'; renderUnits(); }
 }
-function clearAI(){ window.__spec=null; const a=document.getElementById('aians'); if(a) a.innerHTML='';
+function clearAI(){ window.__ai=null; const a=document.getElementById('aians'); if(a) a.innerHTML='';
   const i=document.getElementById('aiq'); if(i) i.value=''; renderUnits(); }
 function applySpec(rows){
   const sp=window.__spec; if(!sp) return rows;
@@ -6289,10 +6296,18 @@ function setFilt(f){ window.__filt=f; renderUnits(); }
 function renderUnits(){
   const t=document.getElementById('utab'); if(!t) return;
   let rows=(window.__U||[]).slice();
-  const sp=window.__spec;
-  if(sp){
-    rows=applySpec(rows);
-    const cols=(sp.columns&&sp.columns.length)?sp.columns:['unit','booked','soldOn','tsv','paid'];
+  const ai=window.__ai;
+  if(ai){
+    rows=ai.rows||[];
+    const sp=ai.spec||{};
+    const cols=(sp.columns&&sp.columns.length)?sp.columns:['unit','customer','booked','soldOn','tsv','paid'];
+    if(ai.groups&&ai.groups.length){
+      let gh='<tr><th>'+(LABEL[sp.groupBy]||sp.groupBy)+'</th><th class="n">Units</th><th class="n">Sale value</th><th class="n">Paid</th><th class="n">Commission</th><th class="n">Pending</th></tr>';
+      ai.groups.forEach(g=>{ gh+='<tr><td>'+g.key+'</td><td class="n">'+g.count+'</td><td class="n">'+cr(g.tsv||0)+
+        '</td><td class="n">'+cr(g.paid||0)+'</td><td class="n">'+cr(g.bkNetComm||0)+
+        '</td><td class="n"'+((g.bkPending||0)>0?' style="color:#e8877f"':'')+'>'+cr(g.bkPending||0)+'</td></tr>'; });
+      t.innerHTML=gh; window.__rows=rows; return;
+    }
     let hh='<tr>'+cols.map(c=>'<th'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+(LABEL[c]||c)+'</th>').join('')+'</tr>';
     rows.forEach(x=>{ hh+='<tr>'+cols.map(c=>'<td'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+cellVal(x,c)+'</td>').join('')+'</tr>'; });
     // totals for any money columns in the view
@@ -6496,6 +6511,87 @@ var UNIT_FIELDS={
   paid:'principal paid to date', balance:'balance still payable',
   bkNetComm:'broker net commission', bkPaid:'commission paid to broker', bkPending:'commission still owed to broker'
 };
+// Applies an AI-produced view spec to the FULL unit set and computes real numbers.
+// The model decides WHAT to look at; this function does the counting and summing, so
+// figures can never be hallucinated.
+function applyViewSpec_(units, spec){
+  var rows=(units||[]).slice();
+  var skipped=[];
+  (spec.filters||[]).forEach(function(f){
+    if(!f||!f.field) return;
+    var present=rows.some(function(x){ return x[f.field]!==undefined; });
+    if(!present){ skipped.push(f.field); return; }
+    rows=rows.filter(function(x){
+      var v=x[f.field], t=f.value;
+      switch(f.op){
+        case 'eq':  return String(v).toLowerCase()===String(t).toLowerCase();
+        case 'ne':  return String(v).toLowerCase()!==String(t).toLowerCase();
+        case 'gt':  return Number(v)>Number(t);
+        case 'gte': return Number(v)>=Number(t);
+        case 'lt':  return Number(v)<Number(t);
+        case 'lte': return Number(v)<=Number(t);
+        case 'contains': return String(v||'').toLowerCase().indexOf(String(t).toLowerCase())>=0;
+        case 'isTrue':  return v===true;
+        case 'isFalse': return v===false;
+        default: return true;
+      }
+    });
+  });
+  if(spec.sort&&spec.sort.field){
+    var sf=spec.sort.field, dir=(spec.sort.dir==='asc')?1:-1;
+    rows.sort(function(a,b){ var x=a[sf], y=b[sf];
+      if(typeof x==='number'&&typeof y==='number') return (x-y)*dir;
+      return String(x==null?'':x).localeCompare(String(y==null?'':y))*dir; });
+  }
+  var MONEY=['tsv','disc','dp','gift','npv','payable','netReal','paid','balance','bkNetComm','bkPaid','bkPending'];
+  function sum(arr,f){ return arr.reduce(function(s,x){ return s+(Number(x[f])||0); },0); }
+  var stats={count:rows.length};
+  // always total the money fields present in the chosen columns (plus the usual suspects)
+  var wanted=(spec.columns&&spec.columns.length)?spec.columns:['tsv','paid','balance'];
+  MONEY.forEach(function(f){ if(wanted.indexOf(f)>=0) stats[f]=sum(rows,f); });
+  (spec.aggregate||[]).forEach(function(a){
+    if(!a||!a.field) return;
+    var f=a.field;
+    if(a.fn==='avg') stats['avg_'+f]=rows.length?Math.round(sum(rows,f)/rows.length):0;
+    else if(a.fn==='max') stats['max_'+f]=rows.reduce(function(m,x){ return Math.max(m,Number(x[f])||0); },0);
+    else if(a.fn==='min') stats['min_'+f]=rows.length?rows.reduce(function(m,x){ return Math.min(m,Number(x[f])||0); },Infinity):0;
+    else if(a.fn==='count') stats['count_'+f]=rows.filter(function(x){ return x[f]!==undefined&&x[f]!==''; }).length;
+    else stats[f]=sum(rows,f);
+  });
+  var groups=null;
+  if(spec.groupBy){
+    var g={};
+    rows.forEach(function(x){
+      var k=String(x[spec.groupBy]===undefined?'\u2014':x[spec.groupBy])||'\u2014';
+      var e=g[k]=g[k]||{key:k,count:0};
+      MONEY.forEach(function(f){ e[f]=(e[f]||0)+(Number(x[f])||0); });
+      e.count++;
+    });
+    groups=Object.keys(g).map(function(k){ return g[k]; })
+      .sort(function(a,b){ return (b.tsv||0)-(a.tsv||0); });
+  }
+  return {rows:rows, stats:stats, groups:groups, skippedFilters:skipped};
+}
+function inrShort_(n){ n=Number(n)||0;
+  if(Math.abs(n)>=1e7) return '\u20b9'+(n/1e7).toFixed(2)+' Cr';
+  if(Math.abs(n)>=1e5) return '\u20b9'+(n/1e5).toFixed(2)+' L';
+  return '\u20b9'+Math.round(n).toLocaleString('en-IN'); }
+function statsLine_(stats, spec){
+  var bits=[stats.count+' unit'+(stats.count===1?'':'s')];
+  ['tsv','paid','balance','bkNetComm','bkPaid','bkPending','netReal','payable','disc'].forEach(function(f){
+    if(stats[f]!==undefined && stats[f]!==0){
+      var lab={tsv:'sale value',paid:'collected',balance:'balance',bkNetComm:'commission',
+               bkPaid:'commission paid',bkPending:'commission pending',netReal:'net realization',
+               payable:'payable',disc:'discount'}[f]||f;
+      bits.push(lab+' '+inrShort_(stats[f]));
+    }
+  });
+  Object.keys(stats).forEach(function(k){
+    if(k.indexOf('avg_')===0) bits.push('avg '+k.slice(4)+' '+inrShort_(stats[k]));
+    if(k.indexOf('max_')===0) bits.push('max '+k.slice(4)+' '+inrShort_(stats[k]));
+  });
+  return bits.join('  \u00b7  ');
+}
 app.post('/api/dashboard-ask', express.json({limit:'100kb'}), async function(req,res){
   try{
     if(!CONFIG.CLAUDE_API_KEY) return res.json({ok:false,error:'CLAUDE_API_KEY is not set on the server.'});
@@ -6503,44 +6599,45 @@ app.post('/api/dashboard-ask', express.json({limit:'100kb'}), async function(req
     if(!q) return res.json({ok:false,error:'Ask something.'});
     var d=await fetchDashboard();
     if(!d||!d.ok) return res.json({ok:false,error:(d&&d.error)||'dashboard data unavailable'});
-    // compact context: aggregates + schema + a few sample rows (never the whole book)
-    var ctx={
-      totals:{units:d.inventory&&d.inventory.units, sold:d.inventory&&d.inventory.sold,
-              unsold:d.inventory&&d.inventory.unsold},
-      money:d.money, unsoldValue:d.unsoldValue&&{atList:d.unsoldValue.atList,total:d.unsoldValue.total,
-              netTotal:d.unsoldValue.netTotal,allowancePct:d.unsoldValue.allowancePct},
-      brokerage:d.brokerage&&{entitled:d.brokerage.entitled,paid:d.brokerage.paid,pending:d.brokerage.pending},
-      byList:d.byList, byTower:d.byTower, listWindows:d.listWindows,
-      unitCount:(d.units||[]).length, unitFields:UNIT_FIELDS,
-      sampleRows:(d.units||[]).slice(0,3)
-    };
-    var sys='You turn a property developer\'s plain-English request into a JSON view spec for their sales dashboard.\n'+
-      'Return ONLY JSON, no prose, no markdown fences. Shape:\n'+
-      '{"answer":"one or two sentences. Describe WHAT the table will show. Do NOT state how many units match or assert totals you cannot compute - you only see aggregates and 3 sample rows, not the full book.",\n'+
-      ' "title":"short heading for the table",\n'+
-      ' "filters":[{"field":"<unitField>","op":"eq|ne|gt|gte|lt|lte|contains|isTrue|isFalse","value":<number|string>}],\n'+
-      ' "sort":{"field":"<unitField>","dir":"asc|desc"},\n'+
-      ' "columns":["unit","booked","..."],\n'+
-      ' "groupBy":"<unitField or empty>",\n'+
-      ' "aggregate":[{"field":"tsv","fn":"sum|avg|count|max|min"}]}\n'+
-      'Rules: use ONLY field names from unitFields. For date comparisons use bookedTs with epoch ms. '+
-      'Amounts are plain INR rupees (1 crore = 10000000). Keep columns to at most 7. '+
-      'If the request is a pure question needing no table, return filters/columns empty and just the answer. '+
-      'Today is '+new Date().toISOString().slice(0,10)+'.\n\nDATA CONTEXT:\n'+JSON.stringify(ctx);
+    var units=d.units||[];
+    if(!units.length) return res.json({ok:false,error:'No unit rows in the dashboard cache. Run buildDashboardCache in Apps Script.'});
+
+    var sys='You convert a property developer\'s request into a JSON query spec over their unit table.\n'+
+      'Return ONLY JSON. No prose. No markdown fences. Shape:\n'+
+      '{"title":"short heading",\n'+
+      ' "filters":[{"field":"<field>","op":"eq|ne|gt|gte|lt|lte|contains|isTrue|isFalse","value":<number|string>}],\n'+
+      ' "sort":{"field":"<field>","dir":"asc|desc"},\n'+
+      ' "columns":["unit","customer","booked","soldOn","tsv","paid","balance"],\n'+
+      ' "groupBy":"<field or omit>",\n'+
+      ' "aggregate":[{"field":"tsv","fn":"sum"}]}\n'+
+      'CRITICAL RULES:\n'+
+      '- Use ONLY these fields: '+Object.keys(UNIT_FIELDS).join(', ')+'\n'+
+      '- For any date range use bookedTs (epoch milliseconds). Year 2025 = gte 1735689600000 and lte 1767225599000. '+
+        'Year 2026 = gte 1767225600000 and lte 1798761599000. Compute other years the same way.\n'+
+      '- "floors" means isPlot isFalse. "plots" means isPlot isTrue.\n'+
+      '- Amounts are plain rupees: 1 lakh = 100000, 1 crore = 10000000.\n'+
+      '- Counting/summing is done by the server, NOT by you. Never state numbers in the title.\n'+
+      '- Include in "columns" every field the user would want to see, max 7.\n'+
+      '- To group (e.g. "by broker", "by price list") set groupBy to that field.\n\n'+
+      'FIELD MEANINGS:\n'+JSON.stringify(UNIT_FIELDS);
+
     var resp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
       headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
-      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:900,system:sys,
+      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:700,system:sys,
         messages:[{role:'user',content:[{type:'text',text:q}]}]})});
     if(!resp.ok) return res.json({ok:false,error:'AI error HTTP '+resp.status});
     var data=await resp.json();
     var text=''; (data.content||[]).forEach(function(c){ if(c.type==='text') text+=c.text; });
     text=text.replace(/```json|```/g,'').trim();
-    var spec; try{ spec=JSON.parse(text); }
-    catch(e){ return res.json({ok:true,spec:{answer:text||'(no answer)',filters:[],columns:[]}}); }
-    res.json({ok:true,spec:spec});
+    var spec; try{ spec=JSON.parse(text); }catch(e){
+      return res.json({ok:false,error:'Could not understand that. Try rephrasing.',raw:text.slice(0,200)});
+    }
+    var r=applyViewSpec_(units, spec);
+    res.json({ok:true, spec:spec, title:spec.title||'', answer:statsLine_(r.stats,spec),
+              stats:r.stats, rows:r.rows.slice(0,400), groups:r.groups,
+              skippedFilters:r.skippedFilters, totalMatched:r.rows.length});
   }catch(e){ res.json({ok:false,error:e.message}); }
 });
-
 app.get('/api/auth-bind',function(req,res){
   // Bind an @lid identifier to a phone number so that sender is recognised from now on.
   // Panel-auth protected (same as every /api/* route), so only you can do this.
