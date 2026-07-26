@@ -6232,7 +6232,13 @@ async function load(){
     app.innerHTML='<div class="load">'+(e.name==='AbortError'?'Timed out after 150s waiting for the tracker.':'Error: '+e.message)+'</div>'; return; }
   clearInterval(tick);
   if(!d||!d.ok){ document.getElementById('app').innerHTML='<div class="load">'+((d&&d.error)||'No data')+'</div>'; return; }
-  document.getElementById('ts').textContent='live \u00b7 '+new Date(d.generated).toLocaleString('en-IN')+(d.fetchMs?(' \u00b7 loaded in '+(d.fetchMs/1000).toFixed(1)+'s'):'');
+  const stamp=d.computedAt?new Date(d.computedAt):(d.generated?new Date(d.generated):null);
+  let age='';
+  if(d.computedAt){ const mins=Math.round((Date.now()-stamp.getTime())/60000);
+    age=mins<90?(mins+' min ago'):(Math.round(mins/60)+' hr ago'); }
+  document.getElementById('ts').textContent=
+    (d.computedAt?('computed '+age+' \u00b7 '+stamp.toLocaleString('en-IN')):('live \u00b7 '+(stamp?stamp.toLocaleString('en-IN'):'')))
+    +(d.buildMs?(' \u00b7 built in '+Math.round(d.buildMs/1000)+'s'):'');
   const I=d.inventory,M=d.money;
   let h='';
   h+='<div class="grid g4">'+
