@@ -2861,6 +2861,32 @@ function pruneStaleDMState(state) {
     }
   });
 }
+// Persistent LID -> phone bindings. WhatsApp increasingly delivers DMs from an
+// @lid privacy identifier instead of a phone number. Resolution can fail transiently,
+// which silently dropped messages from authorised staff. We now remember every
+// successful resolution, and allow a manual bind via /api/auth-bind (panel auth).
+var LID_MAP_FILE='./wa_auth/lid_map.json';
+var LID_MAP=(function(){
+  try{ return JSON.parse(fs.readFileSync(LID_MAP_FILE,'utf8'))||{}; }catch(e){ return {}; }
+})();
+function lidMapSave(){
+  try{ fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(LID_MAP_FILE,JSON.stringify(LID_MAP,null,2)); }
+  catch(e){ console.log('[Auth] could not persist lid map:',e.message); }
+}
+function lidRemember(jid, phone, how){
+  if(!jid||!phone) return;
+  if(LID_MAP[jid]===phone) return;
+  LID_MAP[jid]=phone; lidMapSave();
+  console.log('[Auth] learned lid',jid,'->',phone,'('+(how||'auto')+')');
+}
+// Recent DM auth decisions - the gate is fail-closed and SILENT, so without this
+// a rejected sender just sees no reply. This makes the reason visible.
+var AUTH_LOG=[];
+function authNote(outcome, rawJid, phone, contactName, reason){
+  AUTH_LOG.unshift({at:new Date().toISOString(), outcome:outcome, jid:rawJid||'',
+                    phone:phone||'', name:contactName||'', reason:reason||''});
+  if(AUTH_LOG.length>60) AUTH_LOG.length=60;
+}
 async function isAuthorisedAccountant(rawJid, contactName) {
   if(!rawJid) return false;
   if(rawJid.indexOf('@g.us') >= 0) return false;
@@ -2869,12 +2895,22 @@ async function isAuthorisedAccountant(rawJid, contactName) {
     phoneOnly = rawJid.split('@')[0].replace(/[^0-9]/g, '');
   } else if(rawJid.indexOf('@lid') >= 0){
     var resolvedPhone = null;
+    // (a) remembered binding - survives restarts, immune to transient lookup failures
+    if(LID_MAP[rawJid]) resolvedPhone = LID_MAP[rawJid];
     try {
-      var contact = await waClient.getContactById(rawJid);
+      var contact = resolvedPhone?null:await waClient.getContactById(rawJid);
       if(contact){
         if(contact.number){
           var n = String(contact.number).replace(/[^0-9]/g, '');
           if(n.length >= 10 && n.length <= 13) resolvedPhone = n;
+        }
+        // (b) whatsapp-web.js often carries the real number on id.user for @lid contacts
+        if(!resolvedPhone && contact.id){
+          var cand2 = [contact.id.user, contact.id._serialized];
+          for(var k2=0;k2<cand2.length;k2++){
+            var d2 = String(cand2[k2]||'').replace(/[^0-9]/g,'');
+            if(d2.length>=11 && d2.length<=13){ resolvedPhone = d2; break; }
+          }
         }
         if(!resolvedPhone){
           var candidates = [contact.pushname, contact.name, contact.shortName, contact.verifiedName];
@@ -2906,12 +2942,16 @@ async function isAuthorisedAccountant(rawJid, contactName) {
     if(!resolvedPhone){
       if(CONFIG.LID_WHITELIST && CONFIG.LID_WHITELIST.indexOf(rawJid) >= 0){
         console.log('[Auth] LID', rawJid, 'allowed via LID_WHITELIST');
+        authNote('allow', rawJid, '', contactName, 'lid in LID_WHITELIST');
         return true;
       }
       console.log('[Auth] LID could not be resolved to a phone:', rawJid, '(name:', contactName, ')');
+      authNote('REJECT', rawJid, '', contactName,
+        'could not resolve this lid to a phone. Bind it: /api/auth-bind?jid='+encodeURIComponent(rawJid)+'&phone=<their number>');
       return false;
     }
     phoneOnly = resolvedPhone;
+    lidRemember(rawJid, phoneOnly, 'resolved');
     console.log('[Auth] LID', rawJid, 'resolved to phone', phoneOnly);
   } else {
     return false;
@@ -2920,9 +2960,11 @@ async function isAuthorisedAccountant(rawJid, contactName) {
   var whitelist = CONFIG.ACCOUNTANT_PHONES.concat([CONFIG.MM_PHONE, CONFIG.SM_PHONE]).concat(CONFIG.TEST_PHONES || []);
   if(whitelist.indexOf(phoneOnly) >= 0){
     console.log('[Auth] allow:', phoneOnly, '(', contactName, ')');
+    authNote('allow', rawJid, phoneOnly, contactName, 'phone in whitelist');
     return true;
   }
   console.log('[Auth] reject:', phoneOnly, '(', contactName, ') - not in whitelist');
+  authNote('REJECT', rawJid, phoneOnly, contactName, 'phone resolved but not in ACCOUNTANT_PHONES/MM/SM');
   return false;
 }
 function buildGroupPostFromDM(entry, posterName) {
@@ -5394,6 +5436,7 @@ var TABS = [
     {ep:'/api/approvals-report?days=14', ico:'\\uD83D\\uDCCB', label:'Approvals report \u2014 last 14 days'},
     {ep:'/ask', ico:'\\uD83D\\uDCAC', label:'Ask the MIS \u2014 chat with your data'},
     {ep:'/dashboard', ico:'\\uD83D\\uDCCA', label:'Master dashboard \u2014 inventory + sales'},
+    {ep:'/api/auth-recent', ico:'\\uD83D\\uDD11', label:'Who the bot accepted / rejected'},
     {ep:'/api/sales-feature?name=cancel&state=on', ico:'\\u2705', label:'Enable: Cancellation / refund', act:true, confirm:'Enable the cancellation + refund request flow in the sales group? It routes refunds/forego to M+S. Leave OFF if you only want booking live.'},
     {ep:'/api/sales-feature?name=cancel&state=off', ico:'\\u26D4', label:'Disable: Cancellation / refund', act:true, confirm:'Turn the cancellation flow OFF for the team?'},
     {ep:'/api/sales-feature?name=brokerage_adjust&state=on', ico:'\\u2705', label:'Enable: Brokerage adjust', act:true, confirm:'Enable brokerage set-off (moves broker commission to a target pool)? Money-moving \u2014 keep OFF unless you are supervising.'},
@@ -6123,11 +6166,23 @@ async function fetchDashboard(){
   const url=process.env.TRACKER_API_URL, secret=process.env.TRACKER_API_SECRET;
   if(!url) return {ok:false,error:'TRACKER_API_URL is not set in the environment.'};
   if(!/^https?:\/\//i.test(url)) return {ok:false,error:'TRACKER_API_URL must start with https:// - got: '+url};
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},
-    body:JSON.stringify({secret:secret,action:'dashboard'})});
+  const t0=Date.now();
+  const ctl=new AbortController();
+  const timer=setTimeout(function(){ ctl.abort(); }, 120000);   // 2 min ceiling
+  let r;
+  try{
+    r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},
+      body:JSON.stringify({secret:secret,action:'dashboard'}),signal:ctl.signal});
+  }catch(e){
+    clearTimeout(timer);
+    if(e.name==='AbortError') return {ok:false,error:'Tracker took longer than 120s. The dashboard aggregation may be reading too many covers - try again, or cut a new tracker deployment.'};
+    return {ok:false,error:'Could not reach the tracker: '+e.message};
+  }
+  clearTimeout(timer);
   const txt=await r.text();
-  try{ return JSON.parse(txt); }
-  catch(e){ return {ok:false,error:'Tracker did not return JSON (HTTP '+r.status+'). First 200 chars: '+txt.slice(0,200)}; }
+  const ms=Date.now()-t0;
+  try{ const j=JSON.parse(txt); if(j&&typeof j==='object') j.fetchMs=ms; return j; }
+  catch(e){ return {ok:false,error:'Tracker did not return JSON (HTTP '+r.status+' after '+ms+'ms). First 200 chars: '+txt.slice(0,200)}; }
 }
 app.get('/api/dashboard-data', async function(req,res){
   try{ res.json(await fetchDashboard()); }catch(e){ res.json({ok:false,error:e.message}); }
@@ -6163,9 +6218,21 @@ function cr(n){n=Number(n)||0;if(n>=1e7)return '\u20b9'+(n/1e7).toFixed(2)+' Cr'
 function pct(a,b){b=Number(b)||0;return b>0?Math.round(Number(a)/b*100):0;}
 function tile(k,v,sm){return '<div class="card"><div class="k">'+k+'</div><div class="v'+(sm?' sm':'')+'">'+v+'</div></div>';}
 async function load(){
-  let d; try{ d=await (await fetch(window.location.origin+'/api/dashboard-data',{credentials:'same-origin'})).json(); }catch(e){ document.getElementById('app').innerHTML='<div class="load">Error: '+e.message+'</div>'; return; }
+  const app=document.getElementById('app');
+  let secs=0; const tick=setInterval(function(){ secs++;
+    app.innerHTML='<div class="load">Pulling live data from the tracker\u2026 '+secs+'s<br><span style="font-size:12px">reading '+'\u2248'+'250 unit covers, this can take up to a minute</span></div>'; },1000);
+  let d;
+  try{
+    const ctl=new AbortController(); const to=setTimeout(function(){ctl.abort();},150000);
+    const resp=await fetch(window.location.origin+'/api/dashboard-data',{credentials:'same-origin',signal:ctl.signal});
+    clearTimeout(to);
+    if(!resp.ok){ clearInterval(tick); app.innerHTML='<div class="load">HTTP '+resp.status+(resp.status===401?' \u2014 sign in to the panel first, then reload this page.':'')+'</div>'; return; }
+    d=await resp.json();
+  }catch(e){ clearInterval(tick);
+    app.innerHTML='<div class="load">'+(e.name==='AbortError'?'Timed out after 150s waiting for the tracker.':'Error: '+e.message)+'</div>'; return; }
+  clearInterval(tick);
   if(!d||!d.ok){ document.getElementById('app').innerHTML='<div class="load">'+((d&&d.error)||'No data')+'</div>'; return; }
-  document.getElementById('ts').textContent='live \u00b7 '+new Date(d.generated).toLocaleString('en-IN');
+  document.getElementById('ts').textContent='live \u00b7 '+new Date(d.generated).toLocaleString('en-IN')+(d.fetchMs?(' \u00b7 loaded in '+(d.fetchMs/1000).toFixed(1)+'s'):'');
   const I=d.inventory,M=d.money;
   let h='';
   h+='<div class="grid g4">'+
@@ -6176,7 +6243,12 @@ async function load(){
   h+='<div class="grid g3" style="margin-top:12px">'+
      tile('Outstanding',cr(M.pending))+
      tile('Collection %',pct(M.paid,M.tsv)+'%')+
-     tile('Mortgaged / held',I.mortgaged)+'</div>';
+     tile('Cancelled / adjusted',I.cancelled||0)+'</div>';
+  const AV=d.available||{total:I.unsold,mortgaged:0,free:0};
+  h+='<div class="sec">Inventory still available</div><div class="grid g3">'+
+     tile('Unsold total',AV.total)+
+     tile('Of which mortgaged',AV.mortgaged)+
+     tile('Free to sell',AV.free)+'</div>';
 
   // sales by price list
   h+='<div class="sec">Sales by price list</div><div class="card"><table><tr><th>List</th><th>Active window</th><th class="n">Units</th><th class="n">Sales value</th><th class="n">Collected</th></tr>';
@@ -6185,14 +6257,22 @@ async function load(){
     h+='<tr><td>'+k+'</td><td style="color:var(--dim)">'+(win[k]||'\u2014')+'</td><td class="n">'+b.units+'</td><td class="n">'+cr(b.tsv)+'</td><td class="n">'+cr(b.paid)+'</td></tr>';});
   h+='</table></div>';
 
-  // window leakage
-  h+='<div class="sec">Price-window check</div><div class="card">';
-  if((d.leakage||[]).length===0){ h+='<span class="pill ok">All sold units priced on the list active at booking</span>'; }
-  else{ h+='<span class="pill warn">'+d.leakage.length+' unit(s) sold outside the active window</span><table style="margin-top:10px"><tr><th>Unit</th><th>List used</th><th>Booked</th><th>Should have been</th></tr>';
-    d.leakage.forEach(x=>{h+='<tr><td>'+x.unit+'</td><td>'+x.listUsed+'</td><td style="color:var(--dim)">'+x.bookedOn+'</td><td class="pill warn">'+x.shouldBe+'</td></tr>';});
-    h+='</table>'; }
-  if(d.soldWithoutList) h+='<div style="color:var(--dim);margin-top:8px;font-size:12px">'+d.soldWithoutList+' sold unit(s) have no price list set (plots / manual).</div>';
-  h+='</div>';
+  // per-unit: booking date, list sold on, list active at that date
+  const U=d.units||[];
+  const mism=U.filter(x=>x.mismatch).length;
+  h+='<div class="sec">Every sold unit \u2014 booking date vs price list</div><div class="card">';
+  h+= mism? ('<span class="pill warn">'+mism+' unit(s) sold on a list that was not active on the booking date</span>')
+          : '<span class="pill ok">Every sold unit matches the list active on its booking date</span>';
+  if(d.soldWithoutList) h+=' <span style="color:var(--dim);font-size:12px">\u00b7 '+d.soldWithoutList+' with no list set (plots / manual)</span>';
+  h+='<div style="max-height:520px;overflow:auto;margin-top:10px"><table>'+
+     '<tr><th>Unit</th><th>Booked on</th><th>Sold on list</th><th>List active then</th><th class="n">TSV</th><th class="n">Paid</th></tr>';
+  U.forEach(x=>{
+    const flag=x.mismatch?' style="background:rgba(196,85,77,.10)"':'';
+    h+='<tr'+flag+'><td>'+x.unit+'</td><td style="color:var(--dim)">'+(x.booked||'\u2014')+'</td><td>'+x.soldOn+'</td>'+
+       '<td'+(x.mismatch?' class="pill warn"':' style="color:var(--dim)"')+'>'+x.activeThen+'</td>'+
+       '<td class="n">'+cr(x.tsv)+'</td><td class="n">'+cr(x.paid)+'</td></tr>';
+  });
+  h+='</table></div></div>';
 
   // by tower
   h+='<div class="sec">By tower</div><div class="card"><table><tr><th>Tower</th><th class="n">Sold</th><th class="n">Sales value</th><th class="n">Collected</th><th class="n">Collection</th></tr>';
@@ -6207,9 +6287,43 @@ async function load(){
      '</div>';
   document.getElementById('app').innerHTML=h;
 }
-load(); setInterval(load,60000);
+load();   // manual reload only - the aggregation is heavy
 </script></body></html>`;
 
+app.get('/api/auth-bind',function(req,res){
+  // Bind an @lid identifier to a phone number so that sender is recognised from now on.
+  // Panel-auth protected (same as every /api/* route), so only you can do this.
+  // The phone must already be an authorised number - this maps identity, it does NOT
+  // grant new access, so a stranger's lid cannot be bound into the whitelist.
+  try{
+    var jid=String(req.query.jid||'').trim();
+    var phone=String(req.query.phone||'').replace(/[^0-9]/g,'');
+    if(!jid||!phone) return res.json({ok:false,error:'need ?jid=<...@lid>&phone=<digits>'});
+    if(jid.indexOf('@lid')<0) return res.json({ok:false,error:'jid must be an @lid identifier'});
+    var allowed=CONFIG.ACCOUNTANT_PHONES.concat([CONFIG.MM_PHONE,CONFIG.SM_PHONE]).concat(CONFIG.TEST_PHONES||[]);
+    if(allowed.indexOf(phone)<0){
+      return res.json({ok:false,error:'that phone is not an authorised number, so binding it would grant new access. Add it to ACCOUNTANT_PHONES first.',authorised:allowed});
+    }
+    lidRemember(jid,phone,'manual bind');
+    res.json({ok:true,bound:{jid:jid,phone:phone},note:'That sender is now recognised. Ask them to resend their message.',map:LID_MAP});
+  }catch(e){ res.json({ok:false,error:e.message}); }
+});
+app.get('/api/auth-unbind',function(req,res){
+  try{
+    var jid=String(req.query.jid||'').trim();
+    if(!jid||!LID_MAP[jid]) return res.json({ok:false,error:'no such binding',map:LID_MAP});
+    delete LID_MAP[jid]; lidMapSave();
+    res.json({ok:true,removed:jid,map:LID_MAP});
+  }catch(e){ res.json({ok:false,error:e.message}); }
+});
+app.get('/api/auth-recent',function(req,res){
+  res.json({note:'Most recent DM auth decisions, newest first. A REJECT means the bot silently ignored that message.',
+    whitelist:{accountants:CONFIG.ACCOUNTANT_PHONES, mm:CONFIG.MM_PHONE, sm:CONFIG.SM_PHONE,
+               lidWhitelist:CONFIG.LID_WHITELIST||[]},
+    learnedLidBindings:LID_MAP,
+    howToFix:'If you see a REJECT with an @lid and no phone, call /api/auth-bind?jid=<the jid>&phone=<their number>, then ask them to resend.',
+    decisions:AUTH_LOG});
+});
 app.get('/api/sales-features-status',function(req,res){try{res.json({features:loadSalesFeatures(),note:'Only enabled features respond in the sales group. Booking is the shipped default; the rest stay off until you switch them on here.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-feature',function(req,res){try{var name=String(req.query.name||'');var st=String(req.query.state||'').toLowerCase();if(!SALES_FEATURES_DEFAULT.hasOwnProperty(name))return res.json({error:'unknown feature '+name});if(st!=='on'&&st!=='off')return res.json({error:'state must be on|off'});var f=setSalesFeature(name,st==='on');res.json({success:true,feature:name,enabled:f[name],features:f});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-approval-status',function(req,res){try{res.json({skipApproval:loadSalesSkipApproval(),note:(loadSalesSkipApproval()?'SKIP is ON \u2014 bookings bypass M+S and go straight to the agent re-confirm, then commit.':'Approvals REQUIRED \u2014 bookings need M+S both-yes, then agent re-confirm.')});}catch(e){res.json({error:e.message});}});
