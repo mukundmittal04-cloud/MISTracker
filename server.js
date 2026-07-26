@@ -5393,6 +5393,7 @@ var TABS = [
     {ep:'/api/sales-features-status', ico:'\\u2699', label:'Sales features \u2014 status'},
     {ep:'/api/approvals-report?days=14', ico:'\\uD83D\\uDCCB', label:'Approvals report \u2014 last 14 days'},
     {ep:'/ask', ico:'\\uD83D\\uDCAC', label:'Ask the MIS \u2014 chat with your data'},
+    {ep:'/dashboard', ico:'\\uD83D\\uDCCA', label:'Master dashboard \u2014 inventory + sales'},
     {ep:'/api/sales-feature?name=cancel&state=on', ico:'\\u2705', label:'Enable: Cancellation / refund', act:true, confirm:'Enable the cancellation + refund request flow in the sales group? It routes refunds/forego to M+S. Leave OFF if you only want booking live.'},
     {ep:'/api/sales-feature?name=cancel&state=off', ico:'\\u26D4', label:'Disable: Cancellation / refund', act:true, confirm:'Turn the cancellation flow OFF for the team?'},
     {ep:'/api/sales-feature?name=brokerage_adjust&state=on', ico:'\\u2705', label:'Enable: Brokerage adjust', act:true, confirm:'Enable brokerage set-off (moves broker commission to a target pool)? Money-moving \u2014 keep OFF unless you are supervising.'},
@@ -6113,6 +6114,93 @@ var ASK_HTML='<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewp
 'function add(cls,txt){var d=document.createElement("div");d.className="m "+cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}'+
 '</script></body></html>';
 app.get('/ask', function(req,res){ res.type('html').send(ASK_HTML); });
+
+// ---- MASTER DASHBOARD: live inventory + sales-by-list + window leakage + collections ----
+async function fetchDashboard(){
+  const r=await fetch(CONFIG.TRACKER_API_URL,{method:'POST',headers:{'Content-Type':'text/plain'},
+    body:JSON.stringify({secret:CONFIG.TRACKER_API_SECRET,action:'dashboard'})});
+  return await r.json();
+}
+app.get('/api/dashboard-data', async function(req,res){
+  try{ res.json(await fetchDashboard()); }catch(e){ res.json({ok:false,error:e.message}); }
+});
+app.get('/dashboard', function(req,res){ res.type('html').send(DASH_HTML); });
+
+const DASH_HTML=`<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>CCM \u2014 Master Dashboard</title>
+<style>
+:root{--bg:#0E1220;--card:#161B2C;--line:#262E47;--ink:#E9EAF0;--dim:#8A90A6;--gold:#E8A33D;--green:#4BA88B;--red:#C4554D;--blue:#5B8DDB}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,sans-serif;padding:16px;max-width:1100px;margin:0 auto}
+h1{font-size:18px;letter-spacing:1px;margin:0 0 2px}h1 span{color:var(--gold)}
+.sub{color:var(--dim);font-size:12px;margin-bottom:16px}
+.grid{display:grid;gap:12px}.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}
+@media(max-width:720px){.g4,.g3{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.v{font-size:22px;font-weight:600;margin-top:4px}.v.sm{font-size:16px}
+.sec{margin-top:22px;font-size:13px;letter-spacing:1px;color:var(--gold);text-transform:uppercase}
+table{width:100%;border-collapse:collapse;margin-top:8px}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:6px}.bar>i{display:block;height:100%;background:var(--green)}
+.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px}
+.pill.warn{background:rgba(196,85,77,.18);color:#e8877f}.pill.ok{background:rgba(75,168,139,.18);color:#6fc4a8}
+.load{color:var(--dim);padding:40px;text-align:center}
+</style></head><body>
+<h1>Capital Central Market \u2014 <span>Master Dashboard</span></h1>
+<div class="sub" id="ts">loading\u2026</div>
+<div id="app"><div class="load">Pulling live data from the tracker\u2026</div></div>
+<script>
+function cr(n){n=Number(n)||0;if(n>=1e7)return '\u20b9'+(n/1e7).toFixed(2)+' Cr';if(n>=1e5)return '\u20b9'+(n/1e5).toFixed(2)+' L';return '\u20b9'+n.toLocaleString('en-IN');}
+function pct(a,b){b=Number(b)||0;return b>0?Math.round(Number(a)/b*100):0;}
+function tile(k,v,sm){return '<div class="card"><div class="k">'+k+'</div><div class="v'+(sm?' sm':'')+'">'+v+'</div></div>';}
+async function load(){
+  let d; try{ d=await (await fetch('/api/dashboard-data')).json(); }catch(e){ document.getElementById('app').innerHTML='<div class="load">Error: '+e.message+'</div>'; return; }
+  if(!d||!d.ok){ document.getElementById('app').innerHTML='<div class="load">'+((d&&d.error)||'No data')+'</div>'; return; }
+  document.getElementById('ts').textContent='live \u00b7 '+new Date(d.generated).toLocaleString('en-IN');
+  const I=d.inventory,M=d.money;
+  let h='';
+  h+='<div class="grid g4">'+
+     tile('Total units',I.units)+
+     tile('Sold',I.sold+' <span style="color:var(--dim);font-size:12px">/ '+I.unsold+' unsold</span>')+
+     tile('Total sales value',cr(M.tsv))+
+     tile('Collected',cr(M.paid))+'</div>';
+  h+='<div class="grid g3" style="margin-top:12px">'+
+     tile('Outstanding',cr(M.pending))+
+     tile('Collection %',pct(M.paid,M.tsv)+'%')+
+     tile('Mortgaged / held',I.mortgaged)+'</div>';
+
+  // sales by price list
+  h+='<div class="sec">Sales by price list</div><div class="card"><table><tr><th>List</th><th>Active window</th><th class="n">Units</th><th class="n">Sales value</th><th class="n">Collected</th></tr>';
+  const win={}; (d.listWindows||[]).forEach(w=>win[w.name]=w.from+' \u2192 '+w.until);
+  Object.keys(d.byList).sort().forEach(k=>{const b=d.byList[k];
+    h+='<tr><td>'+k+'</td><td style="color:var(--dim)">'+(win[k]||'\u2014')+'</td><td class="n">'+b.units+'</td><td class="n">'+cr(b.tsv)+'</td><td class="n">'+cr(b.paid)+'</td></tr>';});
+  h+='</table></div>';
+
+  // window leakage
+  h+='<div class="sec">Price-window check</div><div class="card">';
+  if((d.leakage||[]).length===0){ h+='<span class="pill ok">All sold units priced on the list active at booking</span>'; }
+  else{ h+='<span class="pill warn">'+d.leakage.length+' unit(s) sold outside the active window</span><table style="margin-top:10px"><tr><th>Unit</th><th>List used</th><th>Booked</th><th>Should have been</th></tr>';
+    d.leakage.forEach(x=>{h+='<tr><td>'+x.unit+'</td><td>'+x.listUsed+'</td><td style="color:var(--dim)">'+x.bookedOn+'</td><td class="pill warn">'+x.shouldBe+'</td></tr>';});
+    h+='</table>'; }
+  if(d.soldWithoutList) h+='<div style="color:var(--dim);margin-top:8px;font-size:12px">'+d.soldWithoutList+' sold unit(s) have no price list set (plots / manual).</div>';
+  h+='</div>';
+
+  // by tower
+  h+='<div class="sec">By tower</div><div class="card"><table><tr><th>Tower</th><th class="n">Sold</th><th class="n">Sales value</th><th class="n">Collected</th><th class="n">Collection</th></tr>';
+  Object.keys(d.byTower).sort().forEach(k=>{const t=d.byTower[k];
+    h+='<tr><td>'+k+'xx</td><td class="n">'+t.sold+'</td><td class="n">'+cr(t.tsv)+'</td><td class="n">'+cr(t.paid)+'</td><td class="n">'+pct(t.paid,t.tsv)+'%<div class="bar"><i style="width:'+pct(t.paid,t.tsv)+'%"></i></div></td></tr>';});
+  h+='</table></div>';
+
+  // plot vs floor
+  h+='<div class="sec">Plots vs floors</div><div class="grid g2">'+
+     '<div class="card"><div class="k">Floors sold</div><div class="v sm">'+d.byType.floor.n+' \u00b7 '+cr(d.byType.floor.tsv)+'</div><div style="color:var(--dim);font-size:12px;margin-top:4px">collected '+cr(d.byType.floor.paid)+'</div></div>'+
+     '<div class="card"><div class="k">Plots sold</div><div class="v sm">'+d.byType.plot.n+' \u00b7 '+cr(d.byType.plot.tsv)+'</div><div style="color:var(--dim);font-size:12px;margin-top:4px">collected '+cr(d.byType.plot.paid)+'</div></div>'+
+     '</div>';
+  document.getElementById('app').innerHTML=h;
+}
+load(); setInterval(load,60000);
+</script></body></html>`;
 
 app.get('/api/sales-features-status',function(req,res){try{res.json({features:loadSalesFeatures(),note:'Only enabled features respond in the sales group. Booking is the shipped default; the rest stay off until you switch them on here.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-feature',function(req,res){try{var name=String(req.query.name||'');var st=String(req.query.state||'').toLowerCase();if(!SALES_FEATURES_DEFAULT.hasOwnProperty(name))return res.json({error:'unknown feature '+name});if(st!=='on'&&st!=='off')return res.json({error:'state must be on|off'});var f=setSalesFeature(name,st==='on');res.json({success:true,feature:name,enabled:f[name],features:f});}catch(e){res.json({error:e.message});}});
