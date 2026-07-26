@@ -6117,9 +6117,17 @@ app.get('/ask', function(req,res){ res.type('html').send(ASK_HTML); });
 
 // ---- MASTER DASHBOARD: live inventory + sales-by-list + window leakage + collections ----
 async function fetchDashboard(){
-  const r=await fetch(CONFIG.TRACKER_API_URL,{method:'POST',headers:{'Content-Type':'text/plain'},
-    body:JSON.stringify({secret:CONFIG.TRACKER_API_SECRET,action:'dashboard'})});
-  return await r.json();
+  // TRACKER_API_URL/SECRET live in process.env (they are passed into the sales module's
+  // deps object, NOT onto CONFIG) - reading CONFIG.* gave undefined and node-fetch then
+  // threw "Only absolute URLs are supported", which the dashboard displayed as its error.
+  const url=process.env.TRACKER_API_URL, secret=process.env.TRACKER_API_SECRET;
+  if(!url) return {ok:false,error:'TRACKER_API_URL is not set in the environment.'};
+  if(!/^https?:\/\//i.test(url)) return {ok:false,error:'TRACKER_API_URL must start with https:// - got: '+url};
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},
+    body:JSON.stringify({secret:secret,action:'dashboard'})});
+  const txt=await r.text();
+  try{ return JSON.parse(txt); }
+  catch(e){ return {ok:false,error:'Tracker did not return JSON (HTTP '+r.status+'). First 200 chars: '+txt.slice(0,200)}; }
 }
 app.get('/api/dashboard-data', async function(req,res){
   try{ res.json(await fetchDashboard()); }catch(e){ res.json({ok:false,error:e.message}); }
@@ -6155,7 +6163,7 @@ function cr(n){n=Number(n)||0;if(n>=1e7)return '\u20b9'+(n/1e7).toFixed(2)+' Cr'
 function pct(a,b){b=Number(b)||0;return b>0?Math.round(Number(a)/b*100):0;}
 function tile(k,v,sm){return '<div class="card"><div class="k">'+k+'</div><div class="v'+(sm?' sm':'')+'">'+v+'</div></div>';}
 async function load(){
-  let d; try{ d=await (await fetch(window.location.origin+'/api/dashboard-data')).json(); }catch(e){ document.getElementById('app').innerHTML='<div class="load">Error: '+e.message+'</div>'; return; }
+  let d; try{ d=await (await fetch(window.location.origin+'/api/dashboard-data',{credentials:'same-origin'})).json(); }catch(e){ document.getElementById('app').innerHTML='<div class="load">Error: '+e.message+'</div>'; return; }
   if(!d||!d.ok){ document.getElementById('app').innerHTML='<div class="load">'+((d&&d.error)||'No data')+'</div>'; return; }
   document.getElementById('ts').textContent='live \u00b7 '+new Date(d.generated).toLocaleString('en-IN');
   const I=d.inventory,M=d.money;
