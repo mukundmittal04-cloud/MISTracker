@@ -6245,10 +6245,23 @@ async function load(){
      tile('Collection %',pct(M.paid,M.tsv)+'%')+
      tile('Cancelled / adjusted',I.cancelled||0)+'</div>';
   const AV=d.available||{total:I.unsold,mortgaged:0,free:0};
-  h+='<div class="sec">Inventory still available</div><div class="grid g3">'+
-     tile('Unsold total',AV.total)+
-     tile('Of which mortgaged',AV.mortgaged)+
-     tile('Free to sell',AV.free)+'</div>';
+  const UV=d.unsoldValue||{total:0,mortgaged:0,free:0,unvaluedUnits:0,unvaluedPlots:0,atList:'',byConfig:{}};
+  h+='<div class="sec">Inventory still available'+(UV.atList?(' \u00b7 valued at the '+UV.atList+' (current) list'):'')+'</div>';
+  h+='<div class="grid g3">'+
+     tile('Unsold units',AV.total)+
+     tile('Unsold value',cr(UV.total))+
+     tile('Free to sell',AV.free+' \u00b7 '+cr(UV.free))+'</div>';
+  h+='<div class="grid g2" style="margin-top:12px">'+
+     tile('Mortgaged (encumbered)',AV.mortgaged+' \u00b7 '+cr(UV.mortgaged))+
+     tile('Not valued (no list price)',(UV.unvaluedUnits||0)+' unit(s)'+(UV.unvaluedPlots?(' \u00b7 '+UV.unvaluedPlots+' plots'):''))+'</div>';
+  const BC=UV.byConfig||{};
+  const bcKeys=Object.keys(BC).sort((a,b)=>BC[b].value-BC[a].value);
+  if(bcKeys.length){
+    h+='<div class="card" style="margin-top:12px"><table><tr><th>Config</th><th class="n">Unsold units</th><th class="n">Price each</th><th class="n">Value</th></tr>';
+    bcKeys.forEach(k=>{const b=BC[k];
+      h+='<tr><td>'+k+'</td><td class="n">'+b.units+'</td><td class="n" style="color:var(--dim)">'+cr(b.unitPrice)+'</td><td class="n">'+cr(b.value)+'</td></tr>';});
+    h+='</table></div>';
+  }
 
   // sales by price list
   h+='<div class="sec">Sales by price list</div><div class="card"><table><tr><th>List</th><th>Active window</th><th class="n">Units</th><th class="n">Sales value</th><th class="n">Collected</th></tr>';
