@@ -6240,8 +6240,12 @@ function clearAI(){ window.__spec=null; const a=document.getElementById('aians')
   const i=document.getElementById('aiq'); if(i) i.value=''; renderUnits(); }
 function applySpec(rows){
   const sp=window.__spec; if(!sp) return rows;
+  const skipped=[];
   (sp.filters||[]).forEach(f=>{
     if(!f||!f.field) return;
+    // if no row has this field at all, the cache predates it - skip rather than return nothing
+    const present=rows.some(x=>x[f.field]!==undefined);
+    if(!present){ skipped.push(f.field); return; }
     rows=rows.filter(x=>{
       const v=x[f.field], t=f.value;
       switch(f.op){
@@ -6258,6 +6262,11 @@ function applySpec(rows){
       }
     });
   });
+  if(skipped.length){
+    const a=document.getElementById('aians');
+    if(a) a.innerHTML+='<div style="color:#e8877f;font-size:12px;margin-top:6px">Ignored filter(s) on '+skipped.join(', ')+
+      ' \u2014 that field is not in the current data. Rebuild the dashboard cache from the latest tracker.</div>';
+  }
   if(sp.sort&&sp.sort.field){
     const f=sp.sort.field, dir=(sp.sort.dir==='asc')?1:-1;
     rows.sort((a,b)=>{ const x=a[f],y=b[f];
@@ -6360,6 +6369,19 @@ async function load(){
     +(d.buildMs?(' \u00b7 built in '+Math.round(d.buildMs/1000)+'s'):'');
   const I=d.inventory,M=d.money;
   let h='';
+  // stale-cache guard: these fields only exist from schemaVersion 3 onward
+  const sample=(d.units&&d.units[0])||{};
+  const missing=[];
+  if(sample.bookedTs===undefined) missing.push('booking dates (date filters + sorting)');
+  if(sample.broker===undefined)   missing.push('broker names');
+  if(sample.bkPending===undefined)missing.push('brokerage paid / pending');
+  if(sample.customer===undefined) missing.push('customer names');
+  if(missing.length){
+    h+='<div class="card" style="border-color:#C4554D;background:rgba(196,85,77,.10);margin-bottom:14px">'+
+       '<div style="font-weight:600;color:#e8877f">This data was built by an older tracker version</div>'+
+       '<div style="font-size:13px;margin-top:6px">Missing: '+missing.join(' \u00b7 ')+'.</div>'+
+       '<div style="font-size:13px;margin-top:6px;color:var(--dim)">Fix: paste the latest tracker code \u2192 Save \u2192 Deploy \u2192 Manage deployments \u2192 New version, then run <b>buildDashboardCache</b> again.</div></div>';
+  }
   h+='<div class="grid g4">'+
      tile('Total units',I.units)+
      tile('Sold',I.sold+' <span style="color:var(--dim);font-size:12px">/ '+I.unsold+' unsold</span>')+
@@ -6494,7 +6516,7 @@ app.post('/api/dashboard-ask', express.json({limit:'100kb'}), async function(req
     };
     var sys='You turn a property developer\'s plain-English request into a JSON view spec for their sales dashboard.\n'+
       'Return ONLY JSON, no prose, no markdown fences. Shape:\n'+
-      '{"answer":"one or two sentences answering the request in INR lakh/crore where relevant",\n'+
+      '{"answer":"one or two sentences. Describe WHAT the table will show. Do NOT state how many units match or assert totals you cannot compute - you only see aggregates and 3 sample rows, not the full book.",\n'+
       ' "title":"short heading for the table",\n'+
       ' "filters":[{"field":"<unitField>","op":"eq|ne|gt|gte|lt|lte|contains|isTrue|isFalse","value":<number|string>}],\n'+
       ' "sort":{"field":"<unitField>","dir":"asc|desc"},\n'+
