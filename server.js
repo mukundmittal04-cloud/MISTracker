@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.12.1-wpp-undo';
+var SERVER_VERSION='2.12.2-wpp-qrfix';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -109,8 +109,17 @@ function clearStaleChromiumLocks() {
   // ("profile appears to be in use", Code 21). These lock files are safe to
   // delete on boot — they are NOT the session; the WhatsApp auth lives in
   // ./wa_auth/session/Default and is preserved. This self-heals every redeploy.
-  var sessionDir = './wa_auth/session';
+  // v2.12.2: clear locks for BOTH engines' profile paths. WPPConnect keeps its
+  // Chromium profile under ./wa_auth/wpp-tokens/<session>; a stale lock there
+  // silently prevents the browser launching, so no QR is ever produced.
+  var sessionDirs = ['./wa_auth/session', './wa_auth/wpp-tokens/fidato-mis', './wa_auth/wpp-tokens'];
+  var sessionDir = sessionDirs[0];
   var lockNames = ['SingletonLock','SingletonSocket','SingletonCookie'];
+  sessionDirs.forEach(function(dir){
+    lockNames.concat(['Default/SingletonLock']).forEach(function(name){
+      try{ fs.rmSync(dir+'/'+name, { force:true, recursive:true }); }catch(e){}
+    });
+  });
   try {
     lockNames.forEach(function(name){
       var p = sessionDir + '/' + name;
@@ -211,7 +220,20 @@ function createWhatsAppClient() {
     console.log('[WA] no WA_WEB_VERSION_URL set - using whatever build WhatsApp Web serves. If Store reads start throwing single-letter errors, pin a build.');
   }
   waClient = new Client(_clientOpts);
-  waClient.on('qr', function(qr) { latestQR = qr; qrcode.toDataURL(qr, function(err, url) { if (!err) latestQRDataUrl = url; }); console.log('QR generated.'); });
+  waClient.on('qr', function(qr) {
+    // v2.12.2: WPPConnect can hand back EITHER the raw QR payload (urlCode) or an
+    // already-rendered base64 PNG. Feeding a 10KB PNG string into qrcode.toDataURL
+    // fails silently ("data too long"), leaving /api/pair stuck on "Waiting for QR".
+    // Detect which we got and handle both.
+    latestQR = qr;
+    var v = String(qr||'');
+    if(v.indexOf('data:image')===0){ latestQRDataUrl = v; console.log('QR generated (pre-rendered image).'); return; }
+    if(v.length>2000){ latestQRDataUrl = 'data:image/png;base64,'+v.replace(/^base64,/,''); console.log('QR generated (raw base64).'); return; }
+    qrcode.toDataURL(v, function(err, url){
+      if(!err){ latestQRDataUrl = url; console.log('QR generated.'); }
+      else { console.error('[WA] QR render failed:', err.message, '| payload len', v.length); }
+    });
+  });
   waClient.on('ready', function() { waReady = true; latestQR = null; latestQRDataUrl = null; console.log('WhatsApp ready!'); });
   waClient.on('authenticated', function() { console.log('WhatsApp authenticated.'); });
   waClient.on('auth_failure', function(msg) { console.error('Auth failure:', msg); waReady = false; });
@@ -5603,6 +5625,9 @@ app.get('/health',function(req,res){
   catch(e){ try{ lib=require('whatsapp-web.js/package.json').version; }catch(e2){} }
   res.json({status:'ok',version:SERVER_VERSION,whatsapp:waReady?'connected':'disconnected',
     waLibVersion:lib, waWebPin:process.env.WA_WEB_VERSION_URL||'(none)',
+    qrCaptured: !!latestQR, qrRendered: !!latestQRDataUrl,
+    qrPayloadLen: latestQR?String(latestQR).length:0,
+
     sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
@@ -7535,7 +7560,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.12.1-wpp-undo | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.12.2-wpp-qrfix | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
