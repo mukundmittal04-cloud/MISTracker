@@ -421,6 +421,18 @@ async function extractFromImage(media, msgId) {
   } catch (e) { console.error('[Vision] Exception:', e.message); return null; }
 }
 // ── Approval audit ────────────────────────────────────────────────────────────
+// A minified upstream error (e.g. whatsapp-web.js injected code throwing 'r')
+// carries no useful message. Return the name, message AND the first stack frames
+// so the panel shows where it failed instead of a single character.
+function errDetail(e){
+  var out={ error: (e && e.message) ? String(e.message) : String(e) };
+  if(e && e.name) out.errorName=e.name;
+  if(e && e.stack){
+    out.where = String(e.stack).split('\n').slice(0,6).map(function(l){ return l.trim(); });
+  }
+  out.hint='If the message is a single letter, it came from whatsapp-web.js injected browser code - usually a library/WhatsApp-Web version mismatch rather than a session problem.';
+  return out;
+}
 async function fetchApprovalMessages(days) {
   if(!waReady||!waClient)throw new Error('WhatsApp not connected');
   var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
@@ -883,7 +895,7 @@ var LEDGER_HEADS = ['Capital Site','Vrindavan','Office GK-1','Legal','Directors'
 var LEDGER_INFLOW_TAGS = ['FBD-Plot-Receivable','FBD-Plot-Construction','FBD-Floor-Receivable','FBD-Floor-Possession','FBD-Floor-Buyback','VRN-Floor','VRN-Plot','\u2014'];
 // v2.10.0-s5.9: paying-account list — exact order/contents of the Ledger Bank A/C dropdown.
 // Used both for the numbered menu (step 6) and to validate a typed account.
-var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','Fervor Marketing HDFC','Tremendous HDFC','RMS HDFC','—','MM PDC','SM PDC','PDC'];
+var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','Fervor Marketing HDFC','Tremendous HDFC','RMS HDFC','Wholly Joy JKB','Capital Site PDC','—','MM PDC','SM PDC','PDC'];
 // v2.11.0-s6.10: AI classify a cancellation reason -> company_fault | normal.
 // Used by the sales module's cancel flow. Uses the same Claude API pattern as vision.
 async function aiClassifyReason(reasonText){
@@ -974,7 +986,7 @@ var sales = initSales({
   TRACKER_API_SECRET: process.env.TRACKER_API_SECRET
 });
 // v2.10.0-s5.11: entity/company list — exact order/contents of the Ledger Entity dropdown (verified).
-var LEDGER_ENTITIES = ['Fidatocity - 70%','Fidatocity - 30%','Fidato City Homes','Fidatocity Homes','Trinity Landspace','Pitam','Hansaflon Buildcon','Hansaflon Buildwell','Dholpur Developers','Trinity Tulsivan','Beatific Hospitality','Chahat Garments','Fidato Buildcon','Fidato Maintenance','Maximal Infrastructure','Others (combined)','MM PDC','SM PDC','PDC','MM','SM','Fervor Marketing','Tremendous','Fervor Marketing HDFC','Tremendous HDFC','RMS'];
+var LEDGER_ENTITIES = ['Fidatocity - 70%','Fidatocity - 30%','Fidato City Homes','Fidatocity Homes','Trinity Landspace','Pitam','Hansaflon Buildcon','Hansaflon Buildwell','Dholpur Developers','Trinity Tulsivan','Beatific Hospitality','Chahat Garments','Fidato Buildcon','Fidato Maintenance','Maximal Infrastructure','Others (combined)','MM PDC','SM PDC','PDC','MM','SM','Fervor Marketing','Tremendous','Fervor Marketing HDFC','Tremendous HDFC','RMS','Wholly Joy'];
 
 // Rule-based Tag pre-guess from a description. Returns {tag, person} or null.
 function guessTagAndPerson(desc, entity){
@@ -1106,9 +1118,19 @@ function assemblePaymentRow(item, answers){
 // SUMIFS); Description carries the payer/source; bankAc = the account it was received INTO.
 function assembleInflowRow(ses){
   var A=ses.answers;
-  return { date: toLedgerWriteDate(A.date), entity: A.entity||'', head: A.head||'', description: A.fromWhom||'',
+  var unit=String(A.unit||'').trim().toUpperCase();
+  var desc=A.fromWhom||'';
+  if(unit && unit!=='NONE') desc = desc ? (desc+' \u2014 '+unit) : unit;
+  // [unit:...] makes the receipt joinable back to that unit's cover for receivables tracking
+  var notes='[bot:'+ses.id+']'+((unit&&unit!=='NONE')?('[unit:'+unit+']'):'');
+  return { date: toLedgerWriteDate(A.date), entity: A.entity||'', head: A.head||'', description: desc,
     tag: A.tag||'', inout:'IN', amount: A.amount, mode: A.mode||'', person:'', bankAc: A.bankAc||'',
-    transferTo:'', notes:'[bot:'+ses.id+']' };
+    transferTo:'', notes:notes };
+}
+// Pull the unit id back out of a ledger row written by the bot.
+function unitFromNotes(notes){
+  var m=String(notes||'').match(/\[unit:([^\]]+)\]/i);
+  return m?m[1].trim().toUpperCase():'';
 }
 // v2.11.0-s6.6: CONTRIBUTION row — promoter (MM/SM) puts money INTO a company. An IN row, tagged so it
 // reads clearly, Person = the promoter. The running loan-account tally is driven by the 'contribution'
@@ -1829,8 +1851,32 @@ async function paidFlowAdvance(session, inputRaw){
       else { return { reply:'\u26A0\uFE0F \u201c'+input+'\u201d isn\u2019t in the entity list. Reply a number (1\u2013'+LEDGER_ENTITIES.length+') or type an exact name:\n'+paidEntityMenu() }; }
     }
     session.answers.entity=ent;
+    session.step='sitepaid';
+    return { reply:'7/8 *Paid directly from site?* (site payments are PDC)\n'+
+      '1) No \u2014 paid from a bank account\n'+
+      '2) Yes \u2014 site PDC held by Umesh' };
+  }
+  if(session.step==='sitepaid'){
+    var siteChoice=null;
+    if(/^1$|^no$|^office$|^bank$/i.test(low)) siteChoice='office';
+    else if(/^2$|^yes$|pdc|site|cheque/i.test(low)) siteChoice='Capital Site PDC';
+    if(!siteChoice){
+      return { reply:'Reply 1 (bank account) or 2 (site PDC).' };
+    }
+    if(siteChoice!=='office'){
+      // a site payment IS its account - no bank picker needed
+      session.answers.bankAc=siteChoice;
+      session.answers.paidFromSite=true;
+      var itemS={ id:session.itemId, seq:session.seq, entity:session.entity, bankAc:siteChoice,
+                  description:session.description, label:session.label };
+      session.row = assemblePaymentRow(itemS, session.answers);
+      session.step='confirm';
+      return { reply:'\ud83c\udfd7\ufe0f Paid *direct from site* (PDC)\n\n'+
+        paidRowPreview(session.row)+'\n\nReply *CONFIRM* to record, or *cancel*.' };
+    }
+    session.answers.paidFromSite=false;
     session.step='account';
-    return { reply:'7/7 *Paid from which account?* — reply the number, or type the account name:\n'+paidAccountMenu() };
+    return { reply:'8/8 *Paid from which account?* — reply the number, or type the account name:\n'+paidAccountMenu() };
   }
   if(session.step==='account'){
     var acct='';
@@ -2014,7 +2060,7 @@ async function handlePaidFlow(msg){
 // The opening line is parsed for amount/mode (+ from/to for transfer, payer for inflow) and those
 // steps are pre-filled & skipped; only the missing answers are asked. CONFIRM always shows the row.
 var IO_STEPS = {
-  inflow:   [['amount','amount'],['date','date'],['mode','mode'],['head','head'],['tag','tag'],['entity','entity'],['account','bankAc'],['fromwhom','fromWhom']],
+  inflow:   [['amount','amount'],['date','date'],['mode','mode'],['head','head'],['tag','tag'],['entity','entity'],['account','bankAc'],['unit','unit'],['fromwhom','fromWhom']],
   transfer: [['amount','amount'],['date','date'],['mode','mode'],['fromacct','fromAcct'],['toacct','toAcct'],['entity','entity']],
   contribution: [['amount','amount'],['promoter','promoter'],['date','date'],['mode','mode'],['account','bankAc'],['entity','entity']]
 };
@@ -2122,6 +2168,7 @@ function ioNextPrompt(ses){
     case 'tag':      return n+'*Tag (receivable)?* \u2014 pick a number:\n'+paidInflowTagMenu()+'\n(or type the exact tag)';
     case 'entity':   return n+'*Which entity / company?* \u2014 reply the number, or type the name:\n'+paidEntityMenu();
     case 'account':  return n+'*Received into which account?* \u2014 reply the number, or type the account name:\n'+paidAccountMenu();
+    case 'unit': return n+'*Against which unit?* \u2014 e.g. 105-GF, 230A-PLOT.\nReply *none* if this receipt is not against a unit.';
     case 'fromwhom': return n+'*Received from whom?* \u2014 type the payer / source (buyer name, etc.).';
     case 'fromacct': return n+'*From which account?* \u2014 reply the number, or type the account name:\n'+paidAccountMenu();
     case 'toacct':   return n+'*To which account?* \u2014 reply the number, or type the account name:\n'+paidAccountMenu();
@@ -2156,6 +2203,13 @@ function ioConsume(ses, step, input, low){
   if(step==='tag'){ var tv=ioPickFromList(low,input,LEDGER_INFLOW_TAGS); if(!tv) return {error:'Pick the Tag by number or type the exact tag:\n'+paidInflowTagMenu()}; A.tag=tv; return {}; }
   if(step==='entity'){ var ev=ioPickEntity(low,input); if(ev.error) return {error:ev.error}; A.entity=ev.value; return {}; }
   if(step==='account'){ var av=ioPickAccount(low,input); if(av.error) return {error:av.error}; A.bankAc=av.value; return {}; }
+  if(step==='unit'){
+    if(/^(none|no|skip|n\/a|-)$/i.test(input)){ A.unit='NONE'; return {}; }
+    var u=String(input).trim().toUpperCase().replace(/\s+/g,' ');
+    if(!/-(GF|FF|SF|TF|PLOT)$/.test(u))
+      return {error:'That does not look like a unit id. Use the form 105-GF / 230A-PLOT, or reply *none*.'};
+    A.unit=u; return {};
+  }
   if(step==='fromwhom'){ if(!input) return {error:'Type the payer / source name.'}; A.fromWhom=input; return {}; }
   if(step==='promoter'){ var pp=detectPromoter(input); if(!pp) return {error:'Reply *MM* or *SM* \u2014 whose contribution is this?'}; A.promoter=pp; return {}; }
   if(step==='fromacct'){ var fa=ioPickAccount(low,input); if(fa.error) return {error:fa.error}; A.fromAcct=fa.value; return {}; }
@@ -2231,6 +2285,19 @@ async function handleInflowFlow(msg){
         try{ recordEvent('contribution', { promoter:c.promoter, entity:c.entity, amount:c.amount, date:c.date }, 'contribution:'+ses.id);
              ledgerSuffix += '\n\u2705 Logged as *'+c.promoter+' contribution* \u2014 added to the '+c.promoter+' loan account.'; }
         catch(e){ console.error('[Inflow] contribution event:', e.message); }
+      }
+      // CCM units: raise a confirmation card in the capital group. The Ledger row above
+      // stands regardless - only the cover write waits on Umesh/Gautam.
+      if(ses.kind==='inflow'){
+        var _u=String((ses.answers&&ses.answers.unit)||'').trim();
+        if(_u && _u!=='NONE' && isCcmUnit(_u)){
+          try{
+            var _r=await raiseCcmReceipt({unit:_u, amount:ses.answers.amount, mode:ses.answers.mode,
+              date:ses.answers.date, payer:ses.answers.fromWhom, account:ses.answers.bankAc,
+              entity:ses.answers.entity, raisedBy:(msg&&msg.from)||'', ledgerRow:out.recordArgs.row});
+            if(_r) ledgerSuffix += '\n\ud83c\udfe0 Sent to the capital group for Umesh/Gautam to confirm before it posts to '+_u+'\u2019s cover ('+_r.receiptId+').';
+          }catch(e){ console.error('[Inflow] raiseCcmReceipt:', e.message); }
+        }
       }
     }
     if(out.done) delete st.sessions[key];
@@ -2662,6 +2729,21 @@ async function handlePromoterVerdicts(msg){
   try{
     if(msg.from !== CONFIG.APPROVAL_GROUP_JID) return false;
     var author = (msg.author||'');
+    // CCM receipt confirmations ("yes 218-FF" / "no 218-FF" / "pending receipts") are
+    // handled first: they are Umesh/Gautam's to confirm, not an M+S approval.
+    try{
+      var rphone=String(author).split('@')[0].replace(/[^0-9]/g,'');
+      if(rphone.length<11){
+        // @lid author - resolve the same way the DM auth gate does, incl. the learned map
+        if(LID_MAP[author]) rphone=LID_MAP[author];
+        else { try{ var rc=await waClient.getContactById(author);
+          var cand=[rc&&rc.number, rc&&rc.id&&rc.id.user];
+          for(var ci=0;ci<cand.length;ci++){ var dg=String(cand[ci]||'').replace(/[^0-9]/g,'');
+            if(dg.length>=11&&dg.length<=13){ rphone=dg; lidRemember(author,dg,'receipt reply'); break; } }
+        }catch(e){} }
+      }
+      if(await handleCcmReceiptReply(msg, rphone)) return true;
+    }catch(e){ console.error('[Receipt reply]', e.message); }
     // v2.8.13: WhatsApp now delivers group authors as @lid IDs (e.g. 102469514330302@lid),
     // not phone numbers — so a raw phone-prefix check fails. Resolve role via
     // identifySender (name-based, same as the rest of the bot), with a phone fallback.
@@ -2669,6 +2751,31 @@ async function handlePromoterVerdicts(msg){
     if(!role){
       var who2 = await identifySender(author);
       if(who2 && (who2.role==='mm'||who2.role==='sm')) role = who2.role;
+    }
+    // If the author is an @lid and identifySender could not place them, resolve the
+    // phone the same way the DM auth gate does - learned map first, then the contact
+    // record - and match it against MM/SM. Without this an @lid author yields role=null
+    // and the ENTIRE verdict branch is skipped: no verdict recorded, no "Approved (M+S)"
+    // message, and the approvals panel reads 0/0/0 while people are actually approving.
+    if(!role && author){
+      var vp = LID_MAP[author] || '';
+      if(!vp){
+        try{
+          var vc = await waClient.getContactById(author);
+          var vcand = [vc && vc.number, vc && vc.id && vc.id.user];
+          for(var vi=0; vi<vcand.length; vi++){
+            var vd = String(vcand[vi]||'').replace(/[^0-9]/g,'');
+            if(vd.length>=11 && vd.length<=13){ vp = vd; break; }
+          }
+        }catch(e){}
+      }
+      if(vp===CONFIG.MM_PHONE) role='mm';
+      else if(vp===CONFIG.SM_PHONE) role='sm';
+      if(role){ lidRemember(author, vp, 'verdict author'); }
+      else {
+        console.log('[Verdicts] could not place author', author, '- resolved phone:', vp||'(none)');
+        authNote('unplaced-verdict', author, vp, '', 'author in the approval group could not be matched to MM or SM - their verdict was ignored');
+      }
     }
     if(!role) return false;
     var body = (msg.body||'').trim();
@@ -5126,28 +5233,177 @@ async function generateDailyReport(dateStr){
   var tIn=0,tOut=0,inflows=[],outflows=[];
   entries.forEach(function(e){if(e.inOut==='IN'){tIn+=e.amount;inflows.push(e);}if(e.inOut==='OUT'){tOut+=e.amount;outflows.push(e);}});
   var byTag={};outflows.forEach(function(e){var t=e.tag||'Other';if(!byTag[t])byTag[t]={total:0,items:[]};byTag[t].total+=e.amount;byTag[t].items.push(e);});
-  return{date:dateStr,totalIn:tIn,totalOut:tOut,net:tIn-tOut,inflows:inflows,outflows:outflows,byTag:byTag,fundPosition:fp,entryCount:entries.length};
+  // site vs office: a payment made out of a site pool was paid directly at site by Umesh
+  var siteOut=[],officeOut=[],siteTot=0,officeTot=0;
+  outflows.forEach(function(e){
+    if(isSiteAccount(e.bankAC)){ siteOut.push(e); siteTot+=e.amount; }
+    else { officeOut.push(e); officeTot+=e.amount; }
+  });
+  // receivables snapshot - best-effort: the report must still render if the tracker is slow or down
+  var recv=null;
+  try{
+    var rv=await buildReceivables(1);
+    if(rv&&rv.ok){
+      var todayIn=0, todayCount=0;
+      inflows.forEach(function(e){ if(unitFromNotes(e.notes)){ todayIn+=e.amount; todayCount++; } });
+      recv={ outstanding:rv.totals.outstanding, payable:rv.totals.payable,
+             paidToDate:rv.totals.paidToDate, pctCollected:rv.totals.pctCollected,
+             collectedToday:todayIn, receiptsToday:todayCount,
+             top:(rv.topOutstanding||[]).slice(0,5),
+             untagged:rv.untaggedCollections&&rv.untaggedCollections.amount||0 };
+    }
+  }catch(e){ console.log('[Report] receivables unavailable:', e.message); }
+  return{date:dateStr,totalIn:tIn,totalOut:tOut,net:tIn-tOut,inflows:inflows,outflows:outflows,byTag:byTag,
+    siteOutflows:siteOut,officeOutflows:officeOut,siteTotal:siteTot,officeTotal:officeTot,
+    receivables:recv,
+    fundPosition:fp,entryCount:entries.length};
 }
 function buildReportHTML(data){
-  var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:Arial,sans-serif;background:#fff;padding:20px;max-width:800px;margin:0 auto;color:#222}.hdr{text-align:center;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:15px}.hdr h1{font-size:22px;margin:0}.hdr p{color:#666;margin:4px 0 0}.metrics{display:flex;gap:10px;margin:15px 0}.mc{flex:1;background:#f5f5f5;border-radius:8px;padding:12px;text-align:center}.mc .lbl{font-size:11px;color:#888}.mc .val{font-size:20px;font-weight:bold;margin:4px 0 0}.gn{color:#0a7}.rd{color:#c33}.bl{color:#36a}.sec{font-size:14px;font-weight:bold;color:#555;border-bottom:1px solid #ddd;padding:8px 0 4px;margin:15px 0 8px}table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;padding:5px;background:#f0f0f0;font-size:11px;color:#666}td{padding:5px;border-top:1px solid #eee}.amt{text-align:right;font-family:monospace}tr.tot td{border-top:2px solid #999;font-weight:bold;background:#fafafa}.usb{color:#0a7}.unusb{color:#c33}</style></head><body>';
+  function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+  var CSS='body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#fff;padding:22px;max-width:820px;margin:0 auto;color:#1c2333;-webkit-font-smoothing:antialiased}'
+   +'.hdr{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid #1c2333;padding-bottom:10px;margin-bottom:16px}'
+   +'.hdr h1{font-size:21px;margin:0;letter-spacing:-.2px}.hdr .dt{text-align:right;color:#6b7280;font-size:12px;line-height:1.5}'
+   +'.strip{display:flex;gap:9px;margin-bottom:6px}'
+   +'.mc{flex:1;border-radius:10px;padding:12px 14px;border:1px solid #e5e7eb}'
+   +'.mc.in{background:#f0fdf6;border-color:#bbe7cf}.mc.out{background:#fef4f3;border-color:#f3c9c4}.mc.net{background:#f3f6fd;border-color:#c9d6f3}'
+   +'.mc .lbl{font-size:10.5px;color:#6b7280;text-transform:uppercase;letter-spacing:.6px}'
+   +'.mc .val{font-size:21px;font-weight:700;margin-top:3px;letter-spacing:-.4px}'
+   +'.gn{color:#0a7a52}.rd{color:#b3372c}.bl{color:#2a4f9b}'
+   +'.sec{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.8px;margin:20px 0 7px}'
+   +'.sec:before{content:"";width:4px;height:15px;border-radius:2px;background:#9ca3af}'
+   +'.sec.i:before{background:#0a7a52}.sec.o:before{background:#b3372c}.sec.s:before{background:#d68910}.sec.f:before{background:#2a4f9b}'
+   +'.sec .cnt{font-weight:500;color:#9ca3af;letter-spacing:0;text-transform:none;font-size:11.5px}'
+   +'table{width:100%;border-collapse:collapse;font-size:12px}'
+   +'th{text-align:left;padding:6px 7px;background:#f3f4f6;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;font-weight:600;border-bottom:1px solid #e5e7eb}'
+   +'td{padding:7px;border-bottom:1px solid #f1f2f4;vertical-align:top}'
+   +'tr:nth-child(even) td{background:#fbfbfc}'
+   +'.amt{text-align:right;font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}'
+   +'.sub{color:#9ca3af;font-size:10.5px;display:block;margin-top:1px}'
+   +'tr.tot td{border-top:2px solid #9ca3af;background:#f9fafb!important;font-weight:700}'
+   +'.chip{display:inline-block;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:600}'
+   +'.chip.site{background:#fdf0d9;color:#966206}.chip.off{background:#eaeef7;color:#2a4f9b}.chip.blk{background:#f4e6e4;color:#8a2d24}'
+   +'.split{display:flex;height:26px;border-radius:6px;overflow:hidden;margin:8px 0 4px;font-size:11px;font-weight:700;color:#fff}'
+   +'.split>div{display:flex;align-items:center;justify-content:center}'
+   +'.holding{background:#fffbeb;border:1px solid #f5d78e;border-radius:10px;padding:11px 14px;margin:8px 0 2px;display:flex;justify-content:space-between;align-items:center}'
+   +'.holding .l{font-size:11px;color:#966206;text-transform:uppercase;letter-spacing:.6px;font-weight:600}'
+   +'.holding .v{font-size:19px;font-weight:700;color:#966206}'
+   +'.empty{color:#9ca3af;font-size:11.5px;padding:6px 0}';
+  var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>'+CSS+'</style></head><body>';
   var _wd=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   var _pd=parseSheetDate(data.date)||new Date(data.date);
   var _dd=isNaN(_pd)?data.date:(_wd[_pd.getDay()]+', '+('0'+_pd.getDate()).slice(-2)+'/'+('0'+(_pd.getMonth()+1)).slice(-2)+'/'+_pd.getFullYear());
-  h+='<div class="hdr"><h1>Daily MIS Report</h1><p>'+_dd+' | '+data.entryCount+' transactions</p></div>';
-  h+='<div class="metrics"><div class="mc"><div class="lbl">Total Inflows</div><div class="val gn">'+formatINR(data.totalIn)+'</div></div><div class="mc"><div class="lbl">Total Outflows</div><div class="val rd">'+formatINR(data.totalOut)+'</div></div><div class="mc"><div class="lbl">Net</div><div class="val '+(data.net>=0?'bl':'rd')+'">'+formatINR(data.net)+'</div></div></div>';
-  if(data.inflows.length>0){h+='<div class="sec">INFLOWS</div><table><tr><th>Description</th><th>Entity</th><th>Tag</th><th>Bank A/C</th><th style="text-align:right">Amount</th></tr>';data.inflows.forEach(function(e){h+='<tr><td>'+e.description+'</td><td>'+e.entity+'</td><td>'+e.tag+'</td><td>'+e.bankAC+'</td><td class="amt gn">'+formatINR(e.amount)+'</td></tr>';});h+='</table>';}
-  h+='<div class="sec">OUTFLOWS</div><table><tr><th>Description</th><th>Head</th><th>Entity</th><th>Tag</th><th>Bank A/C</th><th>Mode</th><th style="text-align:right">Amount</th></tr>';
-  data.outflows.forEach(function(e){h+='<tr><td>'+e.description+'</td><td>'+e.head+'</td><td>'+e.entity+'</td><td>'+e.tag+'</td><td>'+e.bankAC+'</td><td>'+e.mode+'</td><td class="amt rd">'+formatINR(e.amount)+'</td></tr>';});h+='</table>';
-  h+='<div class="sec">FUND POSITION</div><table><tr><th>Account</th><th style="text-align:right">Opening</th><th style="text-align:right">IN</th><th style="text-align:right">OUT</th><th style="text-align:right">Closing</th><th>Status</th></tr>';
-  var _usable=0,_unusable=0;
-  data.fundPosition.forEach(function(a){
-    var _isUsable=/^usable$/i.test((a.status||'').toString().trim());
-    if(_isUsable)_usable+=(a.closing||0);else _unusable+=(a.closing||0);
-    h+='<tr><td>'+a.bankAC+'</td><td class="amt">'+formatINR(a.opening)+'</td><td class="amt gn">'+formatINR(a.todayIn)+'</td><td class="amt rd">'+formatINR(a.todayOut)+'</td><td class="amt">'+formatINR(a.closing)+'</td><td>'+(a.status||'')+'</td></tr>';
+
+  h+='<div class="hdr"><div><h1>Daily MIS Report</h1></div>'
+   +'<div class="dt">'+esc(_dd)+'<br>'+data.entryCount+' transaction'+(data.entryCount===1?'':'s')+'</div></div>';
+
+  h+='<div class="strip">'
+   +'<div class="mc in"><div class="lbl">Money in</div><div class="val gn">'+formatINR(data.totalIn)+'</div></div>'
+   +'<div class="mc out"><div class="lbl">Money out</div><div class="val rd">'+formatINR(data.totalOut)+'</div></div>'
+   +'<div class="mc net"><div class="lbl">Net</div><div class="val '+(data.net>=0?'bl':'rd')+'">'+(data.net<0?'\u2212':'')+formatINR(Math.abs(data.net))+'</div></div></div>';
+
+  // ---- site vs office, right at the top: the question you actually ask ----
+  var sT=(data.siteTotal||0), oT=(data.officeTotal||0), tT=sT+oT;
+  if(tT>0){
+    var sp=Math.round(sT/tT*100), op=100-sp;
+    h+='<div class="sec s">Paid from <span class="cnt">site vs office</span></div>';
+    h+='<div class="split">'
+     +(sp>0?'<div style="width:'+sp+'%;background:#d68910">'+(sp>=14?('Site '+sp+'%'):'')+'</div>':'')
+     +(op>0?'<div style="width:'+op+'%;background:#2a4f9b">'+(op>=14?('Office '+op+'%'):'')+'</div>':'')
+     +'</div>';
+    h+='<table><tr><th>Paid from</th><th style="text-align:right">Items</th><th style="text-align:right">Amount</th></tr>'
+     +'<tr><td><span class="chip site">SITE</span> PDC held by Umesh</td><td class="amt">'+(data.siteOutflows||[]).length+'</td><td class="amt rd">'+formatINR(sT)+'</td></tr>'
+     +'<tr><td><span class="chip off">OFFICE</span> bank accounts</td><td class="amt">'+(data.officeOutflows||[]).length+'</td><td class="amt rd">'+formatINR(oT)+'</td></tr>'
+     +'</table>';
+  }
+
+  // ---- inflows ----
+  h+='<div class="sec i">Money in <span class="cnt">'+(data.inflows||[]).length+' receipt'+((data.inflows||[]).length===1?'':'s')+'</span></div>';
+  if((data.inflows||[]).length){
+    h+='<table><tr><th>From</th><th>Tag</th><th>Into</th><th style="text-align:right">Amount</th></tr>';
+    data.inflows.forEach(function(e){
+      h+='<tr><td>'+esc(e.description)+'<span class="sub">'+esc(e.entity)+'</span></td>'
+       +'<td>'+esc(e.tag)+'</td><td>'+esc(e.bankAC)+(isSiteAccount(e.bankAC)?' <span class="chip site">SITE</span>':'')+'</td>'
+       +'<td class="amt gn">'+formatINR(e.amount)+'</td></tr>';
+    });
+    h+='<tr class="tot"><td colspan="3">Total in</td><td class="amt gn">'+formatINR(data.totalIn)+'</td></tr></table>';
+  } else h+='<div class="empty">No receipts today.</div>';
+
+  // ---- receivables: what is still owed, and did it move today ----
+  if(data.receivables){
+    var R=data.receivables;
+    h+='<div class="sec f">Receivables <span class="cnt">across every sold unit</span></div>';
+    h+='<div class="strip" style="margin-bottom:4px">'
+     +'<div class="mc out"><div class="lbl">Still outstanding</div><div class="val rd">'+formatINR(R.outstanding)+'</div></div>'
+     +'<div class="mc in"><div class="lbl">Collected today</div><div class="val gn">'+formatINR(R.collectedToday)
+       +'</div><div class="sub" style="margin-top:2px">'+(R.receiptsToday||0)+' receipt'+((R.receiptsToday===1)?'':'s')+' against units</div></div>'
+     +'<div class="mc net"><div class="lbl">Collected to date</div><div class="val bl">'+R.pctCollected+'%</div>'
+       +'<div class="sub" style="margin-top:2px">'+formatINR(R.paidToDate)+' of '+formatINR(R.payable)+'</div></div></div>';
+    if((R.top||[]).length){
+      h+='<table><tr><th>Largest outstanding</th><th>Customer</th><th style="text-align:right">Collected</th><th style="text-align:right">Still owed</th></tr>';
+      R.top.forEach(function(u){
+        h+='<tr><td>'+esc(u.unit)+'</td><td>'+esc(u.customer)+'</td>'
+         +'<td class="amt" style="color:#6b7280">'+u.pctCollected+'%</td>'
+         +'<td class="amt rd">'+formatINR(u.outstanding)+'</td></tr>';
+      });
+      h+='</table>';
+    }
+    if(R.untagged>0){
+      h+='<div class="empty">'+formatINR(R.untagged)+' collected today is not tagged to a unit \u2014 it will not reduce any unit\u2019s balance.</div>';
+    }
+  }
+
+  // ---- outflows, site block first then office ----
+  function outTable(rows,label,chip){
+    if(!rows||!rows.length) return '';
+    var t=0; rows.forEach(function(e){ t+=e.amount; });
+    var s='<table><tr><th>'+label+'</th><th>Head</th><th>Mode</th><th style="text-align:right">Amount</th></tr>';
+    rows.forEach(function(e){
+      s+='<tr><td>'+esc(e.description)+'<span class="sub">'+esc(e.entity)+(e.bankAC?(' \u00b7 '+esc(e.bankAC)):'')+'</span></td>'
+       +'<td>'+esc(e.head)+'</td><td>'+esc(e.mode)+'</td><td class="amt rd">'+formatINR(e.amount)+'</td></tr>';
+    });
+    s+='<tr class="tot"><td colspan="3">Subtotal</td><td class="amt rd">'+formatINR(t)+'</td></tr></table>';
+    return s;
+  }
+  if((data.siteOutflows||[]).length){
+    h+='<div class="sec s">Paid at site <span class="cnt">PDC \u00b7 '+data.siteOutflows.length+' payment'+(data.siteOutflows.length===1?'':'s')+'</span></div>';
+    h+=outTable(data.siteOutflows,'Paid to','site');
+  }
+  if((data.officeOutflows||[]).length){
+    h+='<div class="sec o">Paid from office <span class="cnt">'+data.officeOutflows.length+' payment'+(data.officeOutflows.length===1?'':'s')+'</span></div>';
+    h+=outTable(data.officeOutflows,'Paid to','off');
+  }
+  if(!(data.outflows||[]).length) h+='<div class="sec o">Money out</div><div class="empty">No payments today.</div>';
+
+  // ---- fund position: banks, then what is held at site, then totals ----
+  h+='<div class="sec f">Fund position <span class="cnt">closing balances</span></div>';
+  var banks=[], siteRows=[], usable=0, blocked=0, siteHeld=0;
+  (data.fundPosition||[]).forEach(function(a){
+    if(isSiteAccount(a.bankAC)){ siteRows.push(a); siteHeld+=(a.closing||0); return; }
+    banks.push(a);
+    if(/^usable$/i.test((a.status||'').toString().trim())) usable+=(a.closing||0); else blocked+=(a.closing||0);
   });
-  h+='<tr class="tot"><td colspan="4">TOTAL USABLE (closing)</td><td class="amt usb">'+formatINR(_usable)+'</td><td>Usable</td></tr>';
-  h+='<tr class="tot"><td colspan="4">TOTAL UNUSABLE (closing)</td><td class="amt unusb">'+formatINR(_unusable)+'</td><td>Blocked</td></tr>';
-  h+='</table></body></html>';
+  h+='<table><tr><th>Account</th><th style="text-align:right">Opening</th><th style="text-align:right">In</th><th style="text-align:right">Out</th><th style="text-align:right">Closing</th></tr>';
+  banks.forEach(function(a){
+    var blk=!/^usable$/i.test((a.status||'').toString().trim());
+    h+='<tr><td>'+esc(a.bankAC)+(blk?' <span class="chip blk">BLOCKED</span>':'')+'</td>'
+     +'<td class="amt">'+formatINR(a.opening)+'</td>'
+     +'<td class="amt gn">'+(a.todayIn?formatINR(a.todayIn):'\u2013')+'</td>'
+     +'<td class="amt rd">'+(a.todayOut?formatINR(a.todayOut):'\u2013')+'</td>'
+     +'<td class="amt">'+formatINR(a.closing)+'</td></tr>';
+  });
+  h+='<tr class="tot"><td colspan="4">Total usable in banks</td><td class="amt gn">'+formatINR(usable)+'</td></tr>';
+  if(blocked) h+='<tr class="tot"><td colspan="4">Total blocked</td><td class="amt rd">'+formatINR(blocked)+'</td></tr>';
+  h+='</table>';
+
+  if(siteRows.length){
+    siteRows.forEach(function(a){
+      h+='<div class="holding"><div><div class="l">Held at site \u00b7 '+esc(a.bankAC)+'</div>'
+       +'<div class="sub" style="color:#a1791f">opening '+formatINR(a.opening)+' \u00b7 in '+formatINR(a.todayIn)+' \u00b7 out '+formatINR(a.todayOut)+'</div></div>'
+       +'<div class="v">'+formatINR(a.closing)+'</div></div>';
+    });
+    h+='<div class="empty">Held at site is PDC with Umesh \u2014 shown separately from bank balances, not counted in usable funds.</div>';
+  }
+  h+='</body></html>';
   return h;
 }
 // ── v2.10.0-s5.2: approval catch-up (record-only) ─────────────────────────────
@@ -5437,6 +5693,9 @@ var TABS = [
     {ep:'/ask', ico:'\\uD83D\\uDCAC', label:'Ask the MIS \u2014 chat with your data'},
     {ep:'/dashboard', ico:'\\uD83D\\uDCCA', label:'Master dashboard \u2014 inventory + sales'},
     {ep:'/api/auth-recent', ico:'\\uD83D\\uDD11', label:'Who the bot accepted / rejected'},
+    {ep:'/api/wa-probe', ico:'\\uD83E\\uDE7A', label:'WhatsApp probe \u2014 which capability is broken'},
+    {ep:'/api/receivables?days=30', ico:'\\uD83D\\uDCC9', label:'Receivables \u2014 due, collected, usage'},
+    {ep:'/api/ccm-receipts', ico:'\\uD83E\\uDDFE', label:'CCM receipts \u2014 pending confirmation'},
     {ep:'/api/sales-feature?name=cancel&state=on', ico:'\\u2705', label:'Enable: Cancellation / refund', act:true, confirm:'Enable the cancellation + refund request flow in the sales group? It routes refunds/forego to M+S. Leave OFF if you only want booking live.'},
     {ep:'/api/sales-feature?name=cancel&state=off', ico:'\\u26D4', label:'Disable: Cancellation / refund', act:true, confirm:'Turn the cancellation flow OFF for the team?'},
     {ep:'/api/sales-feature?name=brokerage_adjust&state=on', ico:'\\u2705', label:'Enable: Brokerage adjust', act:true, confirm:'Enable brokerage set-off (moves broker commission to a target pool)? Money-moving \u2014 keep OFF unless you are supervising.'},
@@ -5782,7 +6041,26 @@ app.get('/api/pair',function(req,res){
   res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Scan QR with WhatsApp</h1><img src="'+latestQRDataUrl+'" style="width:300px"/></div></body></html>');
 });
 app.get('/api/wa-status',function(req,res){res.json({connected:waReady});});
-app.get('/api/approval-backfill',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var days=parseInt(req.query.days)||30;var commit=req.query.commit==='1'||req.query.commit==='true';var result=await buildVerdictBackfill(days,commit);res.json(result);}catch(e){res.json({error:e.message});}});
+app.get('/api/wa-probe',async function(req,res){
+  // Distinguishes a dead session from a library/WhatsApp-Web mismatch by testing
+  // each capability in isolation. Read failures with a one-letter message point at
+  // the library; a failure on getState points at the session.
+  var out={ waReady:!!waReady, hasClient:!!waClient, steps:{} };
+  async function step(name, fn){
+    try{ out.steps[name]={ ok:true, value: await fn() }; }
+    catch(e){ out.steps[name]={ ok:false, message:(e&&e.message)||String(e),
+        name:(e&&e.name)||'', frame:(e&&e.stack)?String(e.stack).split('\n')[1].trim():'' }; }
+  }
+  if(!waClient) return res.json(out);
+  await step('getState', function(){ return waClient.getState(); });
+  await step('clientInfoWid', function(){ return waClient.info && waClient.info.wid && waClient.info.wid._serialized; });
+  await step('getChats_count', async function(){ var c=await waClient.getChats(); return c.length; });
+  await step('getChatById_approvalGroup', async function(){ var c=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID); return c && c.name; });
+  await step('fetchMessages_5', async function(){ var c=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID); var m=await c.fetchMessages({limit:5}); return m.length; });
+  out.reading='If getState and clientInfoWid succeed but getChats/fetchMessages fail, the session is fine and whatsapp-web.js can no longer read the WhatsApp Web store - update the library. If getState itself fails, re-link the session.';
+  res.json(out);
+});
+app.get('/api/approval-backfill',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var days=parseInt(req.query.days)||30;var commit=req.query.commit==='1'||req.query.commit==='true';var result=await buildVerdictBackfill(days,commit);res.json(result);}catch(e){res.json(errDetail(e));}});
 app.get('/api/event-store',function(req,res){try{var s=loadEventStore();var limit=parseInt(req.query.limit)||200;var evs=s.events.slice(-limit).reverse();var counts={verdict:0,approved:0,paid:0};s.events.forEach(function(e){if(counts[e.type]!=null)counts[e.type]++;});res.json({version:s.version,createdAt:s.createdAt,totalEvents:s.events.length,counts:counts,showing:evs.length,events:evs});}catch(e){res.json({error:e.message});}});
 app.get('/api/payable-code-backfill',function(req,res){try{res.json(buildPayableCodeBackfill(req.query.commit==='1'||req.query.commit==='true'));}catch(e){res.json({error:e.message});}});
 app.get('/api/event-store-diff',async function(req,res){
@@ -5904,7 +6182,7 @@ app.get('/api/debug-replies',async function(req,res){try{if(!waReady)return res.
   res.json({count:out.length,replies:out});
 }catch(e){res.json({error:e.message});}});
 app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])));}catch(e){res.status(500).json({error:e.message});}});
-app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json(errDetail(e));}});
 app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
 app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.17',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
@@ -6209,8 +6487,29 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 .pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px}
 .pill.warn{background:rgba(196,85,77,.18);color:#e8877f}.pill.ok{background:rgba(75,168,139,.18);color:#6fc4a8}
 .load{color:var(--dim);padding:40px;text-align:center}
-.btn{background:var(--card);border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer}
+.btn{background:var(--card);border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:9px 14px;font-size:13px;cursor:pointer;min-height:40px}
 .btn:hover{border-color:var(--gold)}
+@media(max-width:760px){
+  body{padding:12px 10px;font-size:15px}
+  h1{font-size:16px}
+  .grid.g4,.grid.g3,.grid.g2{grid-template-columns:1fr 1fr}
+  .card{padding:12px}
+  .v{font-size:19px}.v.sm{font-size:15px}
+  .sec{margin-top:20px;font-size:12px}
+  table{display:block}
+  tr:first-child th{display:none}
+  table tr{display:block;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:10px;background:var(--card)}
+  table td{display:flex;justify-content:space-between;align-items:baseline;gap:12px;border:0;padding:4px 0;text-align:right}
+  table td::before{content:attr(data-l);color:var(--dim);font-size:12px;text-align:left;flex:0 0 auto}
+  table td:first-child{font-weight:600;font-size:16px;border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:4px}
+  table td:first-child::before{content:''}
+  table tr[id^=det]{background:#10152a}
+  table tr[id^=det] td{display:block;text-align:left}
+  table tr[id^=det] td::before{content:''}
+  #aiq{font-size:15px}
+  .aiRow{flex-direction:column}
+  .aiRow .btn{width:100%;justify-content:center}
+}
 </style></head><body>
 <h1>Capital Central Market \u2014 <span>Master Dashboard</span></h1>
 <div class="sub" id="ts">loading\u2026</div>
@@ -6303,13 +6602,13 @@ function renderUnits(){
     const cols=(sp.columns&&sp.columns.length)?sp.columns:['unit','customer','booked','soldOn','tsv','paid'];
     if(ai.groups&&ai.groups.length){
       let gh='<tr><th>'+(LABEL[sp.groupBy]||sp.groupBy)+'</th><th class="n">Units</th><th class="n">Sale value</th><th class="n">Paid</th><th class="n">Commission</th><th class="n">Pending</th></tr>';
-      ai.groups.forEach(g=>{ gh+='<tr><td>'+g.key+'</td><td class="n">'+g.count+'</td><td class="n">'+cr(g.tsv||0)+
-        '</td><td class="n">'+cr(g.paid||0)+'</td><td class="n">'+cr(g.bkNetComm||0)+
-        '</td><td class="n"'+((g.bkPending||0)>0?' style="color:#e8877f"':'')+'>'+cr(g.bkPending||0)+'</td></tr>'; });
+      ai.groups.forEach(g=>{ gh+='<tr><td>'+g.key+'</td><td data-l="Units" class="n">'+g.count+'</td><td data-l="Sale value" class="n">'+cr(g.tsv||0)+
+        '</td><td data-l="Paid" class="n">'+cr(g.paid||0)+'</td><td data-l="Commission" class="n">'+cr(g.bkNetComm||0)+
+        '</td><td data-l="Pending" class="n"'+((g.bkPending||0)>0?' style="color:#e8877f"':'')+'>'+cr(g.bkPending||0)+'</td></tr>'; });
       t.innerHTML=gh; window.__rows=rows; return;
     }
     let hh='<tr>'+cols.map(c=>'<th'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+(LABEL[c]||c)+'</th>').join('')+'</tr>';
-    rows.forEach(x=>{ hh+='<tr>'+cols.map(c=>'<td'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+cellVal(x,c)+'</td>').join('')+'</tr>'; });
+    rows.forEach(x=>{ hh+='<tr>'+cols.map(c=>'<td data-l="'+(LABEL[c]||c)+'"'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+cellVal(x,c)+'</td>').join('')+'</tr>'; });
     // totals for any money columns in the view
     const mcols=cols.filter(c=>MONEY_F.indexOf(c)>=0);
     if(mcols.length&&rows.length){
@@ -6330,10 +6629,12 @@ function renderUnits(){
   rows.forEach((x,i)=>{
     const bg=x.mismatch?' style="background:rgba(196,85,77,.10)"':'';
     h+='<tr'+bg+' onclick="toggleUnit('+i+')" style="cursor:pointer">'+
-       '<td>'+x.unit+'</td><td style="color:var(--dim)">'+(x.booked||'\u2014')+'</td><td>'+x.soldOn+'</td>'+
-       '<td'+(x.mismatch?' class="pill warn"':' style="color:var(--dim)"')+'>'+x.activeThen+'</td>'+
-       '<td class="n">'+cr(x.tsv)+'</td><td class="n">'+cr(x.paid)+'</td>'+
-       '<td class="n"'+((x.bkPending||0)>0?' style="color:#e8877f"':' style="color:var(--dim)"')+'>'+((x.bkPending||0)>0?cr(x.bkPending):'\u2014')+'</td></tr>';
+       '<td>'+x.unit+(x.customer&&x.customer!=='\u2014'?('<span style="font-weight:400;font-size:13px;color:var(--dim)"> \u00b7 '+x.customer+'</span>'):'')+'</td>'+
+       '<td data-l="Booked on" style="color:var(--dim)">'+(x.booked||'\u2014')+'</td>'+
+       '<td data-l="Sold on">'+x.soldOn+'</td>'+
+       '<td data-l="Active then"'+(x.mismatch?' class="pill warn"':' style="color:var(--dim)"')+'>'+x.activeThen+'</td>'+
+       '<td data-l="TSV" class="n">'+cr(x.tsv)+'</td><td data-l="Paid" class="n">'+cr(x.paid)+'</td>'+
+       '<td data-l="Bkg pending" class="n"'+((x.bkPending||0)>0?' style="color:#e8877f"':' style="color:var(--dim)"')+'>'+((x.bkPending||0)>0?cr(x.bkPending):'\u2014')+'</td></tr>';
     h+='<tr id="det'+i+'" style="display:none"><td colspan="7" style="background:#10152a;padding:12px 14px">'+detail(x)+'</td></tr>';
   });
   t.innerHTML=h; window.__rows=rows;
@@ -6423,7 +6724,7 @@ async function load(){
   if(bcKeys.length){
     h+='<div class="card" style="margin-top:12px"><table><tr><th>Config</th><th class="n">Unsold units</th><th class="n">Price each</th><th class="n">Value</th></tr>';
     bcKeys.forEach(k=>{const b=BC[k];
-      h+='<tr><td>'+k+'</td><td class="n">'+b.units+'</td><td class="n" style="color:var(--dim)">'+cr(b.unitPrice)+'</td><td class="n">'+cr(b.value)+'</td></tr>';});
+      h+='<tr><td>'+k+'</td><td data-l="Unsold units" class="n">'+b.units+'</td><td data-l="Price each" class="n" style="color:var(--dim)">'+cr(b.unitPrice)+'</td><td data-l="Value" class="n">'+cr(b.value)+'</td></tr>';});
     h+='</table></div>';
   }
 
@@ -6445,9 +6746,9 @@ async function load(){
   if(BBk.length){
     h+='<div class="card" style="margin-top:12px"><table><tr><th>Broker</th><th class="n">Units</th><th class="n">Sales value</th><th class="n">Commission</th><th class="n">Paid</th><th class="n">Pending</th></tr>';
     BBk.forEach(k=>{const b=BK.byBroker[k];
-      h+='<tr><td>'+k+'</td><td class="n">'+b.units+'</td><td class="n">'+cr(b.tsv)+'</td><td class="n">'+cr(b.entitled)+'</td>'+
-         '<td class="n" style="color:var(--dim)">'+cr(b.paid)+'</td>'+
-         '<td class="n"'+(b.pending>0?' style="color:#e8877f"':'')+'>'+cr(b.pending)+'</td></tr>';});
+      h+='<tr><td>'+k+'</td><td data-l="Units" class="n">'+b.units+'</td><td data-l="Sales value" class="n">'+cr(b.tsv)+'</td><td data-l="Commission" class="n">'+cr(b.entitled)+'</td>'+
+         '<td data-l="Paid" class="n" style="color:var(--dim)">'+cr(b.paid)+'</td>'+
+         '<td data-l="Pending" class="n"'+(b.pending>0?' style="color:#e8877f"':'')+'>'+cr(b.pending)+'</td></tr>';});
     h+='</table></div>';
   }
 
@@ -6460,7 +6761,7 @@ async function load(){
   if(d.soldWithoutList) h+=' <span style="color:var(--dim);font-size:12px">\u00b7 '+d.soldWithoutList+' with no list set (plots / manual)</span>';
   h+='<div class="card" style="margin-top:10px">'+
      '<div style="font-size:12px;color:var(--dim);margin-bottom:8px">Ask for any cut of this data \u2014 e.g. \u201cunits sold below the active list, biggest gap first\u201d, \u201cbrokerage owed by broker\u201d, \u201cfloors booked in 2025 with balance over 50 lakh\u201d</div>'+
-     '<div style="display:flex;gap:8px"><input id="aiq" placeholder="Describe the report you want\u2026" '+
+     '<div class="aiRow" style="display:flex;gap:8px"><input id="aiq" placeholder="Describe the report you want\u2026" '+
        'style="flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--ink);padding:9px 12px;font-size:13px">'+
      '<button class="btn" style="background:var(--gold);color:#0E1220;border-color:var(--gold);font-weight:600" onclick="askAI()">Build</button>'+
      '<button class="btn" onclick="clearAI()">Reset</button></div>'+
@@ -6478,7 +6779,7 @@ async function load(){
   // by tower
   h+='<div class="sec">By tower</div><div class="card"><table><tr><th>Tower</th><th class="n">Sold</th><th class="n">Sales value</th><th class="n">Collected</th><th class="n">Collection</th></tr>';
   Object.keys(d.byTower).sort().forEach(k=>{const t=d.byTower[k];
-    h+='<tr><td>'+k+'xx</td><td class="n">'+t.sold+'</td><td class="n">'+cr(t.tsv)+'</td><td class="n">'+cr(t.paid)+'</td><td class="n">'+pct(t.paid,t.tsv)+'%<div class="bar"><i style="width:'+pct(t.paid,t.tsv)+'%"></i></div></td></tr>';});
+    h+='<tr><td>Tower '+k+'xx</td><td data-l="Sold" class="n">'+t.sold+'</td><td data-l="Sales value" class="n">'+cr(t.tsv)+'</td><td data-l="Collected" class="n">'+cr(t.paid)+'</td><td data-l="Collection" class="n">'+pct(t.paid,t.tsv)+'%<div class="bar"><i style="width:'+pct(t.paid,t.tsv)+'%"></i></div></td></tr>';});
   h+='</table></div>';
 
   // plot vs floor
@@ -6664,6 +6965,236 @@ app.get('/api/auth-unbind',function(req,res){
     res.json({ok:true,removed:jid,map:LID_MAP});
   }catch(e){ res.json({ok:false,error:e.message}); }
 });
+// ── SITE FLOAT: PDC held at the Capital site with Umesh ───────────────────────
+// Site payments are made in PDC only. The pool is tracked as an account so the
+// existing Fund Position machinery (opening / in / out / closing / cheques)
+// picks it up with no new plumbing. A payment "direct from site" is one whose
+// account is Capital Site PDC.
+var SITE_ACCOUNTS=['Capital Site PDC'];
+function isSiteAccount(acct){
+  var a=String(acct||'').trim().toLowerCase();
+  return SITE_ACCOUNTS.some(function(s){ return s.toLowerCase()===a; });
+}
+// Site float position from the ledger: what came into the site pools, what was
+// paid out of them, and therefore what Umesh should be holding right now.
+async function buildSiteFloat(days){
+  days=Math.max(1,Math.min(365,parseInt(days,10)||30));
+  var end=new Date(), start=new Date(Date.now()-days*86400000);
+  var entries=await getLedgerRange(start,end);
+  var pdcIn=0, pdcOut=0, outRows=[], inRows=[];
+  var siteOut=0, officeOut=0;
+  entries.forEach(function(e){
+    var site=isSiteAccount(e.bankAC);
+    if(e.inOut==='OUT'){ if(site){ siteOut+=e.amount; pdcOut+=e.amount; outRows.push(e); } else officeOut+=e.amount; }
+    else if(site && e.inOut==='IN'){ pdcIn+=e.amount; inRows.push(e); }
+    else if(site && e.inOut==='TRANSFER'){ pdcOut+=e.amount; outRows.push(e); }   // handed over / deposited
+  });
+  return { windowDays:days,
+    pdc:{ received:pdcIn, paidOut:pdcOut, holding:pdcIn-pdcOut,
+          receipts:inRows.length, payments:outRows.length },
+    split:{ siteOut:siteOut, officeOut:officeOut,
+            sitePct:(siteOut+officeOut)>0?Math.round(siteOut/(siteOut+officeOut)*100):0 },
+    recentSitePayments:outRows.sort(function(a,b){ return (b.date||'')<(a.date||'')?-1:1; }).slice(0,25)
+      .map(function(e){ return {date:e.date,desc:e.description,head:e.head,mode:e.mode,amount:e.amount}; })
+  };
+}
+// ── RECEIVABLES: what is due per unit, and how collections are eating into it ──
+// Joins three books: the tracker's per-unit balances (payable / paid / balance),
+// the ledger's unit-tagged IN rows (what the accountant actually logged against
+// each unit), and where that money went (site PDC vs office accounts).
+// ── CCM RECEIPT CONFIRMATION ────────────────────────────────────────────────
+// An inflow logged against a CCM unit writes to the Ledger immediately (money
+// arrived), then posts a confirmation card to the capital group. Umesh or Gautam
+// reply "yes <unit>" and only then does it post to that unit's cover. The pending
+// list IS the reconciliation - nothing syncs silently.
+var RECEIPT_STORE='./wa_auth/ccm_receipts.json';
+var RECEIPT_CONFIRMERS=['919873574180','919773592304'];   // Umesh, Gautam
+function isCcmUnit(u){ return /^[0-9]{2,4}[A-Z]?(\s*\([^)]*\))?-(GF|FF|SF|TF|PLOT)$/i.test(String(u||'').trim()); }
+function loadReceipts(){ try{ return JSON.parse(fs.readFileSync(RECEIPT_STORE,'utf8'))||{items:{},seq:{}}; }
+  catch(e){ return {items:{},seq:{}}; } }
+function saveReceipts(s){ try{ fs.mkdirSync('./wa_auth',{recursive:true});
+  fs.writeFileSync(RECEIPT_STORE,JSON.stringify(s,null,2)); }catch(e){ console.log('[Receipt] save failed:',e.message); } }
+function mintReceiptId(store){
+  var d=new Date(), ist=new Date(d.getTime()+19800000);
+  var day=ist.toISOString().slice(2,10).replace(/-/g,'');
+  store.seq=store.seq||{}; store.seq[day]=(store.seq[day]||0)+1;
+  return 'R-'+day+'-'+('00'+store.seq[day]).slice(-3);
+}
+function receiptCard(r){
+  return ['\ud83d\udcb0 *RECEIPT TO CONFIRM* \u2014 '+r.unit,
+    '```',
+    'Amount   '+formatINR(r.amount),
+    'Mode     '+r.mode+(/cash|pdc/i.test(r.mode)?'  \u2192 cash column':'  \u2192 cheque column'),
+    'Date     '+r.date,
+    'From     '+(r.payer||'\u2014'),
+    'Into     '+(r.account||'\u2014'),
+    '```',
+    'Logged in the Ledger already. Reply *yes '+r.unit+'* to post it to the unit\u2019s cover,',
+    'or *no '+r.unit+'* if the unit is wrong.',
+    '_'+r.receiptId+'_'].join('\n');
+}
+// called from the inflow flow right after the ledger row is written
+async function raiseCcmReceipt(o){
+  if(!isCcmUnit(o.unit)) return null;                       // Vrindavan etc. stop at the ledger
+  var store=loadReceipts();
+  var rid=mintReceiptId(store);
+  var rec={ receiptId:rid, unit:String(o.unit).trim().toUpperCase(), amount:Number(o.amount)||0,
+            mode:o.mode||'', date:o.date||'', payer:o.payer||'', account:o.account||'',
+            entity:o.entity||'', status:'pending', raisedBy:o.raisedBy||'', at:Date.now(),
+            ledgerRow:o.ledgerRow||null };
+  store.items[rid]=rec; saveReceipts(store);
+  try{
+    var m=await waClient.sendMessage(CONFIG.CAPITAL_APPROVAL_JID||CONFIG.APPROVAL_GROUP_JID, receiptCard(rec));
+    rec.msgId=m&&m.id&&m.id._serialized; store.items[rid]=rec; saveReceipts(store);
+  }catch(e){ console.log('[Receipt] could not post card:',e.message); }
+  return rec;
+}
+// post a confirmed receipt onto the cover (tracker call is idempotent by receiptId)
+async function postReceiptToCover(rec){
+  var url=process.env.TRACKER_API_URL, secret=process.env.TRACKER_API_SECRET;
+  if(!url) return {ok:false,error:'TRACKER_API_URL not set'};
+  var r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},
+    body:JSON.stringify({secret:secret,action:'receipt',receiptId:rec.receiptId,
+      unit:rec.unit,amount:rec.amount,mode:rec.mode,date:rec.date,source:'inflow-group'})});
+  var txt=await r.text();
+  try{ return JSON.parse(txt); }catch(e){ return {ok:false,error:'tracker did not return JSON: '+txt.slice(0,150)}; }
+}
+// "yes <unit>" / "no <unit>" / "pending receipts" in the capital group
+async function handleCcmReceiptReply(msg, senderPhone){
+  var body=String(msg.body||'').trim();
+  var store=loadReceipts();
+  if(/^pending\s+receipts?$/i.test(body)){
+    var p=Object.keys(store.items).map(function(k){return store.items[k];})
+           .filter(function(x){return x.status==='pending';})
+           .sort(function(a,b){return a.at-b.at;});
+    if(!p.length){ await msg.reply('No receipts awaiting confirmation.'); return true; }
+    var lines=['*RECEIPTS AWAITING CONFIRMATION* ('+p.length+')',''];
+    p.forEach(function(x){
+      var hrs=Math.round((Date.now()-x.at)/3600000);
+      lines.push('\u2022 '+x.unit+'  '+formatINR(x.amount)+'  '+x.mode+'  \u00b7 '+(hrs<1?'just now':hrs+'h ago')+'  ('+x.receiptId+')');
+    });
+    lines.push('','Reply *yes <unit>* to post one to its cover.');
+    await msg.reply(lines.join('\n')); return true;
+  }
+  var m=body.match(/^(yes|no)\s+([0-9]{2,4}[A-Z]?(?:\s*\([^)]*\))?-(?:GF|FF|SF|TF|PLOT))$/i);
+  if(!m) return false;
+  var verdict=m[1].toLowerCase(), unit=m[2].trim().toUpperCase();
+  if(RECEIPT_CONFIRMERS.indexOf(senderPhone)<0){
+    await msg.reply('Only Umesh or Gautam can confirm receipts.'); return true;
+  }
+  var pend=Object.keys(store.items).map(function(k){return store.items[k];})
+          .filter(function(x){return x.unit===unit && x.status==='pending';})
+          .sort(function(a,b){return a.at-b.at;})[0];
+  if(!pend){
+    var already=Object.keys(store.items).map(function(k){return store.items[k];})
+      .filter(function(x){return x.unit===unit && x.status==='posted';}).pop();
+    await msg.reply(already
+      ? ('Nothing pending for '+unit+'. The last one ('+already.receiptId+', '+formatINR(already.amount)+') was already posted.')
+      : ('No pending receipt for '+unit+'.'));
+    return true;
+  }
+  if(verdict==='no'){
+    pend.status='rejected'; pend.rejectedBy=senderPhone; pend.rejectedAt=Date.now();
+    saveReceipts(store);
+    await msg.reply('\u274c '+pend.receiptId+' not posted to '+unit+'. The Ledger row stands \u2014 re-raise it against the right unit.');
+    return true;
+  }
+  var out=await postReceiptToCover(pend);
+  if(!out||!out.ok){
+    await msg.reply('\u26a0\ufe0f Could not post '+pend.receiptId+' to '+unit+': '+((out&&out.error)||'unknown error')+
+      '\nIt stays pending \u2014 reply *yes '+unit+'* to try again.');
+    return true;
+  }
+  pend.status='posted'; pend.postedAt=Date.now(); pend.postedBy=senderPhone;
+  pend.result={tranches:out.tranchesFilled,balanceAfter:out.balanceAfter,duplicate:!!out.duplicate};
+  saveReceipts(store);
+  if(out.duplicate){ await msg.reply('\u2713 '+pend.receiptId+' was already on the cover \u2014 nothing written twice.'); return true; }
+  await msg.reply(['\u2705 Posted to '+unit,'```',
+    'Receipt   '+formatINR(pend.amount)+' ('+out.column+')',
+    'Filled    '+(out.tranchesFilled||[]).join(' | '),
+    'Paid now  '+formatINR(out.paidToDate),
+    'Balance   '+formatINR(out.balanceAfter),
+    '```'].join('\n'));
+  return true;
+}
+app.get('/api/ccm-receipts',function(req,res){
+  var s=loadReceipts();
+  var all=Object.keys(s.items).map(function(k){return s.items[k];}).sort(function(a,b){return b.at-a.at;});
+  res.json({ pending:all.filter(function(x){return x.status==='pending';}),
+             posted:all.filter(function(x){return x.status==='posted';}).slice(0,50),
+             rejected:all.filter(function(x){return x.status==='rejected';}).slice(0,25),
+             confirmers:RECEIPT_CONFIRMERS,
+             note:'Inflows against CCM units post to the capital group for Umesh/Gautam to confirm before they reach the cover.' });
+});
+
+async function buildReceivables(days){
+  days=Math.max(1,Math.min(365,parseInt(days,10)||30));
+  var dash=await fetchDashboard();
+  if(!dash||!dash.ok) return {ok:false,error:(dash&&dash.error)||'dashboard data unavailable'};
+  var units=dash.units||[];
+  if(!units.length) return {ok:false,error:'No unit rows in the dashboard cache. Run buildDashboardCache.'};
+
+  var end=new Date(), start=new Date(Date.now()-days*86400000);
+  var entries=await getLedgerRange(start,end);
+
+  // collections in the window, keyed by unit where the row carries [unit:...]
+  var collected={}, untagged=0, untaggedRows=[], siteIn=0, officeIn=0;
+  entries.forEach(function(e){
+    if(e.inOut!=='IN') return;
+    var u=unitFromNotes(e.notes);
+    if(isSiteAccount(e.bankAC)) siteIn+=e.amount; else officeIn+=e.amount;
+    if(!u){ untagged+=e.amount; if(untaggedRows.length<25) untaggedRows.push({date:e.date,desc:e.description,amount:e.amount,tag:e.tag}); return; }
+    var c=collected[u]=collected[u]||{amount:0,rows:[]};
+    c.amount+=e.amount;
+    c.rows.push({date:e.date,amount:e.amount,mode:e.mode,into:e.bankAC,tag:e.tag});
+  });
+
+  // per-unit position from the tracker, enriched with this window's collections
+  var rows=[], totPayable=0, totPaid=0, totOutstanding=0, collectedInWindow=0;
+  units.forEach(function(u){
+    var payable=Number(u.payable)||0, paid=Number(u.paid)||0;
+    var bal=Number(u.balance)|| (payable>paid?payable-paid:0);
+    var c=collected[u.unit];
+    totPayable+=payable; totPaid+=paid; totOutstanding+=bal;
+    if(c) collectedInWindow+=c.amount;
+    rows.push({unit:u.unit, customer:u.customer||'\u2014', broker:u.broker||'',
+               payable:payable, paidToDate:paid, outstanding:bal,
+               collectedInWindow:c?c.amount:0, receipts:c?c.rows.length:0,
+               pctCollected: payable>0?Math.round(paid/payable*100):0});
+  });
+  rows.sort(function(a,b){ return b.outstanding-a.outstanding; });
+
+  // ledger rows tagged to a unit the tracker does not know about
+  var known={}; units.forEach(function(u){ known[u.unit]=true; });
+  var orphan=Object.keys(collected).filter(function(u){ return !known[u]; })
+              .map(function(u){ return {unit:u, amount:collected[u].amount}; });
+
+  return { ok:true, windowDays:days,
+    totals:{ payable:totPayable, paidToDate:totPaid, outstanding:totOutstanding,
+             collectedInWindow:collectedInWindow,
+             pctCollected: totPayable>0?Math.round(totPaid/totPayable*100):0 },
+    usage:{ intoSitePDC:siteIn, intoOfficeAccounts:officeIn,
+            sitePct:(siteIn+officeIn)>0?Math.round(siteIn/(siteIn+officeIn)*100):0 },
+    untaggedCollections:{ amount:untagged, rows:untaggedRows,
+      note:'IN rows with no [unit:...] tag - logged before the unit question existed, or answered "none".' },
+    orphanUnits:orphan,
+    topOutstanding:rows.filter(function(r){ return r.outstanding>0; }).slice(0,30),
+    movers:rows.filter(function(r){ return r.collectedInWindow>0; })
+             .sort(function(a,b){ return b.collectedInWindow-a.collectedInWindow; }).slice(0,30),
+    units:rows };
+}
+app.get('/api/receivables',async function(req,res){
+  try{ res.json(await buildReceivables(req.query.days||30)); }
+  catch(e){ res.json({ok:false,error:e.message}); }
+});
+// ── CCM RECEIPT CONFIRMATION ─────────────────────────────────────────────────
+// An inflow logged against a CCM unit writes the ledger row immediately (money
+// arrived), then posts a confirmation card to the capital group. Umesh or Gautam
+// confirms, and only then is it written onto the unit's cover. Unconfirmed
+app.get('/api/site-float',async function(req,res){
+  try{ res.json(await buildSiteFloat(req.query.days||30)); }
+  catch(e){ res.json({error:e.message}); }
+});
 app.get('/api/auth-recent',function(req,res){
   res.json({note:'Most recent DM auth decisions, newest first. A REJECT means the bot silently ignored that message.',
     whitelist:{accountants:CONFIG.ACCOUNTANT_PHONES, mm:CONFIG.MM_PHONE, sm:CONFIG.SM_PHONE,
@@ -6732,7 +7263,7 @@ app.get('/api/stale-scan',async function(req,res){try{if(!waReady)return res.jso
 app.get('/api/stale-state',function(req,res){try{res.json(loadStaleState());}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-reset',function(req,res){try{saveStaleState({reminded:{}});res.json({success:true,message:'Stale reminder state cleared - next scan will re-send any 30+ min pending items'});}catch(e){res.json({error:e.message});}});
 app.get('/api/eod-send',async function(req,res){try{var r=await sendEODReport(req.query.date);res.json(r);}catch(e){res.json({error:e.message});}});
-app.get('/api/eod-preview',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var audit=await buildApprovalAudit(30);var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);var dayOfWeek=new Date(d).getDay();var isFriday=req.query.friday==='1'||dayOfWeek===5;var weekStats=isFriday?computeWeeklyMatcherStats():null;res.send(buildEODReportHTML({date:d,audit:audit,rec:rec,outliers:outliers,isFriday:isFriday,weekStats:weekStats}));}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/eod-preview',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var audit=await buildApprovalAudit(30);var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);var dayOfWeek=new Date(d).getDay();var isFriday=req.query.friday==='1'||dayOfWeek===5;var weekStats=isFriday?computeWeeklyMatcherStats():null;res.send(buildEODReportHTML({date:d,audit:audit,rec:rec,outliers:outliers,isFriday:isFriday,weekStats:weekStats}));}catch(e){res.status(500).json(errDetail(e));}});
 app.get('/api/eod-image',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var audit=await buildApprovalAudit(30);var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);var dayOfWeek=new Date(d).getDay();var isFriday=req.query.friday==='1'||dayOfWeek===5;var weekStats=isFriday?computeWeeklyMatcherStats():null;var html=buildEODReportHTML({date:d,audit:audit,rec:rec,outliers:outliers,isFriday:isFriday,weekStats:weekStats});var img=await htmlToImage(html,460,2000);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/match-cache',function(req,res){try{res.json(loadMatchCache());}catch(e){res.json({error:e.message});}});
 app.get('/api/match-cache-clear',function(req,res){try{saveMatchCache({matches:{},rejected:{},manualPaid:{}});res.json({success:true});}catch(e){res.json({error:e.message});}});
