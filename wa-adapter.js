@@ -139,6 +139,10 @@ class Client extends EventEmitter {
 
   async initialize(){
     var self=this;
+    if(this._wpp){                      // already have a live session — re-announce, don't re-create
+      console.log('[adapter] initialize() called again; reusing existing session');
+      this._ready=true; self.emit('ready'); return this;
+    }
     // wwebjs fires qr→authenticated→ready; reproduce that ordering.
     this._wpp = await wppconnect.create({
       session: 'fidato-mis',
@@ -186,8 +190,15 @@ class Client extends EventEmitter {
     // conflict/logout while running
     if(this._wpp.onStateChange){
       this._wpp.onStateChange(function(st){
-        if(st==='CONFLICT'||st==='UNLAUNCHED'||st==='UNPAIRED'||st==='UNPAIRED_IDLE')
+        // v2.12.3: only a genuine unpair/conflict counts. Transient states used to
+        // flip waReady false on a perfectly live session, which silenced every
+        // handler and stuck /api/pair on "Waiting for QR".
+        if(st==='CONFLICT'||st==='UNPAIRED'||st==='UNPAIRED_IDLE'){
+          console.log('[adapter] genuine disconnect state:', st);
           self.emit('disconnected', st);
+        } else {
+          console.log('[adapter] state change (not a disconnect):', st);
+        }
       });
     }
 
