@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.12.2-wpp-qrfix';
+var SERVER_VERSION='2.12.3-wpp-ready';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -6152,8 +6152,46 @@ load();
 loadLog();
 </script>
 </body></html>`;
+// ── v2.12.3: waReady SELF-HEAL ───────────────────────────────────────────────
+// waReady gates every message handler (`if(!waReady) return false`) and /api/pair.
+// It is set by the 'ready' event alone, so a missed or out-of-order event leaves a
+// perfectly working session looking dead: commands ignored, /api/pair stuck on
+// "Waiting for QR". This reconciles the flag against the actual connection every
+// 30s, in BOTH directions, so no single missed event can strand the bot again.
+var _readyHealTimer = null;
+async function reconcileWaReady(){
+  try{
+    if(!waClient) return;
+    var st = await waClient.getState().catch(function(){ return null; });
+    var live = (st==='CONNECTED' || st==='MAIN' || st==='NORMAL');
+    if(live && !waReady){
+      waReady = true; latestQR = null; latestQRDataUrl = null;
+      console.log('[WA] self-heal: session is live but waReady was false — corrected to READY');
+    } else if(!live && waReady && st){
+      waReady = false;
+      console.log('[WA] self-heal: state is', st, '— marking not ready');
+    }
+  }catch(e){ /* never let the healer throw */ }
+}
+function startReadyHeal(){
+  if(_readyHealTimer) return;
+  _readyHealTimer = setInterval(reconcileWaReady, 30000);
+  setTimeout(reconcileWaReady, 8000);   // first check shortly after boot
+}
+// Manual trigger, for when you don't want to wait 30s.
+app.get('/api/wa-ready-check',async function(req,res){
+  var before = waReady;
+  await reconcileWaReady();
+  var st = waClient ? await waClient.getState().catch(function(){return null;}) : null;
+  res.json({ before:before, after:waReady, state:st,
+    note: waReady ? 'Bot is READY — commands and /api/pair will behave normally.'
+                  : 'Still not ready. If state is null the browser is not connected; re-pair at /api/pair.' });
+});
 app.get('/api/pair',function(req,res){
   if(waReady)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:#0f0">WhatsApp Connected</h1></body></html>');
+  // v2.12.3: no QR yet AND no stored one? The session may actually be live and the
+  // flag stale — reconcile before telling the user to keep waiting.
+  if(!latestQRDataUrl){ reconcileWaReady(); }
   if(!latestQRDataUrl)return res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><h1 style="color:white">Waiting for QR...</h1></body></html>');
   res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Scan QR with WhatsApp</h1><img src="'+latestQRDataUrl+'" style="width:300px"/></div></body></html>');
 });
@@ -7559,8 +7597,9 @@ cron.schedule('0 19 * * *',function(){
 // ── Startup ──────────────────────────────────────────────────────────────────
 initGoogleSheets();
 createWhatsAppClient();
+startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.12.2-wpp-qrfix | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.12.3-wpp-ready | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
