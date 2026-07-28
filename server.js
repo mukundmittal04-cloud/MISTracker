@@ -125,10 +125,28 @@ function clearStaleChromiumLocks() {
 }
 function createWhatsAppClient() {
   clearStaleChromiumLocks();
-  waClient = new Client({
+  // ── WhatsApp Web version pin ────────────────────────────────────────────────
+  // WhatsApp Web ships new bundles continuously. whatsapp-web.js reads WA Web's
+  // internal Store via page.evaluate(); when WA Web changes its internals faster
+  // than the library, those reads throw a MINIFIED variable name (e.g. "r") from
+  // inside ExecutionContext.#evaluate. The session stays CONNECTED and
+  // authenticated - only Store reads (getChats / getChatById / fetchMessages) and
+  // sends break. Restarting does not help because nothing is wrong with the session.
+  //
+  // Pinning WA Web to a build the installed library understands is the fix.
+  // Set WA_WEB_VERSION_URL in Railway to try a different build without a deploy.
+  var _waVerUrl = process.env.WA_WEB_VERSION_URL || '';
+  var _clientOpts = {
     authStrategy: new LocalAuth({ dataPath: './wa_auth' }),
     puppeteer: { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-accelerated-2d-canvas','--no-first-run','--no-zygote','--single-process','--disable-gpu','--disable-extensions'] },
-  });
+  };
+  if(_waVerUrl){
+    _clientOpts.webVersionCache = { type:'remote', remotePath:_waVerUrl };
+    console.log('[WA] pinning WhatsApp Web build:', _waVerUrl);
+  } else {
+    console.log('[WA] no WA_WEB_VERSION_URL set - using whatever build WhatsApp Web serves. If Store reads start throwing single-letter errors, pin a build.');
+  }
+  waClient = new Client(_clientOpts);
   waClient.on('qr', function(qr) { latestQR = qr; qrcode.toDataURL(qr, function(err, url) { if (!err) latestQRDataUrl = url; }); console.log('QR generated.'); });
   waClient.on('ready', function() { waReady = true; latestQR = null; latestQRDataUrl = null; console.log('WhatsApp ready!'); });
   waClient.on('authenticated', function() { console.log('WhatsApp authenticated.'); });
@@ -5511,7 +5529,15 @@ function buildPayableCodeBackfill(commit){
   return { totalApproved:approved.length, alreadyCoded:approved.length-toCode.length, toAssign:toCode.length, committed:!!commit, assigned:assigned };
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){res.json({status:'ok',version:SERVER_VERSION,whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){
+  // whatsapp:'connected' only means the session authenticated. It does NOT mean the
+  // bot can read or send - Store reads can be broken while the session is fine.
+  // waStoreOk is the honest signal: it probes one cheap Store read.
+  var lib='unknown';
+  try{ lib=require('whatsapp-web.js/package.json').version; }catch(e){}
+  res.json({status:'ok',version:SERVER_VERSION,whatsapp:waReady?'connected':'disconnected',
+    waLibVersion:lib, waWebPin:process.env.WA_WEB_VERSION_URL||'(none)',
+    sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
