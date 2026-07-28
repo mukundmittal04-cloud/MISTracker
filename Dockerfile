@@ -1,10 +1,12 @@
 # Fidato MIS Tracker — Dockerfile for Railway
-# Provides Chromium + all deps needed by Puppeteer (image rendering)
-# AND whatsapp-web.js (which also uses Puppeteer internally).
+# v2.12.0 — engine migrated from whatsapp-web.js to WPPConnect (via wa-adapter.js).
+# Provides system Chromium + the libraries it needs, used by BOTH:
+#   - puppeteer (report/dashboard image rendering)
+#   - WPPConnect (WhatsApp session)
 
 FROM node:20-slim
 
-# Install Chromium and the libraries it needs to run headless
+# Chromium and its runtime libraries for headless operation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     fonts-liberation \
@@ -36,27 +38,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxshmfence1 \
     libxss1 \
     libxtst6 \
+    libasound2 \
     ca-certificates \
     wget \
-    --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
-# Tell Puppeteer to use the system Chromium (don't try to download its own)
+# Use the system Chromium; never download a private copy.
+# wa-adapter.js reads PUPPETEER_EXECUTABLE_PATH and passes it to WPPConnect.
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_SKIP_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    CHROME_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
-# Install dependencies
+# Install dependencies.
+# NOTE: --omit=optional was REMOVED — WPPConnect needs optional deps to launch.
 COPY package.json ./
-RUN npm install --omit=optional --no-fund --no-audit
+RUN npm install --no-fund --no-audit
 
-# Copy app source
+# Copy app source (server.js, wa-adapter.js, sales.js, dashboard.html, ...)
 COPY . .
 
-# Railway sets PORT
-# Build cache bust: 1783591460
+# Railway injects PORT
+# Build cache bust: 2026-07-28-v2.12.0-wpp
 ENV NODE_ENV=production
 EXPOSE 3000
 
