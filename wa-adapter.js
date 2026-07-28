@@ -144,8 +144,12 @@ class Client extends EventEmitter {
       session: 'fidato-mis',
       folderNameToken: './wa_auth/wpp-tokens',     // on the Railway volume; /api/wa-reset wipes it too
       catchQR: function(_b64, _ascii, _att, urlCode){
-        // server.js runs qrcode.toDataURL(qr) — needs the RAW string, which is urlCode
-        self.emit('qr', urlCode||_b64);
+        // server.js renders this. Prefer the RAW payload (urlCode) which encodes to a
+        // proper QR; fall back to the pre-rendered PNG, which server.js now detects
+        // and shows directly rather than trying to re-encode.
+        var payload = urlCode || _b64;
+        console.log('[adapter] QR captured (attempt '+(_att||1)+') via '+(urlCode?'urlCode':'base64 image')+', len '+String(payload||'').length);
+        self.emit('qr', payload);
       },
       statusFind: function(st){
         if(st==='qrReadSuccess'||st==='isLogged') self.emit('authenticated');
