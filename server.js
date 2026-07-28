@@ -1,5 +1,5 @@
 // ============================================================
-// FIDATO MIS SERVER v2.11.0-s6.14-dashboard - APPROVAL DIGEST: 3 SEPARATE MESSAGES + HIDE ALREADY-DONE. buildApprovalReminderDigest now returns {messages:[...]} - up to THREE messages posted to the capital approval group: "APPROVALS NEEDED - M" (S already approved, mentions M only), "APPROVALS NEEDED - S" (M approved, mentions S only), and "APPROVALS NEEDED - M & S" (neither yet, mentions both). Empty buckets are not posted. Numbering is CONTINUOUS across the three so a reply "5 yes" still maps; sendApprovalReminderDigest posts each, tags each items msgId, and saves one digest_map with msgIds[] so a bare verdict quoting any one message applies only to that messages slice. NEW filter alreadyDone(e) drops entries that are already fully approved (findApprovedEvent), already paid (paidStatsForItem>0), or are the bots own "Approved (M+S)" confirmation echo (regex on label) - so paid/approved items no longer pollute the pending list. Held items fold into whichever bucket still needs that persons yes, tagged (on hold). Preview .text kept (messages joined). Offline-tested. Prior: v2.11.0-s6.7 - OUTFLOW SUMMARY SHOWS APPROVED-BUT-UNPOSTED + EVENT-STORE-SOURCED CATCH-UP. buildPaymentsSummary adds a third pass over event-store approved events with no posted record and no paid event (mirrors the s6.3 buildOutflowLog pass) so the in-group summary is the COMPLETE approved universe, not just posted (pp.recent) items. Capital-IN raises are excluded NARROWLY via isCapitalInflowLabel (/contribution of rs|inr|rupee/) so a mis-posted "MM/SM Contribution of Rs 2.28 Crore" never shows as a payable outflow, while a contribution REPAYMENT ("SM EXCESS contribution old" = paid back to SM) correctly STAYS in the payments list. Approved-but-unposted items listed in the summary are now payable by number: the bare-number handler synthesizes+registers a posted record from the approved event when none exists. The one-time catch-up (catchUpApprovedToOutflow) is RE-SOURCED from the event store (new listApprovedFromEventStore) instead of the lossy chat-history audit (listApprovedForOutflow), so the approved-but-unposted backlog clears in one run. Diagnosis: approvals were recorded but never bridged because OUTFLOW_POST_ENABLED was OFF; the summary read only posted items so approved-unposted were invisible; the old catch-up re-derived approved from chat history (saw only 7) so it never reached the ~30 stranded. Toggle now ON; this patch surfaces + clears the rest. Offline-tested. Prior: v2.11.0-s6.6 - PROMOTER CONTRIBUTION ACCOUNTS. The inflow group now recognises a CONTRIBUTION (MM/SM putting money into a company) as a third kind alongside inflow/transfer. parseInflowOpening routes to 'contribution' when a contribution word (contribution/capital/put in/infused/invested) is present OR the promoter (MM/SM by token or name) is the named source; a plain "drawing" is never a contribution. New IO step 'promoter' asks MM or SM if it wasn't parsed from the line. On confirm it writes an IN row (Person=promoter, tag "Promoter Contribution") AND records a 'contribution' event {promoter,entity,amount,date}. Outflow side: when a paid item's label is a contribution repayment (detectContributionRepayment = a repay/return/payback verb + MM/SM, or an explicit contribution/capital context; "MM Drawing" is excluded), the paid flow also records a 'contrepay' event that knocks it off that promoter's account. buildContributionStatement nets contributions(+) - repayments(-) per promoter, capturing a SILENT per-entity breakdown (byEntity) while the headline is the combined figure (Option A: personal drawings are NOT subtracted). Read it in the inflow group with "MM account" / "SM account" / "contributions", or GET /api/contributions. Offline-tested: 54 assertions (routing / prefill / row / repayment-detect / statement-math + full contribution flow + inflow regression). Prior: v2.11.0-s6.5 - NATURAL INFLOW/TRANSFER TRIGGERS. parseInflowOpening no longer requires the keyword to be the FIRST word; it fires on intent in ANY word order, gated by a money-like amount so chatter never logs. Triggers only when the message has a real amount (a unit lakh/lac/lk/cr/k/l, an Rs/INR/rupees marker, or magnitude >= 1000) AND an intent signal -> transfer if a transfer verb (transfer/trf/tfr/moved/shifted) OR an account->account "from X to Y" (both resolve to accounts), else inflow if an inflow verb (received/recd/rcvd/got/credited/deposited/inflow/collected/collection/came in) OR a "from <payer>" / "by <payer>". So "5 lakh received from Rajesh", "got 5L from Rajesh", "5L from Rajesh", "credited 250000 from ABC" all log now, while "ok" / "thanks" / "got it 100%" / "call me at 5" / "received the documents" stay silent. parseRoughAmount now also reads "5L"/"5 L" as 5 lakh (added l/lk units with a word-boundary guard so 5kg/5liters are not misread). Slot pre-fill (amount/mode/payer/into-acct/from-acct/to-acct) unchanged, just order-independent. Offline-tested (39 assertions). Prior: v2.11.0-s6.4 - QUIET SINGLE VERDICTS. A lone promoter YES no longer posts a group receipt (the old "recorded M's approval" line read like the expense was already fully approved). New perVerdictNotice(v,who,label,amount): YES -> null (silent; only the combined "Approved (M+S)" line announces it, and that already fires solely when BOTH M+S are yes); NO -> posts "rejected by <who>"; HOLD -> posts "put on hold by <who>". The main verdict branch calls it; the re-approval branch drops its lone receipt too (its own rejection + both-yes lines already cover it). The M+S approval GATE is UNCHANGED — approved events still mint only on both-yes, so nothing is treated as approved on a single verdict. Offline-tested (5 assertions). Prior: v2.11.0-s6.3 - DASHBOARD MARK-PAID (manual reconciliation). The Payments-log dashboard (/api/outflow-log) now lists the COMPLETE approved universe: buildOutflowLog adds a third pass over event-store 'approved' events with no posted record and no paid event, surfaced as status 'approved' (purple pill) so approved-but-unposted items appear alongside posted/part-paid/paid/closed. Each row with a balance (approved/posted/part-paid, not closed, not fully paid) gets a green Mark-paid button -> GET /api/paid-mark?id=...[&amount=...] -> markItemPaid(): records a 'paid' event for the remaining balance (mode 'Manual', date IST today), NO ledger write (a books-reconciliation mark, not a disbursement), reversible via the existing Mark-unpaid (/api/paid-undo). Optional &amount records a partial (capped at balance). Lets M tick every approved/pending item against his books once and start the live tracking afresh. Offline-tested: 22 assertions (full / partial / over-cap / closed / already-paid / approved-unposted + pending-row surfacing). Prior: v2.11.0-s6.2 - PAYABLE CODE (stage 2c+2d): AMOUNT-STEP 3-WAY BRANCH + OVER-APPROVAL RE-APPROVAL. paidFlowAdvance amount step now splits on typed amount vs remaining balance: == balance settles as before; < balance asks part-vs-reduced (new 'partask' step: 1=part payment rest still due; 2=final/reduced -> sets session.closeAfter so the outer handler recordClosedEvent's the item and writes off the unpaid remainder, no ledger row for the write-off); > balance is BLOCKED (no answers.amount, no write) and routed to a pick-list reason (new 'overreason' step over REAPPROVAL_REASONS = Price revised / Extra work / GST taxes / Measurement change / Other; Other -> 'overnote' free-text), then reapprovalSignalFrom packages {itemId,code,label,approved,paidSoFar,balance,thisInstalment,attempted=paidSoFar+thisInstalment,reason,isFinal=paidSoFar>0}. Outer handlePaidFlow, on out.reapproval, posts buildReapprovalMessage (two auto-selected variants: fresh/mid-stream shows approved/now-being-paid/increase; final-instalment shows already-paid history + total-would-become + over delta) to APPROVAL_GROUP_JID, registerReapproval()s it keyed by the posted msgId (wa_auth/reapproval_pending.json), tells the accountant it is blocked pending M+S, ends the session (no write). handlePromoterVerdicts gains a re-approval branch AHEAD of the EXPENSE-REQUEST swipe branch: a bare ok/yes/no swipe on a pending re-approval post records the M/S verdict on the registry entry; both-yes calls liftPayableAmount(itemId,attempted,code) which raises paid_posted rec.amount (what newPaidSession + the summary read) so the higher figure becomes payable, records a 'reapproved' audit event, confirms in-group; a no marks it rejected and leaves the approved figure unchanged. Offline-tested: 37 assertions on the amount branch/signal/message + 9 on liftPayableAmount. BACKEND-ONLY P-code unchanged. ROLLOUT: keep LEDGER_WRITE_TAB on the copy tab until this is live so the over/under guards gate real writes from day one. Prior: v2.11.0-s6.1 - PAYABLE CODE (stage 2a+2b of the build). mintPayableCode -> P-YYMMDD-NNN with a DAILY-RESET counter derived from existing approved-event codes for that IST day (single-threaded store, no double-issue). recordApprovedEvent now MINTS + stores `code` on the approved event at full M+S approval (idempotent: re-approval keeps the existing code, adds no dup). payableCodeFor(itemId) resolves it. assemblePaymentRow ledger Notes tag switched from [bot:<id>] to [bot:<P-code>#seq] (falls back to <id> for TEST/inflow/transfer rows that have no code) so bot-written ledger rows reconcile by EXACT JOIN on the code instead of fuzzy matching. One-time back-fill buildPayableCodeBackfill + GET /api/payable-code-backfill[?commit=1] codes the existing approved events in seq order using their recorded `at` date (the 30 historical ones batch as P-260620-NNN since the s5.20 catch-up recorded them on 20 Jun); dry-run by default, idempotent on commit. Offline-tested (14 assertions). BACKEND-ONLY: code is never shown to accountants. STILL TO BUILD (stage 2c+2d): amount-step 3-way branch (=balance settle / <balance part-vs-reduced prompt / >balance BLOCK + no write) and re-approval bounce to the approval group (pick-list reason; mid-stream + final-instalment message variants) with the M+S unlock that lifts the Payable amount. Prior: v2.11.0-s6.0 - CATEGORISED PAYMENTS SUMMARY (STAGE 1 of the Payable-code build). buildPaymentsSummary/formatPaymentsSummary rewritten into three labelled blocks: a header scorecard (Approved-due / Outstanding / Paid-to-date + last-Nd / Part-paid-balance / Closed); APPROVED-NOT-PAID (fresh items, sorted BIGGEST AMOUNT FIRST, NO cap, numbered for reply-to-pay); PART-PAID (paid/of/balance, numbered for next instalment); and PAID-last-N-days (CALENDAR window PAID_WINDOW_DAYS=3 = today + N-1 prior, computed via payDayIndex/payDateLabel on an IST day-index so it does not wobble by time-of-day; shows amount+date, check-marked not numbered). Footer self-checks Paid+Outstanding[+Closed]=Approved. NO P- code shown to accountants. Trigger unchanged: 'summary'/'status' in the outflow group; numbered map (fresh+part-paid only) still drives reply-number. STILL TO BUILD (next stages): P-YYMMDD-NNN daily-reset code minted at full M+S approval + [bot:P-] ledger tag; bot writes REAL Ledger (repoint LEDGER_WRITE_TAB); amount-step 3-way branch (=balance settle / <balance part-vs-reduced prompt / >balance BLOCK + no ledger write); re-approval bounce to approval group with pick-list reason (mid-stream AND final-instalment message variants, auto-selected); test/[See image]/duplicate cleanup of paid_posted.json; 'paid all' full-history command. Prior: v2.10.0-s5.21 - INFLOW + TRANSFER group (one group, INFLOW_GROUP_JID, default 120363429672822928@g.us). Routed by first word: "received …" → INFLOW (writes an IN row; Tag = receivable code from LEDGER_INFLOW_TAGS so the Site+Projections receivables SUMIFS pick it up; Description = payer; bankAc = account received into; questions amount→date→mode→head→tag→entity→into-account→from-whom→CONFIRM). "transfer …" → TRANSFER (writes a TRANSFER row; bankAc = from, transferTo = to, IN/OUT = TRANSFER so it's excluded from IN/OUT day totals; questions amount→date→mode→from-acct→to-acct→entity→CONFIRM). The opening line is parsed for amount (handles "5 lakh"/"1.5 cr"), mode keyword, transfer from/to accounts, and inflow payer/into-account; pre-filled slots are skipped and only the missing answers are asked; CONFIRM always shows the full row preview so any misread is caught before writing. Reuses the existing question validators, writeRowToLedger (same dry-run / LEDGER_WRITE_ENABLED / LEDGER_WRITE_TAB / new-day-block gating + [bot:<id>] dedupe), day-block creation, and accountant auth. New: handleInflowFlow adapter wired into the message dispatcher ahead of handlePaidFlow; sessions namespaced (#io) so they never collide with an outflow paid session. Simple logger for now (no event-store tracking / summary / part-receipt / unit register — those are the later layers). NOTE: the receivable tags must be added to the Ledger Tag dropdown; transfer rows leave Head blank. Prior: v2.10.0-s5.16 — corrected Tag and Head to the VERIFIED live dropdowns (screenshots 17 Jun). TAG is now the project cost-code set (FBD-Contractor/Steel/RMC/Exterior/STP/Road/SCO/Electricity/Diesel/Other, VRN-Contractor/Steel/RMC/Electricity/Site/Other, FBD/VRN Floor/Plot/Other-Collection, and a blank '—'); the old generic Tag values (Office/Legal/Salary/Directors-SM/-MM/Loan) were never real Tags — they are HEADS. HEAD is now the verified expense-nature set (Capital Site, Vrindavan, Office GK-1, Legal, Directors, Salary, Loan, Site, Drawing, Office Exp, Legal Exp, Diesel, Electricity, Other, Noida 153, Noida TS-3) and the Head step (4/7) is now a VALIDATED picklist like Tag/Account/Entity (number / "ok" guess / exact name; off-list rejected) — no longer free-form. Realigned the guessers: aiGuessTag prompt updated to project cost-codes only (Head nature lives in Head; off-list→dash); aiGuessHead now constrained to LEDGER_HEADS; guessHeadFallback returns only in-list heads; guessTagAndPerson rewritten to infer a valid project code (proj×category, else the project's -Other, else none) + promoter Person (SM/MM) from the description/entity, and the tag guess is guarded to in-list. Removed the now-dead TAG_QUICK. Prior: v2.10.0-s5.15 — FULL numbered pickers for Mode, Tag and Head in the paid flow. Mode (3/7) and Tag (5/7) now render the COMPLETE list vertically (Tag = all 19 LEDGER_TAGS, not just the 6 quick picks; a tag number now indexes the full list); Head (4/7) gains a numbered quick-pick list (LEDGER_HEADS, PROVISIONAL) shown alongside the AI guess — "ok"=guess, a number picks from the list, or type any Head (Head stays free-form). paidModeMenu/paidTagMenu now use the shared vertical paidNumberedMenu; added paidHeadMenu. No model/flow changes otherwise. Prior: v2.10.0-s5.14 — PART-PAYMENT TRACKING + interactive two-group summary + close/cancel. The paid flow now allows MANY instalments per approved item: each completed flow records its own paid event (seq-aware dedupe key paid:<id>#<seq>) and its own ledger row tagged [bot:<id>#<seq>] (distinct + idempotent per planLedgerWrite). Per item we derive approved (posted/due), paid (Σ instalments), balance; states fresh/part-paid/settled. The "amount paid?" step now defaults "ok" to the remaining BALANCE, not the full approved. Question order swapped: …tag → 6/7 ENTITY → 7/7 ACCOUNT → CONFIRM (was account then entity). buildPaymentsSummary is now a CUMULATIVE roll-up: Paid = actual cash out; identity Paid + Outstanding + Closed = Approved (Closed term shown only when present). formatPaymentsSummary renders two labelled groups — ⚪ FRESH (not yet paid) on top, 🟡 PART-PAID below — with CONTINUOUS numbering (Fresh first), oldest-approved first; settled items drop off. The summary persists its number→item map (paid_summary_map.json) so in the outflow group a bare NUMBER logs the next instalment for that item (balance pre-filled, instalment-aware "paid so far / balance"), and CLOSE <n> / CLOSE <n> yes closes/cancels an item as-is (accountants allowed): under-settled → remaining written off, never-paid → fully cancelled; closing writes NO ledger row. Reopen via /api/payment-reopen?id=. buildOutflowLog sums instalments and reports status posted/part-paid/paid/closed (+ dashboard pill CSS). Prior: v2.10.0-s5.13 — added /api/outflow-post-dummy (lock-protected): posts a ⟨TEST⟩-tagged PAYMENT DUE item via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the OUTFLOW_POST toggle so it works while posting is OFF; registered in paid_posted.json so a "paid" reply matches back and it shows in the summary). Item id test-<ts> => any ledger row it produces is tagged [bot:test-…] for cleanup. Params: label, amount, optional entity/account. Also added an on-demand summary/status command in the outflow group (works for accountants AND M/S, who are whitelisted): replies with Approved(due)/Paid/Yet-to-pay counts + ₹ totals, yet-to-pay itemised, in the agreed layout. buildPaymentsSummary is a pure status-partition of the POSTED universe valued at the posted/approved (due) amount, so Approved = Paid + Yet-to-pay always reconciles (self-checking); formatPaymentsSummary renders it; both offline-tested. Held / Do-not-pay deferred (no way to set them yet). Prior: v2.10.0-s5.12 — added /api/ledger-test-write (lock-protected rehearsal trigger): builds a row via the same assemblePaymentRow and fires the same gated writeRowToLedger, tagged [bot:test-<ts>] in col L. Lets a same-day or back-dated write be fired from the browser to verify the executor on Copy of Ledger without WhatsApp. Confirmed (live) the new-day clone target: date breaker =DATE(y,m,d) and DAY TOTAL formulas are all RELATIVE (C=SUMIFS IN ref A<daterow>, G=SUMIFS OUT, J=C-G) so copyPaste repoints them; bot clones the 2-row date+total breaker (no repeated header, matching the newest day). entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
+// FIDATO MIS SERVER v2.11.0-s6.8 - APPROVAL DIGEST: 3 SEPARATE MESSAGES + HIDE ALREADY-DONE. buildApprovalReminderDigest now returns {messages:[...]} - up to THREE messages posted to the capital approval group: "APPROVALS NEEDED - M" (S already approved, mentions M only), "APPROVALS NEEDED - S" (M approved, mentions S only), and "APPROVALS NEEDED - M & S" (neither yet, mentions both). Empty buckets are not posted. Numbering is CONTINUOUS across the three so a reply "5 yes" still maps; sendApprovalReminderDigest posts each, tags each items msgId, and saves one digest_map with msgIds[] so a bare verdict quoting any one message applies only to that messages slice. NEW filter alreadyDone(e) drops entries that are already fully approved (findApprovedEvent), already paid (paidStatsForItem>0), or are the bots own "Approved (M+S)" confirmation echo (regex on label) - so paid/approved items no longer pollute the pending list. Held items fold into whichever bucket still needs that persons yes, tagged (on hold). Preview .text kept (messages joined). Offline-tested. Prior: v2.11.0-s6.7 - OUTFLOW SUMMARY SHOWS APPROVED-BUT-UNPOSTED + EVENT-STORE-SOURCED CATCH-UP. buildPaymentsSummary adds a third pass over event-store approved events with no posted record and no paid event (mirrors the s6.3 buildOutflowLog pass) so the in-group summary is the COMPLETE approved universe, not just posted (pp.recent) items. Capital-IN raises are excluded NARROWLY via isCapitalInflowLabel (/contribution of rs|inr|rupee/) so a mis-posted "MM/SM Contribution of Rs 2.28 Crore" never shows as a payable outflow, while a contribution REPAYMENT ("SM EXCESS contribution old" = paid back to SM) correctly STAYS in the payments list. Approved-but-unposted items listed in the summary are now payable by number: the bare-number handler synthesizes+registers a posted record from the approved event when none exists. The one-time catch-up (catchUpApprovedToOutflow) is RE-SOURCED from the event store (new listApprovedFromEventStore) instead of the lossy chat-history audit (listApprovedForOutflow), so the approved-but-unposted backlog clears in one run. Diagnosis: approvals were recorded but never bridged because OUTFLOW_POST_ENABLED was OFF; the summary read only posted items so approved-unposted were invisible; the old catch-up re-derived approved from chat history (saw only 7) so it never reached the ~30 stranded. Toggle now ON; this patch surfaces + clears the rest. Offline-tested. Prior: v2.11.0-s6.6 - PROMOTER CONTRIBUTION ACCOUNTS. The inflow group now recognises a CONTRIBUTION (MM/SM putting money into a company) as a third kind alongside inflow/transfer. parseInflowOpening routes to 'contribution' when a contribution word (contribution/capital/put in/infused/invested) is present OR the promoter (MM/SM by token or name) is the named source; a plain "drawing" is never a contribution. New IO step 'promoter' asks MM or SM if it wasn't parsed from the line. On confirm it writes an IN row (Person=promoter, tag "Promoter Contribution") AND records a 'contribution' event {promoter,entity,amount,date}. Outflow side: when a paid item's label is a contribution repayment (detectContributionRepayment = a repay/return/payback verb + MM/SM, or an explicit contribution/capital context; "MM Drawing" is excluded), the paid flow also records a 'contrepay' event that knocks it off that promoter's account. buildContributionStatement nets contributions(+) - repayments(-) per promoter, capturing a SILENT per-entity breakdown (byEntity) while the headline is the combined figure (Option A: personal drawings are NOT subtracted). Read it in the inflow group with "MM account" / "SM account" / "contributions", or GET /api/contributions. Offline-tested: 54 assertions (routing / prefill / row / repayment-detect / statement-math + full contribution flow + inflow regression). Prior: v2.11.0-s6.5 - NATURAL INFLOW/TRANSFER TRIGGERS. parseInflowOpening no longer requires the keyword to be the FIRST word; it fires on intent in ANY word order, gated by a money-like amount so chatter never logs. Triggers only when the message has a real amount (a unit lakh/lac/lk/cr/k/l, an Rs/INR/rupees marker, or magnitude >= 1000) AND an intent signal -> transfer if a transfer verb (transfer/trf/tfr/moved/shifted) OR an account->account "from X to Y" (both resolve to accounts), else inflow if an inflow verb (received/recd/rcvd/got/credited/deposited/inflow/collected/collection/came in) OR a "from <payer>" / "by <payer>". So "5 lakh received from Rajesh", "got 5L from Rajesh", "5L from Rajesh", "credited 250000 from ABC" all log now, while "ok" / "thanks" / "got it 100%" / "call me at 5" / "received the documents" stay silent. parseRoughAmount now also reads "5L"/"5 L" as 5 lakh (added l/lk units with a word-boundary guard so 5kg/5liters are not misread). Slot pre-fill (amount/mode/payer/into-acct/from-acct/to-acct) unchanged, just order-independent. Offline-tested (39 assertions). Prior: v2.11.0-s6.4 - QUIET SINGLE VERDICTS. A lone promoter YES no longer posts a group receipt (the old "recorded M's approval" line read like the expense was already fully approved). New perVerdictNotice(v,who,label,amount): YES -> null (silent; only the combined "Approved (M+S)" line announces it, and that already fires solely when BOTH M+S are yes); NO -> posts "rejected by <who>"; HOLD -> posts "put on hold by <who>". The main verdict branch calls it; the re-approval branch drops its lone receipt too (its own rejection + both-yes lines already cover it). The M+S approval GATE is UNCHANGED — approved events still mint only on both-yes, so nothing is treated as approved on a single verdict. Offline-tested (5 assertions). Prior: v2.11.0-s6.3 - DASHBOARD MARK-PAID (manual reconciliation). The Payments-log dashboard (/api/outflow-log) now lists the COMPLETE approved universe: buildOutflowLog adds a third pass over event-store 'approved' events with no posted record and no paid event, surfaced as status 'approved' (purple pill) so approved-but-unposted items appear alongside posted/part-paid/paid/closed. Each row with a balance (approved/posted/part-paid, not closed, not fully paid) gets a green Mark-paid button -> GET /api/paid-mark?id=...[&amount=...] -> markItemPaid(): records a 'paid' event for the remaining balance (mode 'Manual', date IST today), NO ledger write (a books-reconciliation mark, not a disbursement), reversible via the existing Mark-unpaid (/api/paid-undo). Optional &amount records a partial (capped at balance). Lets M tick every approved/pending item against his books once and start the live tracking afresh. Offline-tested: 22 assertions (full / partial / over-cap / closed / already-paid / approved-unposted + pending-row surfacing). Prior: v2.11.0-s6.2 - PAYABLE CODE (stage 2c+2d): AMOUNT-STEP 3-WAY BRANCH + OVER-APPROVAL RE-APPROVAL. paidFlowAdvance amount step now splits on typed amount vs remaining balance: == balance settles as before; < balance asks part-vs-reduced (new 'partask' step: 1=part payment rest still due; 2=final/reduced -> sets session.closeAfter so the outer handler recordClosedEvent's the item and writes off the unpaid remainder, no ledger row for the write-off); > balance is BLOCKED (no answers.amount, no write) and routed to a pick-list reason (new 'overreason' step over REAPPROVAL_REASONS = Price revised / Extra work / GST taxes / Measurement change / Other; Other -> 'overnote' free-text), then reapprovalSignalFrom packages {itemId,code,label,approved,paidSoFar,balance,thisInstalment,attempted=paidSoFar+thisInstalment,reason,isFinal=paidSoFar>0}. Outer handlePaidFlow, on out.reapproval, posts buildReapprovalMessage (two auto-selected variants: fresh/mid-stream shows approved/now-being-paid/increase; final-instalment shows already-paid history + total-would-become + over delta) to APPROVAL_GROUP_JID, registerReapproval()s it keyed by the posted msgId (wa_auth/reapproval_pending.json), tells the accountant it is blocked pending M+S, ends the session (no write). handlePromoterVerdicts gains a re-approval branch AHEAD of the EXPENSE-REQUEST swipe branch: a bare ok/yes/no swipe on a pending re-approval post records the M/S verdict on the registry entry; both-yes calls liftPayableAmount(itemId,attempted,code) which raises paid_posted rec.amount (what newPaidSession + the summary read) so the higher figure becomes payable, records a 'reapproved' audit event, confirms in-group; a no marks it rejected and leaves the approved figure unchanged. Offline-tested: 37 assertions on the amount branch/signal/message + 9 on liftPayableAmount. BACKEND-ONLY P-code unchanged. ROLLOUT: keep LEDGER_WRITE_TAB on the copy tab until this is live so the over/under guards gate real writes from day one. Prior: v2.11.0-s6.1 - PAYABLE CODE (stage 2a+2b of the build). mintPayableCode -> P-YYMMDD-NNN with a DAILY-RESET counter derived from existing approved-event codes for that IST day (single-threaded store, no double-issue). recordApprovedEvent now MINTS + stores `code` on the approved event at full M+S approval (idempotent: re-approval keeps the existing code, adds no dup). payableCodeFor(itemId) resolves it. assemblePaymentRow ledger Notes tag switched from [bot:<id>] to [bot:<P-code>#seq] (falls back to <id> for TEST/inflow/transfer rows that have no code) so bot-written ledger rows reconcile by EXACT JOIN on the code instead of fuzzy matching. One-time back-fill buildPayableCodeBackfill + GET /api/payable-code-backfill[?commit=1] codes the existing approved events in seq order using their recorded `at` date (the 30 historical ones batch as P-260620-NNN since the s5.20 catch-up recorded them on 20 Jun); dry-run by default, idempotent on commit. Offline-tested (14 assertions). BACKEND-ONLY: code is never shown to accountants. STILL TO BUILD (stage 2c+2d): amount-step 3-way branch (=balance settle / <balance part-vs-reduced prompt / >balance BLOCK + no write) and re-approval bounce to the approval group (pick-list reason; mid-stream + final-instalment message variants) with the M+S unlock that lifts the Payable amount. Prior: v2.11.0-s6.0 - CATEGORISED PAYMENTS SUMMARY (STAGE 1 of the Payable-code build). buildPaymentsSummary/formatPaymentsSummary rewritten into three labelled blocks: a header scorecard (Approved-due / Outstanding / Paid-to-date + last-Nd / Part-paid-balance / Closed); APPROVED-NOT-PAID (fresh items, sorted BIGGEST AMOUNT FIRST, NO cap, numbered for reply-to-pay); PART-PAID (paid/of/balance, numbered for next instalment); and PAID-last-N-days (CALENDAR window PAID_WINDOW_DAYS=3 = today + N-1 prior, computed via payDayIndex/payDateLabel on an IST day-index so it does not wobble by time-of-day; shows amount+date, check-marked not numbered). Footer self-checks Paid+Outstanding[+Closed]=Approved. NO P- code shown to accountants. Trigger unchanged: 'summary'/'status' in the outflow group; numbered map (fresh+part-paid only) still drives reply-number. STILL TO BUILD (next stages): P-YYMMDD-NNN daily-reset code minted at full M+S approval + [bot:P-] ledger tag; bot writes REAL Ledger (repoint LEDGER_WRITE_TAB); amount-step 3-way branch (=balance settle / <balance part-vs-reduced prompt / >balance BLOCK + no ledger write); re-approval bounce to approval group with pick-list reason (mid-stream AND final-instalment message variants, auto-selected); test/[See image]/duplicate cleanup of paid_posted.json; 'paid all' full-history command. Prior: v2.10.0-s5.21 - INFLOW + TRANSFER group (one group, INFLOW_GROUP_JID, default 120363429672822928@g.us). Routed by first word: "received …" → INFLOW (writes an IN row; Tag = receivable code from LEDGER_INFLOW_TAGS so the Site+Projections receivables SUMIFS pick it up; Description = payer; bankAc = account received into; questions amount→date→mode→head→tag→entity→into-account→from-whom→CONFIRM). "transfer …" → TRANSFER (writes a TRANSFER row; bankAc = from, transferTo = to, IN/OUT = TRANSFER so it's excluded from IN/OUT day totals; questions amount→date→mode→from-acct→to-acct→entity→CONFIRM). The opening line is parsed for amount (handles "5 lakh"/"1.5 cr"), mode keyword, transfer from/to accounts, and inflow payer/into-account; pre-filled slots are skipped and only the missing answers are asked; CONFIRM always shows the full row preview so any misread is caught before writing. Reuses the existing question validators, writeRowToLedger (same dry-run / LEDGER_WRITE_ENABLED / LEDGER_WRITE_TAB / new-day-block gating + [bot:<id>] dedupe), day-block creation, and accountant auth. New: handleInflowFlow adapter wired into the message dispatcher ahead of handlePaidFlow; sessions namespaced (#io) so they never collide with an outflow paid session. Simple logger for now (no event-store tracking / summary / part-receipt / unit register — those are the later layers). NOTE: the receivable tags must be added to the Ledger Tag dropdown; transfer rows leave Head blank. Prior: v2.10.0-s5.16 — corrected Tag and Head to the VERIFIED live dropdowns (screenshots 17 Jun). TAG is now the project cost-code set (FBD-Contractor/Steel/RMC/Exterior/STP/Road/SCO/Electricity/Diesel/Other, VRN-Contractor/Steel/RMC/Electricity/Site/Other, FBD/VRN Floor/Plot/Other-Collection, and a blank '—'); the old generic Tag values (Office/Legal/Salary/Directors-SM/-MM/Loan) were never real Tags — they are HEADS. HEAD is now the verified expense-nature set (Capital Site, Vrindavan, Office GK-1, Legal, Directors, Salary, Loan, Site, Drawing, Office Exp, Legal Exp, Diesel, Electricity, Other, Noida 153, Noida TS-3) and the Head step (4/7) is now a VALIDATED picklist like Tag/Account/Entity (number / "ok" guess / exact name; off-list rejected) — no longer free-form. Realigned the guessers: aiGuessTag prompt updated to project cost-codes only (Head nature lives in Head; off-list→dash); aiGuessHead now constrained to LEDGER_HEADS; guessHeadFallback returns only in-list heads; guessTagAndPerson rewritten to infer a valid project code (proj×category, else the project's -Other, else none) + promoter Person (SM/MM) from the description/entity, and the tag guess is guarded to in-list. Removed the now-dead TAG_QUICK. Prior: v2.10.0-s5.15 — FULL numbered pickers for Mode, Tag and Head in the paid flow. Mode (3/7) and Tag (5/7) now render the COMPLETE list vertically (Tag = all 19 LEDGER_TAGS, not just the 6 quick picks; a tag number now indexes the full list); Head (4/7) gains a numbered quick-pick list (LEDGER_HEADS, PROVISIONAL) shown alongside the AI guess — "ok"=guess, a number picks from the list, or type any Head (Head stays free-form). paidModeMenu/paidTagMenu now use the shared vertical paidNumberedMenu; added paidHeadMenu. No model/flow changes otherwise. Prior: v2.10.0-s5.14 — PART-PAYMENT TRACKING + interactive two-group summary + close/cancel. The paid flow now allows MANY instalments per approved item: each completed flow records its own paid event (seq-aware dedupe key paid:<id>#<seq>) and its own ledger row tagged [bot:<id>#<seq>] (distinct + idempotent per planLedgerWrite). Per item we derive approved (posted/due), paid (Σ instalments), balance; states fresh/part-paid/settled. The "amount paid?" step now defaults "ok" to the remaining BALANCE, not the full approved. Question order swapped: …tag → 6/7 ENTITY → 7/7 ACCOUNT → CONFIRM (was account then entity). buildPaymentsSummary is now a CUMULATIVE roll-up: Paid = actual cash out; identity Paid + Outstanding + Closed = Approved (Closed term shown only when present). formatPaymentsSummary renders two labelled groups — ⚪ FRESH (not yet paid) on top, 🟡 PART-PAID below — with CONTINUOUS numbering (Fresh first), oldest-approved first; settled items drop off. The summary persists its number→item map (paid_summary_map.json) so in the outflow group a bare NUMBER logs the next instalment for that item (balance pre-filled, instalment-aware "paid so far / balance"), and CLOSE <n> / CLOSE <n> yes closes/cancels an item as-is (accountants allowed): under-settled → remaining written off, never-paid → fully cancelled; closing writes NO ledger row. Reopen via /api/payment-reopen?id=. buildOutflowLog sums instalments and reports status posted/part-paid/paid/closed (+ dashboard pill CSS). Prior: v2.10.0-s5.13 — added /api/outflow-post-dummy (lock-protected): posts a ⟨TEST⟩-tagged PAYMENT DUE item via the SAME postApprovedToOutflow path as the real bridge (force-bypasses the OUTFLOW_POST toggle so it works while posting is OFF; registered in paid_posted.json so a "paid" reply matches back and it shows in the summary). Item id test-<ts> => any ledger row it produces is tagged [bot:test-…] for cleanup. Params: label, amount, optional entity/account. Also added an on-demand summary/status command in the outflow group (works for accountants AND M/S, who are whitelisted): replies with Approved(due)/Paid/Yet-to-pay counts + ₹ totals, yet-to-pay itemised, in the agreed layout. buildPaymentsSummary is a pure status-partition of the POSTED universe valued at the posted/approved (due) amount, so Approved = Paid + Yet-to-pay always reconciles (self-checking); formatPaymentsSummary renders it; both offline-tested. Held / Do-not-pay deferred (no way to set them yet). Prior: v2.10.0-s5.12 — added /api/ledger-test-write (lock-protected rehearsal trigger): builds a row via the same assemblePaymentRow and fires the same gated writeRowToLedger, tagged [bot:test-<ts>] in col L. Lets a same-day or back-dated write be fired from the browser to verify the executor on Copy of Ledger without WhatsApp. Confirmed (live) the new-day clone target: date breaker =DATE(y,m,d) and DAY TOTAL formulas are all RELATIVE (C=SUMIFS IN ref A<daterow>, G=SUMIFS OUT, J=C-G) so copyPaste repoints them; bot clones the 2-row date+total breaker (no repeated header, matching the newest day). entity list (step 7/7) corrected to the verified Ledger Entity dropdown (21 entries incl Fidatocity Homes, Others (combined), MM, SM). Account list (step 6/7) and entity list both validate typed input against the dropdowns. 7-question paid flow fills cols B (entity) and J (account), overriding the request lines. paid flow is now 7 questions: added "7/7 Which entity/company?" (numbered list compiled from the workbook Company/Entity column; typed value validated/resolved, warns on mismatch). Chosen entity fills col B, overriding the request Company line. NOTE: the entity list is PROVISIONAL (no confirmed dropdown) — confirm/correct it. Prior: 6th account question fills col J. paid flow is now 6 questions: added "6/6 Paid from which account?" (full numbered list of the 22 Ledger Bank A/C accounts; a typed account is validated/resolved against that list, warns on mismatch). The chosen account fills col J, overriding the request From line (which only ever held the company). Rest of the flow unchanged. Delete now clears the WHOLE thread for an expense: the paid flow records every message id (the PAYMENT DUE post, each bot Q&A prompt, and each accountant reply) against the item, and unpost deletes them all (best-effort; the bot can only delete-for-everyone its own messages unless it is group admin). outflow payments log (/api/outflow-log: every item pushed to the group joined with paid status) + testing controls: mark a paid item back to unpaid (/api/paid-undo, removes the paid event) and delete a pushed item from the dashboard + its group message (/api/outflow-unpost?deleteMsg=1); both wired as buttons on the queue dashboard. parseSheetDate now reads weekday-suffixed breaker dates ("09 Jun 2026, Tuesday") and isLedgerNum strips the rupee symbol, so breaker vs transaction rows classify correctly on the LIVE sheet (verified against Copy of Ledger). new-day block creation by cloning the previous breaker (preserves formatting + SUMIFS/NET formulas), chronologically placed (newest=bottom, back-dated=mid-sheet); tighter txn-row detection (numeric col G) so breaker rows are not misread. bot writes Ledger col A as dd/mm/yyyy real date so the breaker =SUMIFS day-totals match it. configurable write tab LEDGER_WRITE_TAB (default Ledger) so a same-workbook copy tab can be the rehearsal target; reads/reports stay on real Ledger. backfill sourced from buildApprovalAudit().fullyApproved (FAST — the s5.1 reconciliation source ran the AI matcher per item and hung the page). Queue page now has a timeout + visible errors. Company/From recovered from request body; does not auto-exclude already-paid (push selectively). list approved items + manual per-item push + one-time catch-up sweep (event-store sourced, idempotent, force-bypasses the auto toggle), with an interactive /api/outflow-queue page behind the lock. Also fixed /health version (was stale s1). STAGE 4 LEDGER WRITE dry-run is a live lock-protected panel toggle: pure planLedgerWrite (right day-block, dedupe by [bot:id], insert position) + gated executor writeRowToLedger. Read/write Sheets scope only when LEDGER_WRITE_ENABLED; LEDGER_WRITE_DRYRUN computes+logs the plan but writes nothing. Default still capture-only. STAGE 3 THE BRIDGE (outflow toggle is a live lock-protected panel switch): on full M+S approval, post the approved item (entity/account/desc parsed from the EXPENSE REQUEST, threaded via the digest map) into the outflow group and register it so a "paid" reply matches back. Toggle OUTFLOW_POST_ENABLED (default OFF), idempotent per expense id. Then STAGE 2 paid-flow Q&A logs it. Still capture-only, NO Sheet write. Base: v2.10.0-s2.3. Tag step now AI-first (aiGuessTag, constrained/validated to LEDGER_TAGS so it can disambiguate e.g. Vrindavan vs Faridabad diesel) with the rule guessTagAndPerson as offline/off-list fallback. Rest of STAGE 2 unchanged. Capture-only, NO Sheet write. Base: v2.10.0-s1.
 // v2.8.16 — clear stale Chromium SingletonLock on boot so redeploys self-heal (volume no longer causes 'profile in use' Code 21)
 // Adds: smart first-message parsing (extracts company/account from free-form text),
 //       multi-amount detection that forces one-at-a-time discipline,
@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.11.0-s6.14-dashboard';
+var SERVER_VERSION='2.11.0-s6.9';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -125,28 +125,10 @@ function clearStaleChromiumLocks() {
 }
 function createWhatsAppClient() {
   clearStaleChromiumLocks();
-  // ── WhatsApp Web version pin ────────────────────────────────────────────────
-  // WhatsApp Web ships new bundles continuously. whatsapp-web.js reads WA Web's
-  // internal Store via page.evaluate(); when WA Web changes its internals faster
-  // than the library, those reads throw a MINIFIED variable name (e.g. "r") from
-  // inside ExecutionContext.#evaluate. The session stays CONNECTED and
-  // authenticated - only Store reads (getChats / getChatById / fetchMessages) and
-  // sends break. Restarting does not help because nothing is wrong with the session.
-  //
-  // Pinning WA Web to a build the installed library understands is the fix.
-  // Set WA_WEB_VERSION_URL in Railway to try a different build without a deploy.
-  var _waVerUrl = process.env.WA_WEB_VERSION_URL || '';
-  var _clientOpts = {
+  waClient = new Client({
     authStrategy: new LocalAuth({ dataPath: './wa_auth' }),
     puppeteer: { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-accelerated-2d-canvas','--no-first-run','--no-zygote','--single-process','--disable-gpu','--disable-extensions'] },
-  };
-  if(_waVerUrl){
-    _clientOpts.webVersionCache = { type:'remote', remotePath:_waVerUrl };
-    console.log('[WA] pinning WhatsApp Web build:', _waVerUrl);
-  } else {
-    console.log('[WA] no WA_WEB_VERSION_URL set - using whatever build WhatsApp Web serves. If Store reads start throwing single-letter errors, pin a build.');
-  }
-  waClient = new Client(_clientOpts);
+  });
   waClient.on('qr', function(qr) { latestQR = qr; qrcode.toDataURL(qr, function(err, url) { if (!err) latestQRDataUrl = url; }); console.log('QR generated.'); });
   waClient.on('ready', function() { waReady = true; latestQR = null; latestQRDataUrl = null; console.log('WhatsApp ready!'); });
   waClient.on('authenticated', function() { console.log('WhatsApp authenticated.'); });
@@ -439,18 +421,6 @@ async function extractFromImage(media, msgId) {
   } catch (e) { console.error('[Vision] Exception:', e.message); return null; }
 }
 // ── Approval audit ────────────────────────────────────────────────────────────
-// A minified upstream error (e.g. whatsapp-web.js injected code throwing 'r')
-// carries no useful message. Return the name, message AND the first stack frames
-// so the panel shows where it failed instead of a single character.
-function errDetail(e){
-  var out={ error: (e && e.message) ? String(e.message) : String(e) };
-  if(e && e.name) out.errorName=e.name;
-  if(e && e.stack){
-    out.where = String(e.stack).split('\n').slice(0,6).map(function(l){ return l.trim(); });
-  }
-  out.hint='If the message is a single letter, it came from whatsapp-web.js injected browser code - usually a library/WhatsApp-Web version mismatch rather than a session problem.';
-  return out;
-}
 async function fetchApprovalMessages(days) {
   if(!waReady||!waClient)throw new Error('WhatsApp not connected');
   var chat = await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);
@@ -907,13 +877,13 @@ var LEDGER_MODES = ['Chq','Cash','RTGS','NEFT','PDC','Auto'];
 // v2.10.0-s5.16: Head = the verified Ledger HEAD dropdown (expense nature), exact order from the
 // live sheet (screenshots 17 Jun 2026). Validated for the numbered picker (step 4) like Tag.
 var LEDGER_HEADS = ['Capital Site','Vrindavan','Office GK-1','Legal','Directors','Salary','Loan','Site','Drawing','Office Exp','Legal Exp','Diesel','Electricity','Other','Noida 153','Noida TS-3'];
-// v2.11.0-s6.14-dashboard: receivable Tags for the INFLOW flow — the codes the Site+Projections receivables
+// v2.10.0-s5.17: receivable Tags for the INFLOW flow — the codes the Site+Projections receivables
 // SUMIFS sum (Ledger col E, IN rows). These must also exist in the Ledger Tag dropdown so the written
 // row isn't flagged invalid. '—' is for non-project inflows (refunds etc.) that hit no receivable line.
 var LEDGER_INFLOW_TAGS = ['FBD-Plot-Receivable','FBD-Plot-Construction','FBD-Floor-Receivable','FBD-Floor-Possession','FBD-Floor-Buyback','VRN-Floor','VRN-Plot','\u2014'];
 // v2.10.0-s5.9: paying-account list — exact order/contents of the Ledger Bank A/C dropdown.
 // Used both for the numbered menu (step 6) and to validate a typed account.
-var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','Fervor Marketing HDFC','Tremendous HDFC','RMS HDFC','Wholly Joy JKB','Capital Site PDC','—','MM PDC','SM PDC','PDC'];
+var LEDGER_ACCOUNTS = ['Fidatocity-70%','Fidatocity-30%','Fidato City Homes','Fidatocity AXIS','Trinity JKB','Trinity HDFC','Pitam JKB','Hansaflon JKB','Hansaflon AXIS','Hansaflon HDFC','Hansaflon Buildwell','Dholpur JKB','Trinity Tulsivan','Beatific HDFC','Chahat JKB','Fidato Buildcon','Fidato Maintenance','Maximal JKB','Fervor Marketing HDFC','Tremendous HDFC','RMS HDFC','—','MM PDC','SM PDC','PDC'];
 // v2.11.0-s6.10: AI classify a cancellation reason -> company_fault | normal.
 // Used by the sales module's cancel flow. Uses the same Claude API pattern as vision.
 async function aiClassifyReason(reasonText){
@@ -1004,7 +974,7 @@ var sales = initSales({
   TRACKER_API_SECRET: process.env.TRACKER_API_SECRET
 });
 // v2.10.0-s5.11: entity/company list — exact order/contents of the Ledger Entity dropdown (verified).
-var LEDGER_ENTITIES = ['Fidatocity - 70%','Fidatocity - 30%','Fidato City Homes','Fidatocity Homes','Trinity Landspace','Pitam','Hansaflon Buildcon','Hansaflon Buildwell','Dholpur Developers','Trinity Tulsivan','Beatific Hospitality','Chahat Garments','Fidato Buildcon','Fidato Maintenance','Maximal Infrastructure','Others (combined)','MM PDC','SM PDC','PDC','MM','SM','Fervor Marketing','Tremendous','Fervor Marketing HDFC','Tremendous HDFC','RMS','Wholly Joy'];
+var LEDGER_ENTITIES = ['Fidatocity - 70%','Fidatocity - 30%','Fidato City Homes','Fidatocity Homes','Trinity Landspace','Pitam','Hansaflon Buildcon','Hansaflon Buildwell','Dholpur Developers','Trinity Tulsivan','Beatific Hospitality','Chahat Garments','Fidato Buildcon','Fidato Maintenance','Maximal Infrastructure','Others (combined)','MM PDC','SM PDC','PDC','MM','SM','Fervor Marketing','Tremendous','Fervor Marketing HDFC','Tremendous HDFC','RMS'];
 
 // Rule-based Tag pre-guess from a description. Returns {tag, person} or null.
 function guessTagAndPerson(desc, entity){
@@ -1132,23 +1102,13 @@ function assemblePaymentRow(item, answers){
     notes: '[bot:'+(payableCodeFor(item.id)||item.id||'')+(item.seq?('#'+item.seq):'')+']'   // v2.11.0-s6.1: Payable code (falls back to id for TEST/non-coded items)
   };
 }
-// v2.11.0-s6.14-dashboard: INFLOW row (IN) — money received. Tag = receivable code (drives the receivables
+// v2.10.0-s5.17: INFLOW row (IN) — money received. Tag = receivable code (drives the receivables
 // SUMIFS); Description carries the payer/source; bankAc = the account it was received INTO.
 function assembleInflowRow(ses){
   var A=ses.answers;
-  var unit=String(A.unit||'').trim().toUpperCase();
-  var desc=A.fromWhom||'';
-  if(unit && unit!=='NONE') desc = desc ? (desc+' \u2014 '+unit) : unit;
-  // [unit:...] makes the receipt joinable back to that unit's cover for receivables tracking
-  var notes='[bot:'+ses.id+']'+((unit&&unit!=='NONE')?('[unit:'+unit+']'):'');
-  return { date: toLedgerWriteDate(A.date), entity: A.entity||'', head: A.head||'', description: desc,
+  return { date: toLedgerWriteDate(A.date), entity: A.entity||'', head: A.head||'', description: A.fromWhom||'',
     tag: A.tag||'', inout:'IN', amount: A.amount, mode: A.mode||'', person:'', bankAc: A.bankAc||'',
-    transferTo:'', notes:notes };
-}
-// Pull the unit id back out of a ledger row written by the bot.
-function unitFromNotes(notes){
-  var m=String(notes||'').match(/\[unit:([^\]]+)\]/i);
-  return m?m[1].trim().toUpperCase():'';
+    transferTo:'', notes:'[bot:'+ses.id+']' };
 }
 // v2.11.0-s6.6: CONTRIBUTION row — promoter (MM/SM) puts money INTO a company. An IN row, tagged so it
 // reads clearly, Person = the promoter. The running loan-account tally is driven by the 'contribution'
@@ -1207,7 +1167,7 @@ function formatContributionStatement(which){
   if(which==='MM'||which==='SM') return block(which);
   return block('MM')+'\n\n'+block('SM');
 }
-// v2.11.0-s6.14-dashboard: TRANSFER row — money moved between own accounts. bankAc = FROM, transferTo = TO.
+// v2.10.0-s5.17: TRANSFER row — money moved between own accounts. bankAc = FROM, transferTo = TO.
 // No Head/Tag (not income or expense); IN/OUT = TRANSFER so it's excluded from the IN/OUT day totals.
 function assembleTransferRow(ses){
   var A=ses.answers;
@@ -1869,32 +1829,8 @@ async function paidFlowAdvance(session, inputRaw){
       else { return { reply:'\u26A0\uFE0F \u201c'+input+'\u201d isn\u2019t in the entity list. Reply a number (1\u2013'+LEDGER_ENTITIES.length+') or type an exact name:\n'+paidEntityMenu() }; }
     }
     session.answers.entity=ent;
-    session.step='sitepaid';
-    return { reply:'7/8 *Paid directly from site?* (site payments are PDC)\n'+
-      '1) No \u2014 paid from a bank account\n'+
-      '2) Yes \u2014 site PDC held by Umesh' };
-  }
-  if(session.step==='sitepaid'){
-    var siteChoice=null;
-    if(/^1$|^no$|^office$|^bank$/i.test(low)) siteChoice='office';
-    else if(/^2$|^yes$|pdc|site|cheque/i.test(low)) siteChoice='Capital Site PDC';
-    if(!siteChoice){
-      return { reply:'Reply 1 (bank account) or 2 (site PDC).' };
-    }
-    if(siteChoice!=='office'){
-      // a site payment IS its account - no bank picker needed
-      session.answers.bankAc=siteChoice;
-      session.answers.paidFromSite=true;
-      var itemS={ id:session.itemId, seq:session.seq, entity:session.entity, bankAc:siteChoice,
-                  description:session.description, label:session.label };
-      session.row = assemblePaymentRow(itemS, session.answers);
-      session.step='confirm';
-      return { reply:'\ud83c\udfd7\ufe0f Paid *direct from site* (PDC)\n\n'+
-        paidRowPreview(session.row)+'\n\nReply *CONFIRM* to record, or *cancel*.' };
-    }
-    session.answers.paidFromSite=false;
     session.step='account';
-    return { reply:'8/8 *Paid from which account?* — reply the number, or type the account name:\n'+paidAccountMenu() };
+    return { reply:'7/7 *Paid from which account?* — reply the number, or type the account name:\n'+paidAccountMenu() };
   }
   if(session.step==='account'){
     var acct='';
@@ -2071,14 +2007,14 @@ async function handlePaidFlow(msg){
   }catch(e){ console.error('[PaidFlow]', e.message); return false; }
 }
 
-// ── v2.11.0-s6.14-dashboard: INFLOW + TRANSFER group ──────────────────────────────────
+// ── v2.10.0-s5.17: INFLOW + TRANSFER group ──────────────────────────────────
 // One group (INFLOW_GROUP_JID) handles two things, routed by the first word:
 //   "received …"  → INFLOW  → writes an IN row (Tag = receivable code → receivables SUMIFS).
 //   "transfer …"  → TRANSFER → writes a TRANSFER row (bankAc = from, transferTo = to).
 // The opening line is parsed for amount/mode (+ from/to for transfer, payer for inflow) and those
 // steps are pre-filled & skipped; only the missing answers are asked. CONFIRM always shows the row.
 var IO_STEPS = {
-  inflow:   [['amount','amount'],['date','date'],['mode','mode'],['head','head'],['tag','tag'],['entity','entity'],['account','bankAc'],['unit','unit'],['fromwhom','fromWhom']],
+  inflow:   [['amount','amount'],['date','date'],['mode','mode'],['head','head'],['tag','tag'],['entity','entity'],['account','bankAc'],['fromwhom','fromWhom']],
   transfer: [['amount','amount'],['date','date'],['mode','mode'],['fromacct','fromAcct'],['toacct','toAcct'],['entity','entity']],
   contribution: [['amount','amount'],['promoter','promoter'],['date','date'],['mode','mode'],['account','bankAc'],['entity','entity']]
 };
@@ -2186,7 +2122,6 @@ function ioNextPrompt(ses){
     case 'tag':      return n+'*Tag (receivable)?* \u2014 pick a number:\n'+paidInflowTagMenu()+'\n(or type the exact tag)';
     case 'entity':   return n+'*Which entity / company?* \u2014 reply the number, or type the name:\n'+paidEntityMenu();
     case 'account':  return n+'*Received into which account?* \u2014 reply the number, or type the account name:\n'+paidAccountMenu();
-    case 'unit': return n+'*Against which unit?* \u2014 e.g. 105-GF, 230A-PLOT.\nReply *none* if this receipt is not against a unit.';
     case 'fromwhom': return n+'*Received from whom?* \u2014 type the payer / source (buyer name, etc.).';
     case 'fromacct': return n+'*From which account?* \u2014 reply the number, or type the account name:\n'+paidAccountMenu();
     case 'toacct':   return n+'*To which account?* \u2014 reply the number, or type the account name:\n'+paidAccountMenu();
@@ -2221,13 +2156,6 @@ function ioConsume(ses, step, input, low){
   if(step==='tag'){ var tv=ioPickFromList(low,input,LEDGER_INFLOW_TAGS); if(!tv) return {error:'Pick the Tag by number or type the exact tag:\n'+paidInflowTagMenu()}; A.tag=tv; return {}; }
   if(step==='entity'){ var ev=ioPickEntity(low,input); if(ev.error) return {error:ev.error}; A.entity=ev.value; return {}; }
   if(step==='account'){ var av=ioPickAccount(low,input); if(av.error) return {error:av.error}; A.bankAc=av.value; return {}; }
-  if(step==='unit'){
-    if(/^(none|no|skip|n\/a|-)$/i.test(input)){ A.unit='NONE'; return {}; }
-    var u=String(input).trim().toUpperCase().replace(/\s+/g,' ');
-    if(!/-(GF|FF|SF|TF|PLOT)$/.test(u))
-      return {error:'That does not look like a unit id. Use the form 105-GF / 230A-PLOT, or reply *none*.'};
-    A.unit=u; return {};
-  }
   if(step==='fromwhom'){ if(!input) return {error:'Type the payer / source name.'}; A.fromWhom=input; return {}; }
   if(step==='promoter'){ var pp=detectPromoter(input); if(!pp) return {error:'Reply *MM* or *SM* \u2014 whose contribution is this?'}; A.promoter=pp; return {}; }
   if(step==='fromacct'){ var fa=ioPickAccount(low,input); if(fa.error) return {error:fa.error}; A.fromAcct=fa.value; return {}; }
@@ -2303,19 +2231,6 @@ async function handleInflowFlow(msg){
         try{ recordEvent('contribution', { promoter:c.promoter, entity:c.entity, amount:c.amount, date:c.date }, 'contribution:'+ses.id);
              ledgerSuffix += '\n\u2705 Logged as *'+c.promoter+' contribution* \u2014 added to the '+c.promoter+' loan account.'; }
         catch(e){ console.error('[Inflow] contribution event:', e.message); }
-      }
-      // CCM units: raise a confirmation card in the capital group. The Ledger row above
-      // stands regardless - only the cover write waits on Umesh/Gautam.
-      if(ses.kind==='inflow'){
-        var _u=String((ses.answers&&ses.answers.unit)||'').trim();
-        if(_u && _u!=='NONE' && isCcmUnit(_u)){
-          try{
-            var _r=await raiseCcmReceipt({unit:_u, amount:ses.answers.amount, mode:ses.answers.mode,
-              date:ses.answers.date, payer:ses.answers.fromWhom, account:ses.answers.bankAc,
-              entity:ses.answers.entity, raisedBy:(msg&&msg.from)||'', ledgerRow:out.recordArgs.row});
-            if(_r) ledgerSuffix += '\n\ud83c\udfe0 Sent to the capital group for Umesh/Gautam to confirm before it posts to '+_u+'\u2019s cover ('+_r.receiptId+').';
-          }catch(e){ console.error('[Inflow] raiseCcmReceipt:', e.message); }
-        }
       }
     }
     if(out.done) delete st.sessions[key];
@@ -2747,21 +2662,6 @@ async function handlePromoterVerdicts(msg){
   try{
     if(msg.from !== CONFIG.APPROVAL_GROUP_JID) return false;
     var author = (msg.author||'');
-    // CCM receipt confirmations ("yes 218-FF" / "no 218-FF" / "pending receipts") are
-    // handled first: they are Umesh/Gautam's to confirm, not an M+S approval.
-    try{
-      var rphone=String(author).split('@')[0].replace(/[^0-9]/g,'');
-      if(rphone.length<11){
-        // @lid author - resolve the same way the DM auth gate does, incl. the learned map
-        if(LID_MAP[author]) rphone=LID_MAP[author];
-        else { try{ var rc=await waClient.getContactById(author);
-          var cand=[rc&&rc.number, rc&&rc.id&&rc.id.user];
-          for(var ci=0;ci<cand.length;ci++){ var dg=String(cand[ci]||'').replace(/[^0-9]/g,'');
-            if(dg.length>=11&&dg.length<=13){ rphone=dg; lidRemember(author,dg,'receipt reply'); break; } }
-        }catch(e){} }
-      }
-      if(await handleCcmReceiptReply(msg, rphone)) return true;
-    }catch(e){ console.error('[Receipt reply]', e.message); }
     // v2.8.13: WhatsApp now delivers group authors as @lid IDs (e.g. 102469514330302@lid),
     // not phone numbers — so a raw phone-prefix check fails. Resolve role via
     // identifySender (name-based, same as the rest of the bot), with a phone fallback.
@@ -2769,31 +2669,6 @@ async function handlePromoterVerdicts(msg){
     if(!role){
       var who2 = await identifySender(author);
       if(who2 && (who2.role==='mm'||who2.role==='sm')) role = who2.role;
-    }
-    // If the author is an @lid and identifySender could not place them, resolve the
-    // phone the same way the DM auth gate does - learned map first, then the contact
-    // record - and match it against MM/SM. Without this an @lid author yields role=null
-    // and the ENTIRE verdict branch is skipped: no verdict recorded, no "Approved (M+S)"
-    // message, and the approvals panel reads 0/0/0 while people are actually approving.
-    if(!role && author){
-      var vp = LID_MAP[author] || '';
-      if(!vp){
-        try{
-          var vc = await waClient.getContactById(author);
-          var vcand = [vc && vc.number, vc && vc.id && vc.id.user];
-          for(var vi=0; vi<vcand.length; vi++){
-            var vd = String(vcand[vi]||'').replace(/[^0-9]/g,'');
-            if(vd.length>=11 && vd.length<=13){ vp = vd; break; }
-          }
-        }catch(e){}
-      }
-      if(vp===CONFIG.MM_PHONE) role='mm';
-      else if(vp===CONFIG.SM_PHONE) role='sm';
-      if(role){ lidRemember(author, vp, 'verdict author'); }
-      else {
-        console.log('[Verdicts] could not place author', author, '- resolved phone:', vp||'(none)');
-        authNote('unplaced-verdict', author, vp, '', 'author in the approval group could not be matched to MM or SM - their verdict was ignored');
-      }
     }
     if(!role) return false;
     var body = (msg.body||'').trim();
@@ -2986,32 +2861,6 @@ function pruneStaleDMState(state) {
     }
   });
 }
-// Persistent LID -> phone bindings. WhatsApp increasingly delivers DMs from an
-// @lid privacy identifier instead of a phone number. Resolution can fail transiently,
-// which silently dropped messages from authorised staff. We now remember every
-// successful resolution, and allow a manual bind via /api/auth-bind (panel auth).
-var LID_MAP_FILE='./wa_auth/lid_map.json';
-var LID_MAP=(function(){
-  try{ return JSON.parse(fs.readFileSync(LID_MAP_FILE,'utf8'))||{}; }catch(e){ return {}; }
-})();
-function lidMapSave(){
-  try{ fs.mkdirSync('./wa_auth',{recursive:true}); fs.writeFileSync(LID_MAP_FILE,JSON.stringify(LID_MAP,null,2)); }
-  catch(e){ console.log('[Auth] could not persist lid map:',e.message); }
-}
-function lidRemember(jid, phone, how){
-  if(!jid||!phone) return;
-  if(LID_MAP[jid]===phone) return;
-  LID_MAP[jid]=phone; lidMapSave();
-  console.log('[Auth] learned lid',jid,'->',phone,'('+(how||'auto')+')');
-}
-// Recent DM auth decisions - the gate is fail-closed and SILENT, so without this
-// a rejected sender just sees no reply. This makes the reason visible.
-var AUTH_LOG=[];
-function authNote(outcome, rawJid, phone, contactName, reason){
-  AUTH_LOG.unshift({at:new Date().toISOString(), outcome:outcome, jid:rawJid||'',
-                    phone:phone||'', name:contactName||'', reason:reason||''});
-  if(AUTH_LOG.length>60) AUTH_LOG.length=60;
-}
 async function isAuthorisedAccountant(rawJid, contactName) {
   if(!rawJid) return false;
   if(rawJid.indexOf('@g.us') >= 0) return false;
@@ -3020,22 +2869,12 @@ async function isAuthorisedAccountant(rawJid, contactName) {
     phoneOnly = rawJid.split('@')[0].replace(/[^0-9]/g, '');
   } else if(rawJid.indexOf('@lid') >= 0){
     var resolvedPhone = null;
-    // (a) remembered binding - survives restarts, immune to transient lookup failures
-    if(LID_MAP[rawJid]) resolvedPhone = LID_MAP[rawJid];
     try {
-      var contact = resolvedPhone?null:await waClient.getContactById(rawJid);
+      var contact = await waClient.getContactById(rawJid);
       if(contact){
         if(contact.number){
           var n = String(contact.number).replace(/[^0-9]/g, '');
           if(n.length >= 10 && n.length <= 13) resolvedPhone = n;
-        }
-        // (b) whatsapp-web.js often carries the real number on id.user for @lid contacts
-        if(!resolvedPhone && contact.id){
-          var cand2 = [contact.id.user, contact.id._serialized];
-          for(var k2=0;k2<cand2.length;k2++){
-            var d2 = String(cand2[k2]||'').replace(/[^0-9]/g,'');
-            if(d2.length>=11 && d2.length<=13){ resolvedPhone = d2; break; }
-          }
         }
         if(!resolvedPhone){
           var candidates = [contact.pushname, contact.name, contact.shortName, contact.verifiedName];
@@ -3067,16 +2906,12 @@ async function isAuthorisedAccountant(rawJid, contactName) {
     if(!resolvedPhone){
       if(CONFIG.LID_WHITELIST && CONFIG.LID_WHITELIST.indexOf(rawJid) >= 0){
         console.log('[Auth] LID', rawJid, 'allowed via LID_WHITELIST');
-        authNote('allow', rawJid, '', contactName, 'lid in LID_WHITELIST');
         return true;
       }
       console.log('[Auth] LID could not be resolved to a phone:', rawJid, '(name:', contactName, ')');
-      authNote('REJECT', rawJid, '', contactName,
-        'could not resolve this lid to a phone. Bind it: /api/auth-bind?jid='+encodeURIComponent(rawJid)+'&phone=<their number>');
       return false;
     }
     phoneOnly = resolvedPhone;
-    lidRemember(rawJid, phoneOnly, 'resolved');
     console.log('[Auth] LID', rawJid, 'resolved to phone', phoneOnly);
   } else {
     return false;
@@ -3085,11 +2920,9 @@ async function isAuthorisedAccountant(rawJid, contactName) {
   var whitelist = CONFIG.ACCOUNTANT_PHONES.concat([CONFIG.MM_PHONE, CONFIG.SM_PHONE]).concat(CONFIG.TEST_PHONES || []);
   if(whitelist.indexOf(phoneOnly) >= 0){
     console.log('[Auth] allow:', phoneOnly, '(', contactName, ')');
-    authNote('allow', rawJid, phoneOnly, contactName, 'phone in whitelist');
     return true;
   }
   console.log('[Auth] reject:', phoneOnly, '(', contactName, ') - not in whitelist');
-  authNote('REJECT', rawJid, phoneOnly, contactName, 'phone resolved but not in ACCOUNTANT_PHONES/MM/SM');
   return false;
 }
 function buildGroupPostFromDM(entry, posterName) {
@@ -5251,177 +5084,28 @@ async function generateDailyReport(dateStr){
   var tIn=0,tOut=0,inflows=[],outflows=[];
   entries.forEach(function(e){if(e.inOut==='IN'){tIn+=e.amount;inflows.push(e);}if(e.inOut==='OUT'){tOut+=e.amount;outflows.push(e);}});
   var byTag={};outflows.forEach(function(e){var t=e.tag||'Other';if(!byTag[t])byTag[t]={total:0,items:[]};byTag[t].total+=e.amount;byTag[t].items.push(e);});
-  // site vs office: a payment made out of a site pool was paid directly at site by Umesh
-  var siteOut=[],officeOut=[],siteTot=0,officeTot=0;
-  outflows.forEach(function(e){
-    if(isSiteAccount(e.bankAC)){ siteOut.push(e); siteTot+=e.amount; }
-    else { officeOut.push(e); officeTot+=e.amount; }
-  });
-  // receivables snapshot - best-effort: the report must still render if the tracker is slow or down
-  var recv=null;
-  try{
-    var rv=await buildReceivables(1);
-    if(rv&&rv.ok){
-      var todayIn=0, todayCount=0;
-      inflows.forEach(function(e){ if(unitFromNotes(e.notes)){ todayIn+=e.amount; todayCount++; } });
-      recv={ outstanding:rv.totals.outstanding, payable:rv.totals.payable,
-             paidToDate:rv.totals.paidToDate, pctCollected:rv.totals.pctCollected,
-             collectedToday:todayIn, receiptsToday:todayCount,
-             top:(rv.topOutstanding||[]).slice(0,5),
-             untagged:rv.untaggedCollections&&rv.untaggedCollections.amount||0 };
-    }
-  }catch(e){ console.log('[Report] receivables unavailable:', e.message); }
-  return{date:dateStr,totalIn:tIn,totalOut:tOut,net:tIn-tOut,inflows:inflows,outflows:outflows,byTag:byTag,
-    siteOutflows:siteOut,officeOutflows:officeOut,siteTotal:siteTot,officeTotal:officeTot,
-    receivables:recv,
-    fundPosition:fp,entryCount:entries.length};
+  return{date:dateStr,totalIn:tIn,totalOut:tOut,net:tIn-tOut,inflows:inflows,outflows:outflows,byTag:byTag,fundPosition:fp,entryCount:entries.length};
 }
 function buildReportHTML(data){
-  function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
-  var CSS='body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#fff;padding:22px;max-width:820px;margin:0 auto;color:#1c2333;-webkit-font-smoothing:antialiased}'
-   +'.hdr{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid #1c2333;padding-bottom:10px;margin-bottom:16px}'
-   +'.hdr h1{font-size:21px;margin:0;letter-spacing:-.2px}.hdr .dt{text-align:right;color:#6b7280;font-size:12px;line-height:1.5}'
-   +'.strip{display:flex;gap:9px;margin-bottom:6px}'
-   +'.mc{flex:1;border-radius:10px;padding:12px 14px;border:1px solid #e5e7eb}'
-   +'.mc.in{background:#f0fdf6;border-color:#bbe7cf}.mc.out{background:#fef4f3;border-color:#f3c9c4}.mc.net{background:#f3f6fd;border-color:#c9d6f3}'
-   +'.mc .lbl{font-size:10.5px;color:#6b7280;text-transform:uppercase;letter-spacing:.6px}'
-   +'.mc .val{font-size:21px;font-weight:700;margin-top:3px;letter-spacing:-.4px}'
-   +'.gn{color:#0a7a52}.rd{color:#b3372c}.bl{color:#2a4f9b}'
-   +'.sec{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:#374151;text-transform:uppercase;letter-spacing:.8px;margin:20px 0 7px}'
-   +'.sec:before{content:"";width:4px;height:15px;border-radius:2px;background:#9ca3af}'
-   +'.sec.i:before{background:#0a7a52}.sec.o:before{background:#b3372c}.sec.s:before{background:#d68910}.sec.f:before{background:#2a4f9b}'
-   +'.sec .cnt{font-weight:500;color:#9ca3af;letter-spacing:0;text-transform:none;font-size:11.5px}'
-   +'table{width:100%;border-collapse:collapse;font-size:12px}'
-   +'th{text-align:left;padding:6px 7px;background:#f3f4f6;font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;font-weight:600;border-bottom:1px solid #e5e7eb}'
-   +'td{padding:7px;border-bottom:1px solid #f1f2f4;vertical-align:top}'
-   +'tr:nth-child(even) td{background:#fbfbfc}'
-   +'.amt{text-align:right;font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}'
-   +'.sub{color:#9ca3af;font-size:10.5px;display:block;margin-top:1px}'
-   +'tr.tot td{border-top:2px solid #9ca3af;background:#f9fafb!important;font-weight:700}'
-   +'.chip{display:inline-block;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:600}'
-   +'.chip.site{background:#fdf0d9;color:#966206}.chip.off{background:#eaeef7;color:#2a4f9b}.chip.blk{background:#f4e6e4;color:#8a2d24}'
-   +'.split{display:flex;height:26px;border-radius:6px;overflow:hidden;margin:8px 0 4px;font-size:11px;font-weight:700;color:#fff}'
-   +'.split>div{display:flex;align-items:center;justify-content:center}'
-   +'.holding{background:#fffbeb;border:1px solid #f5d78e;border-radius:10px;padding:11px 14px;margin:8px 0 2px;display:flex;justify-content:space-between;align-items:center}'
-   +'.holding .l{font-size:11px;color:#966206;text-transform:uppercase;letter-spacing:.6px;font-weight:600}'
-   +'.holding .v{font-size:19px;font-weight:700;color:#966206}'
-   +'.empty{color:#9ca3af;font-size:11.5px;padding:6px 0}';
-  var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>'+CSS+'</style></head><body>';
+  var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:Arial,sans-serif;background:#fff;padding:20px;max-width:800px;margin:0 auto;color:#222}.hdr{text-align:center;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:15px}.hdr h1{font-size:22px;margin:0}.hdr p{color:#666;margin:4px 0 0}.metrics{display:flex;gap:10px;margin:15px 0}.mc{flex:1;background:#f5f5f5;border-radius:8px;padding:12px;text-align:center}.mc .lbl{font-size:11px;color:#888}.mc .val{font-size:20px;font-weight:bold;margin:4px 0 0}.gn{color:#0a7}.rd{color:#c33}.bl{color:#36a}.sec{font-size:14px;font-weight:bold;color:#555;border-bottom:1px solid #ddd;padding:8px 0 4px;margin:15px 0 8px}table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;padding:5px;background:#f0f0f0;font-size:11px;color:#666}td{padding:5px;border-top:1px solid #eee}.amt{text-align:right;font-family:monospace}tr.tot td{border-top:2px solid #999;font-weight:bold;background:#fafafa}.usb{color:#0a7}.unusb{color:#c33}</style></head><body>';
   var _wd=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   var _pd=parseSheetDate(data.date)||new Date(data.date);
   var _dd=isNaN(_pd)?data.date:(_wd[_pd.getDay()]+', '+('0'+_pd.getDate()).slice(-2)+'/'+('0'+(_pd.getMonth()+1)).slice(-2)+'/'+_pd.getFullYear());
-
-  h+='<div class="hdr"><div><h1>Daily MIS Report</h1></div>'
-   +'<div class="dt">'+esc(_dd)+'<br>'+data.entryCount+' transaction'+(data.entryCount===1?'':'s')+'</div></div>';
-
-  h+='<div class="strip">'
-   +'<div class="mc in"><div class="lbl">Money in</div><div class="val gn">'+formatINR(data.totalIn)+'</div></div>'
-   +'<div class="mc out"><div class="lbl">Money out</div><div class="val rd">'+formatINR(data.totalOut)+'</div></div>'
-   +'<div class="mc net"><div class="lbl">Net</div><div class="val '+(data.net>=0?'bl':'rd')+'">'+(data.net<0?'\u2212':'')+formatINR(Math.abs(data.net))+'</div></div></div>';
-
-  // ---- site vs office, right at the top: the question you actually ask ----
-  var sT=(data.siteTotal||0), oT=(data.officeTotal||0), tT=sT+oT;
-  if(tT>0){
-    var sp=Math.round(sT/tT*100), op=100-sp;
-    h+='<div class="sec s">Paid from <span class="cnt">site vs office</span></div>';
-    h+='<div class="split">'
-     +(sp>0?'<div style="width:'+sp+'%;background:#d68910">'+(sp>=14?('Site '+sp+'%'):'')+'</div>':'')
-     +(op>0?'<div style="width:'+op+'%;background:#2a4f9b">'+(op>=14?('Office '+op+'%'):'')+'</div>':'')
-     +'</div>';
-    h+='<table><tr><th>Paid from</th><th style="text-align:right">Items</th><th style="text-align:right">Amount</th></tr>'
-     +'<tr><td><span class="chip site">SITE</span> PDC held by Umesh</td><td class="amt">'+(data.siteOutflows||[]).length+'</td><td class="amt rd">'+formatINR(sT)+'</td></tr>'
-     +'<tr><td><span class="chip off">OFFICE</span> bank accounts</td><td class="amt">'+(data.officeOutflows||[]).length+'</td><td class="amt rd">'+formatINR(oT)+'</td></tr>'
-     +'</table>';
-  }
-
-  // ---- inflows ----
-  h+='<div class="sec i">Money in <span class="cnt">'+(data.inflows||[]).length+' receipt'+((data.inflows||[]).length===1?'':'s')+'</span></div>';
-  if((data.inflows||[]).length){
-    h+='<table><tr><th>From</th><th>Tag</th><th>Into</th><th style="text-align:right">Amount</th></tr>';
-    data.inflows.forEach(function(e){
-      h+='<tr><td>'+esc(e.description)+'<span class="sub">'+esc(e.entity)+'</span></td>'
-       +'<td>'+esc(e.tag)+'</td><td>'+esc(e.bankAC)+(isSiteAccount(e.bankAC)?' <span class="chip site">SITE</span>':'')+'</td>'
-       +'<td class="amt gn">'+formatINR(e.amount)+'</td></tr>';
-    });
-    h+='<tr class="tot"><td colspan="3">Total in</td><td class="amt gn">'+formatINR(data.totalIn)+'</td></tr></table>';
-  } else h+='<div class="empty">No receipts today.</div>';
-
-  // ---- receivables: what is still owed, and did it move today ----
-  if(data.receivables){
-    var R=data.receivables;
-    h+='<div class="sec f">Receivables <span class="cnt">across every sold unit</span></div>';
-    h+='<div class="strip" style="margin-bottom:4px">'
-     +'<div class="mc out"><div class="lbl">Still outstanding</div><div class="val rd">'+formatINR(R.outstanding)+'</div></div>'
-     +'<div class="mc in"><div class="lbl">Collected today</div><div class="val gn">'+formatINR(R.collectedToday)
-       +'</div><div class="sub" style="margin-top:2px">'+(R.receiptsToday||0)+' receipt'+((R.receiptsToday===1)?'':'s')+' against units</div></div>'
-     +'<div class="mc net"><div class="lbl">Collected to date</div><div class="val bl">'+R.pctCollected+'%</div>'
-       +'<div class="sub" style="margin-top:2px">'+formatINR(R.paidToDate)+' of '+formatINR(R.payable)+'</div></div></div>';
-    if((R.top||[]).length){
-      h+='<table><tr><th>Largest outstanding</th><th>Customer</th><th style="text-align:right">Collected</th><th style="text-align:right">Still owed</th></tr>';
-      R.top.forEach(function(u){
-        h+='<tr><td>'+esc(u.unit)+'</td><td>'+esc(u.customer)+'</td>'
-         +'<td class="amt" style="color:#6b7280">'+u.pctCollected+'%</td>'
-         +'<td class="amt rd">'+formatINR(u.outstanding)+'</td></tr>';
-      });
-      h+='</table>';
-    }
-    if(R.untagged>0){
-      h+='<div class="empty">'+formatINR(R.untagged)+' collected today is not tagged to a unit \u2014 it will not reduce any unit\u2019s balance.</div>';
-    }
-  }
-
-  // ---- outflows, site block first then office ----
-  function outTable(rows,label,chip){
-    if(!rows||!rows.length) return '';
-    var t=0; rows.forEach(function(e){ t+=e.amount; });
-    var s='<table><tr><th>'+label+'</th><th>Head</th><th>Mode</th><th style="text-align:right">Amount</th></tr>';
-    rows.forEach(function(e){
-      s+='<tr><td>'+esc(e.description)+'<span class="sub">'+esc(e.entity)+(e.bankAC?(' \u00b7 '+esc(e.bankAC)):'')+'</span></td>'
-       +'<td>'+esc(e.head)+'</td><td>'+esc(e.mode)+'</td><td class="amt rd">'+formatINR(e.amount)+'</td></tr>';
-    });
-    s+='<tr class="tot"><td colspan="3">Subtotal</td><td class="amt rd">'+formatINR(t)+'</td></tr></table>';
-    return s;
-  }
-  if((data.siteOutflows||[]).length){
-    h+='<div class="sec s">Paid at site <span class="cnt">PDC \u00b7 '+data.siteOutflows.length+' payment'+(data.siteOutflows.length===1?'':'s')+'</span></div>';
-    h+=outTable(data.siteOutflows,'Paid to','site');
-  }
-  if((data.officeOutflows||[]).length){
-    h+='<div class="sec o">Paid from office <span class="cnt">'+data.officeOutflows.length+' payment'+(data.officeOutflows.length===1?'':'s')+'</span></div>';
-    h+=outTable(data.officeOutflows,'Paid to','off');
-  }
-  if(!(data.outflows||[]).length) h+='<div class="sec o">Money out</div><div class="empty">No payments today.</div>';
-
-  // ---- fund position: banks, then what is held at site, then totals ----
-  h+='<div class="sec f">Fund position <span class="cnt">closing balances</span></div>';
-  var banks=[], siteRows=[], usable=0, blocked=0, siteHeld=0;
-  (data.fundPosition||[]).forEach(function(a){
-    if(isSiteAccount(a.bankAC)){ siteRows.push(a); siteHeld+=(a.closing||0); return; }
-    banks.push(a);
-    if(/^usable$/i.test((a.status||'').toString().trim())) usable+=(a.closing||0); else blocked+=(a.closing||0);
+  h+='<div class="hdr"><h1>Daily MIS Report</h1><p>'+_dd+' | '+data.entryCount+' transactions</p></div>';
+  h+='<div class="metrics"><div class="mc"><div class="lbl">Total Inflows</div><div class="val gn">'+formatINR(data.totalIn)+'</div></div><div class="mc"><div class="lbl">Total Outflows</div><div class="val rd">'+formatINR(data.totalOut)+'</div></div><div class="mc"><div class="lbl">Net</div><div class="val '+(data.net>=0?'bl':'rd')+'">'+formatINR(data.net)+'</div></div></div>';
+  if(data.inflows.length>0){h+='<div class="sec">INFLOWS</div><table><tr><th>Description</th><th>Entity</th><th>Tag</th><th>Bank A/C</th><th style="text-align:right">Amount</th></tr>';data.inflows.forEach(function(e){h+='<tr><td>'+e.description+'</td><td>'+e.entity+'</td><td>'+e.tag+'</td><td>'+e.bankAC+'</td><td class="amt gn">'+formatINR(e.amount)+'</td></tr>';});h+='</table>';}
+  h+='<div class="sec">OUTFLOWS</div><table><tr><th>Description</th><th>Head</th><th>Entity</th><th>Tag</th><th>Bank A/C</th><th>Mode</th><th style="text-align:right">Amount</th></tr>';
+  data.outflows.forEach(function(e){h+='<tr><td>'+e.description+'</td><td>'+e.head+'</td><td>'+e.entity+'</td><td>'+e.tag+'</td><td>'+e.bankAC+'</td><td>'+e.mode+'</td><td class="amt rd">'+formatINR(e.amount)+'</td></tr>';});h+='</table>';
+  h+='<div class="sec">FUND POSITION</div><table><tr><th>Account</th><th style="text-align:right">Opening</th><th style="text-align:right">IN</th><th style="text-align:right">OUT</th><th style="text-align:right">Closing</th><th>Status</th></tr>';
+  var _usable=0,_unusable=0;
+  data.fundPosition.forEach(function(a){
+    var _isUsable=/^usable$/i.test((a.status||'').toString().trim());
+    if(_isUsable)_usable+=(a.closing||0);else _unusable+=(a.closing||0);
+    h+='<tr><td>'+a.bankAC+'</td><td class="amt">'+formatINR(a.opening)+'</td><td class="amt gn">'+formatINR(a.todayIn)+'</td><td class="amt rd">'+formatINR(a.todayOut)+'</td><td class="amt">'+formatINR(a.closing)+'</td><td>'+(a.status||'')+'</td></tr>';
   });
-  h+='<table><tr><th>Account</th><th style="text-align:right">Opening</th><th style="text-align:right">In</th><th style="text-align:right">Out</th><th style="text-align:right">Closing</th></tr>';
-  banks.forEach(function(a){
-    var blk=!/^usable$/i.test((a.status||'').toString().trim());
-    h+='<tr><td>'+esc(a.bankAC)+(blk?' <span class="chip blk">BLOCKED</span>':'')+'</td>'
-     +'<td class="amt">'+formatINR(a.opening)+'</td>'
-     +'<td class="amt gn">'+(a.todayIn?formatINR(a.todayIn):'\u2013')+'</td>'
-     +'<td class="amt rd">'+(a.todayOut?formatINR(a.todayOut):'\u2013')+'</td>'
-     +'<td class="amt">'+formatINR(a.closing)+'</td></tr>';
-  });
-  h+='<tr class="tot"><td colspan="4">Total usable in banks</td><td class="amt gn">'+formatINR(usable)+'</td></tr>';
-  if(blocked) h+='<tr class="tot"><td colspan="4">Total blocked</td><td class="amt rd">'+formatINR(blocked)+'</td></tr>';
-  h+='</table>';
-
-  if(siteRows.length){
-    siteRows.forEach(function(a){
-      h+='<div class="holding"><div><div class="l">Held at site \u00b7 '+esc(a.bankAC)+'</div>'
-       +'<div class="sub" style="color:#a1791f">opening '+formatINR(a.opening)+' \u00b7 in '+formatINR(a.todayIn)+' \u00b7 out '+formatINR(a.todayOut)+'</div></div>'
-       +'<div class="v">'+formatINR(a.closing)+'</div></div>';
-    });
-    h+='<div class="empty">Held at site is PDC with Umesh \u2014 shown separately from bank balances, not counted in usable funds.</div>';
-  }
-  h+='</body></html>';
+  h+='<tr class="tot"><td colspan="4">TOTAL USABLE (closing)</td><td class="amt usb">'+formatINR(_usable)+'</td><td>Usable</td></tr>';
+  h+='<tr class="tot"><td colspan="4">TOTAL UNUSABLE (closing)</td><td class="amt unusb">'+formatINR(_unusable)+'</td><td>Blocked</td></tr>';
+  h+='</table></body></html>';
   return h;
 }
 // ── v2.10.0-s5.2: approval catch-up (record-only) ─────────────────────────────
@@ -5529,15 +5213,7 @@ function buildPayableCodeBackfill(commit){
   return { totalApproved:approved.length, alreadyCoded:approved.length-toCode.length, toAssign:toCode.length, committed:!!commit, assigned:assigned };
 }
 // ── Endpoints ─────────────────────────────────────────────────────────────────
-app.get('/health',function(req,res){
-  // whatsapp:'connected' only means the session authenticated. It does NOT mean the
-  // bot can read or send - Store reads can be broken while the session is fine.
-  // waStoreOk is the honest signal: it probes one cheap Store read.
-  var lib='unknown';
-  try{ lib=require('whatsapp-web.js/package.json').version; }catch(e){}
-  res.json({status:'ok',version:SERVER_VERSION,whatsapp:waReady?'connected':'disconnected',
-    waLibVersion:lib, waWebPin:process.env.WA_WEB_VERSION_URL||'(none)',
-    sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
+app.get('/health',function(req,res){res.json({status:'ok',version:SERVER_VERSION,whatsapp:waReady?'connected':'disconnected',sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 // ── v2.8.18 endpoint lock: Basic Auth on all /api/* (/health stays open) ──────
 var _crypto = require('crypto');
 var PANEL_USER = process.env.PANEL_USER || '';
@@ -5717,11 +5393,6 @@ var TABS = [
     {ep:'/api/sales-features-status', ico:'\\u2699', label:'Sales features \u2014 status'},
     {ep:'/api/approvals-report?days=14', ico:'\\uD83D\\uDCCB', label:'Approvals report \u2014 last 14 days'},
     {ep:'/ask', ico:'\\uD83D\\uDCAC', label:'Ask the MIS \u2014 chat with your data'},
-    {ep:'/dashboard', ico:'\\uD83D\\uDCCA', label:'Master dashboard \u2014 inventory + sales'},
-    {ep:'/api/auth-recent', ico:'\\uD83D\\uDD11', label:'Who the bot accepted / rejected'},
-    {ep:'/api/wa-probe', ico:'\\uD83E\\uDE7A', label:'WhatsApp probe \u2014 which capability is broken'},
-    {ep:'/api/receivables?days=30', ico:'\\uD83D\\uDCC9', label:'Receivables \u2014 due, collected, usage'},
-    {ep:'/api/ccm-receipts', ico:'\\uD83E\\uDDFE', label:'CCM receipts \u2014 pending confirmation'},
     {ep:'/api/sales-feature?name=cancel&state=on', ico:'\\u2705', label:'Enable: Cancellation / refund', act:true, confirm:'Enable the cancellation + refund request flow in the sales group? It routes refunds/forego to M+S. Leave OFF if you only want booking live.'},
     {ep:'/api/sales-feature?name=cancel&state=off', ico:'\\u26D4', label:'Disable: Cancellation / refund', act:true, confirm:'Turn the cancellation flow OFF for the team?'},
     {ep:'/api/sales-feature?name=brokerage_adjust&state=on', ico:'\\u2705', label:'Enable: Brokerage adjust', act:true, confirm:'Enable brokerage set-off (moves broker commission to a target pool)? Money-moving \u2014 keep OFF unless you are supervising.'},
@@ -6067,26 +5738,7 @@ app.get('/api/pair',function(req,res){
   res.send('<html><body style="display:flex;justify-content:center;align-items:center;min-height:100vh;background:#111"><div style="text-align:center"><h1 style="color:white">Scan QR with WhatsApp</h1><img src="'+latestQRDataUrl+'" style="width:300px"/></div></body></html>');
 });
 app.get('/api/wa-status',function(req,res){res.json({connected:waReady});});
-app.get('/api/wa-probe',async function(req,res){
-  // Distinguishes a dead session from a library/WhatsApp-Web mismatch by testing
-  // each capability in isolation. Read failures with a one-letter message point at
-  // the library; a failure on getState points at the session.
-  var out={ waReady:!!waReady, hasClient:!!waClient, steps:{} };
-  async function step(name, fn){
-    try{ out.steps[name]={ ok:true, value: await fn() }; }
-    catch(e){ out.steps[name]={ ok:false, message:(e&&e.message)||String(e),
-        name:(e&&e.name)||'', frame:(e&&e.stack)?String(e.stack).split('\n')[1].trim():'' }; }
-  }
-  if(!waClient) return res.json(out);
-  await step('getState', function(){ return waClient.getState(); });
-  await step('clientInfoWid', function(){ return waClient.info && waClient.info.wid && waClient.info.wid._serialized; });
-  await step('getChats_count', async function(){ var c=await waClient.getChats(); return c.length; });
-  await step('getChatById_approvalGroup', async function(){ var c=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID); return c && c.name; });
-  await step('fetchMessages_5', async function(){ var c=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID); var m=await c.fetchMessages({limit:5}); return m.length; });
-  out.reading='If getState and clientInfoWid succeed but getChats/fetchMessages fail, the session is fine and whatsapp-web.js can no longer read the WhatsApp Web store - update the library. If getState itself fails, re-link the session.';
-  res.json(out);
-});
-app.get('/api/approval-backfill',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var days=parseInt(req.query.days)||30;var commit=req.query.commit==='1'||req.query.commit==='true';var result=await buildVerdictBackfill(days,commit);res.json(result);}catch(e){res.json(errDetail(e));}});
+app.get('/api/approval-backfill',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var days=parseInt(req.query.days)||30;var commit=req.query.commit==='1'||req.query.commit==='true';var result=await buildVerdictBackfill(days,commit);res.json(result);}catch(e){res.json({error:e.message});}});
 app.get('/api/event-store',function(req,res){try{var s=loadEventStore();var limit=parseInt(req.query.limit)||200;var evs=s.events.slice(-limit).reverse();var counts={verdict:0,approved:0,paid:0};s.events.forEach(function(e){if(counts[e.type]!=null)counts[e.type]++;});res.json({version:s.version,createdAt:s.createdAt,totalEvents:s.events.length,counts:counts,showing:evs.length,events:evs});}catch(e){res.json({error:e.message});}});
 app.get('/api/payable-code-backfill',function(req,res){try{res.json(buildPayableCodeBackfill(req.query.commit==='1'||req.query.commit==='true'));}catch(e){res.json({error:e.message});}});
 app.get('/api/event-store-diff',async function(req,res){
@@ -6208,7 +5860,7 @@ app.get('/api/debug-replies',async function(req,res){try{if(!waReady)return res.
   res.json({count:out.length,replies:out});
 }catch(e){res.json({error:e.message});}});
 app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])));}catch(e){res.status(500).json({error:e.message});}});
-app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json(errDetail(e));}});
+app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
 app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.17',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
@@ -6462,773 +6114,6 @@ var ASK_HTML='<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewp
 '</script></body></html>';
 app.get('/ask', function(req,res){ res.type('html').send(ASK_HTML); });
 
-// ---- MASTER DASHBOARD: live inventory + sales-by-list + window leakage + collections ----
-async function fetchDashboard(){
-  // TRACKER_API_URL/SECRET live in process.env (they are passed into the sales module's
-  // deps object, NOT onto CONFIG) - reading CONFIG.* gave undefined and node-fetch then
-  // threw "Only absolute URLs are supported", which the dashboard displayed as its error.
-  const url=process.env.TRACKER_API_URL, secret=process.env.TRACKER_API_SECRET;
-  if(!url) return {ok:false,error:'TRACKER_API_URL is not set in the environment.'};
-  if(!/^https?:\/\//i.test(url)) return {ok:false,error:'TRACKER_API_URL must start with https:// - got: '+url};
-  const t0=Date.now();
-  const ctl=new AbortController();
-  const timer=setTimeout(function(){ ctl.abort(); }, 120000);   // 2 min ceiling
-  let r;
-  try{
-    r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},
-      body:JSON.stringify({secret:secret,action:'dashboard'}),signal:ctl.signal});
-  }catch(e){
-    clearTimeout(timer);
-    if(e.name==='AbortError') return {ok:false,error:'Tracker took longer than 120s. The dashboard aggregation may be reading too many covers - try again, or cut a new tracker deployment.'};
-    return {ok:false,error:'Could not reach the tracker: '+e.message};
-  }
-  clearTimeout(timer);
-  const txt=await r.text();
-  const ms=Date.now()-t0;
-  try{ const j=JSON.parse(txt); if(j&&typeof j==='object') j.fetchMs=ms; return j; }
-  catch(e){ return {ok:false,error:'Tracker did not return JSON (HTTP '+r.status+' after '+ms+'ms). First 200 chars: '+txt.slice(0,200)}; }
-}
-app.get('/api/dashboard-data', async function(req,res){
-  try{ res.json(await fetchDashboard()); }catch(e){ res.json({ok:false,error:e.message}); }
-});
-app.get('/dashboard', function(req,res){ res.type('html').send(DASH_HTML); });
-
-const DASH_HTML=`<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>CCM \u2014 Master Dashboard</title>
-<style>
-:root{--bg:#0E1220;--card:#161B2C;--line:#262E47;--ink:#E9EAF0;--dim:#8A90A6;--gold:#E8A33D;--green:#4BA88B;--red:#C4554D;--blue:#5B8DDB}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,sans-serif;padding:16px;max-width:1100px;margin:0 auto}
-h1{font-size:18px;letter-spacing:1px;margin:0 0 2px}h1 span{color:var(--gold)}
-.sub{color:var(--dim);font-size:12px;margin-bottom:16px}
-.grid{display:grid;gap:12px}.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}
-@media(max-width:720px){.g4,.g3{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
-.k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-.v{font-size:22px;font-weight:600;margin-top:4px}.v.sm{font-size:16px}
-.sec{margin-top:22px;font-size:13px;letter-spacing:1px;color:var(--gold);text-transform:uppercase}
-table{width:100%;border-collapse:collapse;margin-top:8px}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);font-size:13px}
-th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase}
-td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
-.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:6px}.bar>i{display:block;height:100%;background:var(--green)}
-.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px}
-.pill.warn{background:rgba(196,85,77,.18);color:#e8877f}.pill.ok{background:rgba(75,168,139,.18);color:#6fc4a8}
-.load{color:var(--dim);padding:40px;text-align:center}
-.btn{background:var(--card);border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:9px 14px;font-size:13px;cursor:pointer;min-height:40px}
-.btn:hover{border-color:var(--gold)}
-@media(max-width:760px){
-  body{padding:12px 10px;font-size:15px}
-  h1{font-size:16px}
-  .grid.g4,.grid.g3,.grid.g2{grid-template-columns:1fr 1fr}
-  .card{padding:12px}
-  .v{font-size:19px}.v.sm{font-size:15px}
-  .sec{margin-top:20px;font-size:12px}
-  table{display:block}
-  tr:first-child th{display:none}
-  table tr{display:block;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:10px;background:var(--card)}
-  table td{display:flex;justify-content:space-between;align-items:baseline;gap:12px;border:0;padding:4px 0;text-align:right}
-  table td::before{content:attr(data-l);color:var(--dim);font-size:12px;text-align:left;flex:0 0 auto}
-  table td:first-child{font-weight:600;font-size:16px;border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:4px}
-  table td:first-child::before{content:''}
-  table tr[id^=det]{background:#10152a}
-  table tr[id^=det] td{display:block;text-align:left}
-  table tr[id^=det] td::before{content:''}
-  #aiq{font-size:15px}
-  .aiRow{flex-direction:column}
-  .aiRow .btn{width:100%;justify-content:center}
-}
-</style></head><body>
-<h1>Capital Central Market \u2014 <span>Master Dashboard</span></h1>
-<div class="sub" id="ts">loading\u2026</div>
-<div id="app"><div class="load">Pulling live data from the tracker\u2026</div></div>
-<script>
-function cr(n){n=Number(n)||0;if(n>=1e7)return '\u20b9'+(n/1e7).toFixed(2)+' Cr';if(n>=1e5)return '\u20b9'+(n/1e5).toFixed(2)+' L';return '\u20b9'+n.toLocaleString('en-IN');}
-function pct(a,b){b=Number(b)||0;return b>0?Math.round(Number(a)/b*100):0;}
-
-
-async function askAI(){
-  const inp=document.getElementById('aiq'), out=document.getElementById('aians');
-  const q=(inp.value||'').trim(); if(!q) return;
-  out.innerHTML='<span style="color:var(--dim)">working\u2026</span>';
-  const t=document.getElementById('utab'); if(t) t.innerHTML='';        // clear stale results
-  window.__ai=null;
-  try{
-    const ctl=new AbortController(); const to=setTimeout(()=>ctl.abort(),45000);
-    const r=await fetch(window.location.origin+'/api/dashboard-ask',{method:'POST',
-      credentials:'same-origin',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question:q}),signal:ctl.signal});
-    clearTimeout(to);
-    const j=await r.json();
-    if(!j.ok){ out.innerHTML='<span style="color:#e8877f">'+(j.error||'failed')+'</span>'; renderUnits(); return; }
-    window.__ai=j;                                    // server already filtered, sorted, totalled
-    let msg='<div style="font-size:15px;font-weight:600">'+(j.answer||'')+'</div>';
-    if(j.title) msg+='<div style="color:var(--gold);font-size:12px;margin-top:4px">'+j.title+'</div>';
-    if(j.totalMatched>400) msg+='<div style="color:var(--dim);font-size:12px;margin-top:4px">showing the first 400 of '+j.totalMatched+'</div>';
-    if((j.skippedFilters||[]).length) msg+='<div style="color:#e8877f;font-size:12px;margin-top:4px">ignored filter(s) on '+j.skippedFilters.join(', ')+' \u2014 not in the current data; rebuild the cache</div>';
-    out.innerHTML=msg;
-    renderUnits();
-  }catch(e){ out.innerHTML='<span style="color:#e8877f">'+(e.name==='AbortError'?'timed out':e.message)+'</span>'; renderUnits(); }
-}
-function clearAI(){ window.__ai=null; const a=document.getElementById('aians'); if(a) a.innerHTML='';
-  const i=document.getElementById('aiq'); if(i) i.value=''; renderUnits(); }
-function applySpec(rows){
-  const sp=window.__spec; if(!sp) return rows;
-  const skipped=[];
-  (sp.filters||[]).forEach(f=>{
-    if(!f||!f.field) return;
-    // if no row has this field at all, the cache predates it - skip rather than return nothing
-    const present=rows.some(x=>x[f.field]!==undefined);
-    if(!present){ skipped.push(f.field); return; }
-    rows=rows.filter(x=>{
-      const v=x[f.field], t=f.value;
-      switch(f.op){
-        case 'eq': return String(v).toLowerCase()===String(t).toLowerCase();
-        case 'ne': return String(v).toLowerCase()!==String(t).toLowerCase();
-        case 'gt': return Number(v)>Number(t);
-        case 'gte': return Number(v)>=Number(t);
-        case 'lt': return Number(v)<Number(t);
-        case 'lte': return Number(v)<=Number(t);
-        case 'contains': return String(v||'').toLowerCase().indexOf(String(t).toLowerCase())>=0;
-        case 'isTrue': return v===true;
-        case 'isFalse': return v===false||v===undefined;
-        default: return true;
-      }
-    });
-  });
-  if(skipped.length){
-    const a=document.getElementById('aians');
-    if(a) a.innerHTML+='<div style="color:#e8877f;font-size:12px;margin-top:6px">Ignored filter(s) on '+skipped.join(', ')+
-      ' \u2014 that field is not in the current data. Rebuild the dashboard cache from the latest tracker.</div>';
-  }
-  if(sp.sort&&sp.sort.field){
-    const f=sp.sort.field, dir=(sp.sort.dir==='asc')?1:-1;
-    rows.sort((a,b)=>{ const x=a[f],y=b[f];
-      return (typeof x==='number'&&typeof y==='number') ? (x-y)*dir : String(x).localeCompare(String(y))*dir; });
-  }
-  return rows;
-}
-const MONEY_F=['tsv','disc','dp','gift','npv','payable','netReal','paid','balance','bkNetComm','bkPaid','bkPending'];
-const LABEL={unit:'Unit',customer:'Customer',broker:'Broker',booked:'Booked on',soldOn:'Sold on',
-  activeThen:'Active then',mismatch:'Mismatch',isPlot:'Plot',tsv:'TSV',disc:'Discount',dp:'DP disc',
-  gift:'Gift',npv:'NPV',payable:'Payable',netReal:'Net realization',paid:'Paid',balance:'Balance',
-  bkNetComm:'Commission',bkPaid:'Comm paid',bkPending:'Comm pending'};
-function cellVal(x,f){
-  if(MONEY_F.indexOf(f)>=0) return cr(x[f]||0);
-  if(f==='mismatch'||f==='isPlot') return x[f]?'yes':'no';
-  return (x[f]===undefined||x[f]==='')?'\u2014':String(x[f]);
-}
-function setSort(k){ if(window.__sort===k){ window.__dir*=-1; } else { window.__sort=k; window.__dir=(k==='date'?-1:1); } renderUnits(); }
-function setFilt(f){ window.__filt=f; renderUnits(); }
-function renderUnits(){
-  const t=document.getElementById('utab'); if(!t) return;
-  let rows=(window.__U||[]).slice();
-  const ai=window.__ai;
-  if(ai){
-    rows=ai.rows||[];
-    const sp=ai.spec||{};
-    const cols=(sp.columns&&sp.columns.length)?sp.columns:['unit','customer','booked','soldOn','tsv','paid'];
-    if(ai.groups&&ai.groups.length){
-      let gh='<tr><th>'+(LABEL[sp.groupBy]||sp.groupBy)+'</th><th class="n">Units</th><th class="n">Sale value</th><th class="n">Paid</th><th class="n">Commission</th><th class="n">Pending</th></tr>';
-      ai.groups.forEach(g=>{ gh+='<tr><td>'+g.key+'</td><td data-l="Units" class="n">'+g.count+'</td><td data-l="Sale value" class="n">'+cr(g.tsv||0)+
-        '</td><td data-l="Paid" class="n">'+cr(g.paid||0)+'</td><td data-l="Commission" class="n">'+cr(g.bkNetComm||0)+
-        '</td><td data-l="Pending" class="n"'+((g.bkPending||0)>0?' style="color:#e8877f"':'')+'>'+cr(g.bkPending||0)+'</td></tr>'; });
-      t.innerHTML=gh; window.__rows=rows; return;
-    }
-    let hh='<tr>'+cols.map(c=>'<th'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+(LABEL[c]||c)+'</th>').join('')+'</tr>';
-    rows.forEach(x=>{ hh+='<tr>'+cols.map(c=>'<td data-l="'+(LABEL[c]||c)+'"'+(MONEY_F.indexOf(c)>=0?' class="n"':'')+'>'+cellVal(x,c)+'</td>').join('')+'</tr>'; });
-    // totals for any money columns in the view
-    const mcols=cols.filter(c=>MONEY_F.indexOf(c)>=0);
-    if(mcols.length&&rows.length){
-      hh+='<tr style="border-top:2px solid var(--line);font-weight:600">'+cols.map(c=>{
-        if(c===cols[0]) return '<td>TOTAL ('+rows.length+')</td>';
-        if(MONEY_F.indexOf(c)>=0) return '<td class="n">'+cr(rows.reduce((s,x)=>s+(Number(x[c])||0),0))+'</td>';
-        return '<td></td>'; }).join('')+'</tr>';
-    }
-    t.innerHTML=hh; window.__rows=rows; return;
-  }
-  if(window.__filt==='mismatch') rows=rows.filter(x=>x.mismatch);
-  if(window.__filt==='pending')  rows=rows.filter(x=>(x.bkPending||0)>0);
-  rows.sort((a,b)=> window.__sort==='date'
-    ? ((a.bookedTs||0)-(b.bookedTs||0))*window.__dir
-    : a.unit.localeCompare(b.unit)*window.__dir);
-  const sd=document.getElementById('sdir'); if(sd) sd.textContent=(window.__sort==='date'?(window.__dir<0?'\u2193':'\u2191'):'');
-  let h='<tr><th>Unit</th><th>Booked on</th><th>Sold on</th><th>Active then</th><th class="n">TSV</th><th class="n">Paid</th><th class="n">Bkg pending</th></tr>';
-  rows.forEach((x,i)=>{
-    const bg=x.mismatch?' style="background:rgba(196,85,77,.10)"':'';
-    h+='<tr'+bg+' onclick="toggleUnit('+i+')" style="cursor:pointer">'+
-       '<td>'+x.unit+(x.customer&&x.customer!=='\u2014'?('<span style="font-weight:400;font-size:13px;color:var(--dim)"> \u00b7 '+x.customer+'</span>'):'')+'</td>'+
-       '<td data-l="Booked on" style="color:var(--dim)">'+(x.booked||'\u2014')+'</td>'+
-       '<td data-l="Sold on">'+x.soldOn+'</td>'+
-       '<td data-l="Active then"'+(x.mismatch?' class="pill warn"':' style="color:var(--dim)"')+'>'+x.activeThen+'</td>'+
-       '<td data-l="TSV" class="n">'+cr(x.tsv)+'</td><td data-l="Paid" class="n">'+cr(x.paid)+'</td>'+
-       '<td data-l="Bkg pending" class="n"'+((x.bkPending||0)>0?' style="color:#e8877f"':' style="color:var(--dim)"')+'>'+((x.bkPending||0)>0?cr(x.bkPending):'\u2014')+'</td></tr>';
-    h+='<tr id="det'+i+'" style="display:none"><td colspan="7" style="background:#10152a;padding:12px 14px">'+detail(x)+'</td></tr>';
-  });
-  t.innerHTML=h; window.__rows=rows;
-}
-function toggleUnit(i){ const r=document.getElementById('det'+i); if(r) r.style.display=(r.style.display==='none'?'table-row':'none'); }
-function row2(l,v,dim){ return '<div style="display:flex;justify-content:space-between;padding:3px 0'+(dim?';color:var(--dim)':'')+'"><span>'+l+'</span><span style="font-variant-numeric:tabular-nums">'+v+'</span></div>'; }
-function detail(x){
-  let a='<div style="font-weight:600;margin-bottom:6px">'+x.unit+' \u00b7 '+(x.customer||'\u2014')+'</div>';
-  a+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px">';
-  a+='<div>'+row2('Booked on',x.booked||'\u2014')+row2('Sold on list',x.soldOn)+
-     row2('List active then',x.activeThen)+row2('Broker',x.broker||'\u2014')+
-     (x.mismatch?'<div style="color:#e8877f;font-size:12px;margin-top:4px">sold on a list that was not active that day</div>':'')+'</div>';
-  a+='<div>'+row2('TSV',cr(x.tsv))+
-     (x.disc?row2('less on-form discount','('+cr(x.disc)+')',1):'')+
-     (x.dp?row2('less DP discount','('+cr(x.dp)+')',1):'')+
-     (x.gift?row2('less gift','('+cr(x.gift)+')',1):'')+
-     (x.npv?row2('less NPV','('+cr(x.npv)+')',1):'')+
-     row2('Payable by customer',cr(x.payable))+
-     row2('Net realization',cr(x.netReal))+'</div>';
-  a+='<div>'+row2('Paid to date',cr(x.paid))+row2('Balance',cr(x.balance))+
-     row2('Broker commission',cr(x.bkNetComm))+row2('Commission paid',cr(x.bkPaid),1)+
-     row2('Commission pending',cr(x.bkPending))+'</div>';
-  a+='</div>';
-  return a;
-}
-function tile(k,v,sm){return '<div class="card"><div class="k">'+k+'</div><div class="v'+(sm?' sm':'')+'">'+v+'</div></div>';}
-async function load(){
-  const app=document.getElementById('app');
-  let secs=0; const tick=setInterval(function(){ secs++;
-    app.innerHTML='<div class="load">Pulling live data from the tracker\u2026 '+secs+'s<br><span style="font-size:12px">reading '+'\u2248'+'250 unit covers, this can take up to a minute</span></div>'; },1000);
-  let d;
-  try{
-    const ctl=new AbortController(); const to=setTimeout(function(){ctl.abort();},150000);
-    const resp=await fetch(window.location.origin+'/api/dashboard-data',{credentials:'same-origin',signal:ctl.signal});
-    clearTimeout(to);
-    if(!resp.ok){ clearInterval(tick); app.innerHTML='<div class="load">HTTP '+resp.status+(resp.status===401?' \u2014 sign in to the panel first, then reload this page.':'')+'</div>'; return; }
-    d=await resp.json();
-  }catch(e){ clearInterval(tick);
-    app.innerHTML='<div class="load">'+(e.name==='AbortError'?'Timed out after 150s waiting for the tracker.':'Error: '+e.message)+'</div>'; return; }
-  clearInterval(tick);
-  if(!d||!d.ok){ document.getElementById('app').innerHTML='<div class="load">'+((d&&d.error)||'No data')+'</div>'; return; }
-  const stamp=d.computedAt?new Date(d.computedAt):(d.generated?new Date(d.generated):null);
-  let age='';
-  if(d.computedAt){ const mins=Math.round((Date.now()-stamp.getTime())/60000);
-    age=mins<90?(mins+' min ago'):(Math.round(mins/60)+' hr ago'); }
-  document.getElementById('ts').textContent=
-    (d.computedAt?('computed '+age+' \u00b7 '+stamp.toLocaleString('en-IN')):('live \u00b7 '+(stamp?stamp.toLocaleString('en-IN'):'')))
-    +(d.buildMs?(' \u00b7 built in '+Math.round(d.buildMs/1000)+'s'):'');
-  const I=d.inventory,M=d.money;
-  let h='';
-  // stale-cache guard: these fields only exist from schemaVersion 3 onward
-  const sample=(d.units&&d.units[0])||{};
-  const missing=[];
-  if(sample.bookedTs===undefined) missing.push('booking dates (date filters + sorting)');
-  if(sample.broker===undefined)   missing.push('broker names');
-  if(sample.bkPending===undefined)missing.push('brokerage paid / pending');
-  if(sample.customer===undefined) missing.push('customer names');
-  if(missing.length){
-    h+='<div class="card" style="border-color:#C4554D;background:rgba(196,85,77,.10);margin-bottom:14px">'+
-       '<div style="font-weight:600;color:#e8877f">This data was built by an older tracker version</div>'+
-       '<div style="font-size:13px;margin-top:6px">Missing: '+missing.join(' \u00b7 ')+'.</div>'+
-       '<div style="font-size:13px;margin-top:6px;color:var(--dim)">Fix: paste the latest tracker code \u2192 Save \u2192 Deploy \u2192 Manage deployments \u2192 New version, then run <b>buildDashboardCache</b> again.</div></div>';
-  }
-  h+='<div class="grid g4">'+
-     tile('Total units',I.units)+
-     tile('Sold',I.sold+' <span style="color:var(--dim);font-size:12px">/ '+I.unsold+' unsold</span>')+
-     tile('Total sales value',cr(M.tsv))+
-     tile('Collected',cr(M.paid))+'</div>';
-  h+='<div class="grid g3" style="margin-top:12px">'+
-     tile('Outstanding',cr(M.pending))+
-     tile('Collection %',pct(M.paid,M.tsv)+'%')+
-     tile('Cancelled / adjusted',I.cancelled||0)+'</div>';
-  const AV=d.available||{total:I.unsold,mortgaged:0,free:0};
-  const UV=d.unsoldValue||{total:0,mortgaged:0,free:0,unvaluedUnits:0,unvaluedPlots:0,atList:'',byConfig:{}};
-  h+='<div class="sec">Inventory still available'+(UV.atList?(' \u00b7 valued at the '+UV.atList+' (current) list'):'')+'</div>';
-  h+='<div class="grid g3">'+
-     tile('Unsold units',AV.total)+
-     tile('Gross value (list)',cr(UV.total))+
-     tile('Net after '+(UV.allowancePct||20)+'% brokerage/disc',cr(UV.netTotal||Math.round(UV.total*0.8)))+'</div>';
-  h+='<div class="grid g3" style="margin-top:12px">'+
-     tile('Free to sell',AV.free+' \u00b7 '+cr(UV.netFree||0)+' net')+
-     tile('Mortgaged',AV.mortgaged+' \u00b7 '+cr(UV.netMortgaged||0)+' net')+
-     tile('Not valued',(UV.unvaluedUnits||0)+' unit(s)'+(UV.unvaluedPlots?(' \u00b7 '+UV.unvaluedPlots+' plots'):''))+'</div>';
-
-  const BC=UV.byConfig||{};
-  const bcKeys=Object.keys(BC).sort((a,b)=>BC[b].value-BC[a].value);
-  if(bcKeys.length){
-    h+='<div class="card" style="margin-top:12px"><table><tr><th>Config</th><th class="n">Unsold units</th><th class="n">Price each</th><th class="n">Value</th></tr>';
-    bcKeys.forEach(k=>{const b=BC[k];
-      h+='<tr><td>'+k+'</td><td data-l="Unsold units" class="n">'+b.units+'</td><td data-l="Price each" class="n" style="color:var(--dim)">'+cr(b.unitPrice)+'</td><td data-l="Value" class="n">'+cr(b.value)+'</td></tr>';});
-    h+='</table></div>';
-  }
-
-  // sales by price list
-  h+='<div class="sec">Sales by price list</div><div class="card"><table><tr><th>List</th><th>Active window</th><th class="n">Units</th><th class="n">Sales value</th><th class="n">Collected</th></tr>';
-  const win={}; (d.listWindows||[]).forEach(w=>win[w.name]=w.from+' \u2192 '+w.until);
-  Object.keys(d.byList).sort().forEach(k=>{const b=d.byList[k];
-    h+='<tr><td>'+k+'</td><td style="color:var(--dim)">'+(win[k]||'\u2014')+'</td><td class="n">'+b.units+'</td><td class="n">'+cr(b.tsv)+'</td><td class="n">'+cr(b.paid)+'</td></tr>';});
-  h+='</table></div>';
-
-  // brokerage
-  const BK=d.brokerage||{entitled:0,paid:0,pending:0,byBroker:{}};
-  h+='<div class="sec">Brokerage</div><div class="grid g3">'+
-     tile('Commission entitled',cr(BK.entitled))+
-     tile('Paid to brokers',cr(BK.paid))+
-     tile('Still pending',cr(BK.pending))+'</div>';
-  const BBk=Object.keys(BK.byBroker||{}).filter(k=>BK.byBroker[k].entitled>0||BK.byBroker[k].pending>0)
-              .sort((a,b)=>BK.byBroker[b].pending-BK.byBroker[a].pending);
-  if(BBk.length){
-    h+='<div class="card" style="margin-top:12px"><table><tr><th>Broker</th><th class="n">Units</th><th class="n">Sales value</th><th class="n">Commission</th><th class="n">Paid</th><th class="n">Pending</th></tr>';
-    BBk.forEach(k=>{const b=BK.byBroker[k];
-      h+='<tr><td>'+k+'</td><td data-l="Units" class="n">'+b.units+'</td><td data-l="Sales value" class="n">'+cr(b.tsv)+'</td><td data-l="Commission" class="n">'+cr(b.entitled)+'</td>'+
-         '<td data-l="Paid" class="n" style="color:var(--dim)">'+cr(b.paid)+'</td>'+
-         '<td data-l="Pending" class="n"'+(b.pending>0?' style="color:#e8877f"':'')+'>'+cr(b.pending)+'</td></tr>';});
-    h+='</table></div>';
-  }
-
-  // per-unit: booking date, list sold on, list active at that date
-  const U=d.units||[];
-  const mism=U.filter(x=>x.mismatch).length;
-  h+='<div class="sec">Every sold unit \u2014 booking date vs price list</div><div class="card">';
-  h+= mism? ('<span class="pill warn">'+mism+' unit(s) sold on a list that was not active on the booking date</span>')
-          : '<span class="pill ok">Every sold unit matches the list active on its booking date</span>';
-  if(d.soldWithoutList) h+=' <span style="color:var(--dim);font-size:12px">\u00b7 '+d.soldWithoutList+' with no list set (plots / manual)</span>';
-  h+='<div class="card" style="margin-top:10px">'+
-     '<div style="font-size:12px;color:var(--dim);margin-bottom:8px">Ask for any cut of this data \u2014 e.g. \u201cunits sold below the active list, biggest gap first\u201d, \u201cbrokerage owed by broker\u201d, \u201cfloors booked in 2025 with balance over 50 lakh\u201d</div>'+
-     '<div class="aiRow" style="display:flex;gap:8px"><input id="aiq" placeholder="Describe the report you want\u2026" '+
-       'style="flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--ink);padding:9px 12px;font-size:13px">'+
-     '<button class="btn" style="background:var(--gold);color:#0E1220;border-color:var(--gold);font-weight:600" onclick="askAI()">Build</button>'+
-     '<button class="btn" onclick="clearAI()">Reset</button></div>'+
-     '<div id="aians" style="margin-top:10px;font-size:13px"></div></div>';
-  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">'+
-     '<button class="btn" onclick="setSort(&quot;date&quot;)">Booking date <span id="sdir"></span></button>'+
-     '<button class="btn" onclick="setSort(&quot;unit&quot;)">Unit</button>'+
-     '<button class="btn" onclick="setFilt(&quot;all&quot;)">All</button>'+
-     '<button class="btn" onclick="setFilt(&quot;mismatch&quot;)">Mismatches only</button>'+
-     '<button class="btn" onclick="setFilt(&quot;pending&quot;)">Brokerage pending</button>'+
-     '</div>';
-  h+='<div style="max-height:560px;overflow:auto"><table id="utab"></table></div>';
-  h+='<div style="color:var(--dim);font-size:12px;margin-top:6px">Tap any row for the full breakdown.</div></div>';
-
-  // by tower
-  h+='<div class="sec">By tower</div><div class="card"><table><tr><th>Tower</th><th class="n">Sold</th><th class="n">Sales value</th><th class="n">Collected</th><th class="n">Collection</th></tr>';
-  Object.keys(d.byTower).sort().forEach(k=>{const t=d.byTower[k];
-    h+='<tr><td>Tower '+k+'xx</td><td data-l="Sold" class="n">'+t.sold+'</td><td data-l="Sales value" class="n">'+cr(t.tsv)+'</td><td data-l="Collected" class="n">'+cr(t.paid)+'</td><td data-l="Collection" class="n">'+pct(t.paid,t.tsv)+'%<div class="bar"><i style="width:'+pct(t.paid,t.tsv)+'%"></i></div></td></tr>';});
-  h+='</table></div>';
-
-  // plot vs floor
-  h+='<div class="sec">Plots vs floors</div><div class="grid g2">'+
-     '<div class="card"><div class="k">Floors sold</div><div class="v sm">'+d.byType.floor.n+' \u00b7 '+cr(d.byType.floor.tsv)+'</div><div style="color:var(--dim);font-size:12px;margin-top:4px">collected '+cr(d.byType.floor.paid)+'</div></div>'+
-     '<div class="card"><div class="k">Plots sold</div><div class="v sm">'+d.byType.plot.n+' \u00b7 '+cr(d.byType.plot.tsv)+'</div><div style="color:var(--dim);font-size:12px;margin-top:4px">collected '+cr(d.byType.plot.paid)+'</div></div>'+
-     '</div>';
-  document.getElementById('app').innerHTML=h;
-  window.__U=U; window.__sort='date'; window.__dir=-1; window.__filt='all';
-  renderUnits();
-}
-load();   // manual reload only - the aggregation is heavy
-</script></body></html>`;
-
-// ---- AI report builder: turns a plain-English request into a VIEW SPEC that the
-// dashboard applies to the already-loaded unit rows. The model never sees all 253
-// rows (token cost) and never returns code (safety) - only a declarative spec that
-// the client applies deterministically.
-var UNIT_FIELDS={
-  unit:'unit id, e.g. 218-FF or 230A-PLOT',
-  customer:'customer name', broker:'broker name (or Direct)',
-  booked:'booking date as dd-MMM-yyyy text', bookedTs:'booking date as epoch ms - use this for date compares',
-  soldOn:'price list the unit was sold on: 1st..6th or (none)',
-  activeThen:'price list that was actually active on the booking date',
-  mismatch:'true when soldOn differs from activeThen',
-  isPlot:'true for plots, false for floors',
-  tsv:'total sale value', disc:'on-form discount', dp:'down-payment discount',
-  gift:'gift', npv:'NPV adjustment',
-  payable:'balance payable by customer after discounts', netReal:'net realization to company',
-  paid:'principal paid to date', balance:'balance still payable',
-  bkNetComm:'broker net commission', bkPaid:'commission paid to broker', bkPending:'commission still owed to broker'
-};
-// Applies an AI-produced view spec to the FULL unit set and computes real numbers.
-// The model decides WHAT to look at; this function does the counting and summing, so
-// figures can never be hallucinated.
-function applyViewSpec_(units, spec){
-  var rows=(units||[]).slice();
-  var skipped=[];
-  (spec.filters||[]).forEach(function(f){
-    if(!f||!f.field) return;
-    var present=rows.some(function(x){ return x[f.field]!==undefined; });
-    if(!present){ skipped.push(f.field); return; }
-    rows=rows.filter(function(x){
-      var v=x[f.field], t=f.value;
-      switch(f.op){
-        case 'eq':  return String(v).toLowerCase()===String(t).toLowerCase();
-        case 'ne':  return String(v).toLowerCase()!==String(t).toLowerCase();
-        case 'gt':  return Number(v)>Number(t);
-        case 'gte': return Number(v)>=Number(t);
-        case 'lt':  return Number(v)<Number(t);
-        case 'lte': return Number(v)<=Number(t);
-        case 'contains': return String(v||'').toLowerCase().indexOf(String(t).toLowerCase())>=0;
-        case 'isTrue':  return v===true;
-        case 'isFalse': return v===false;
-        default: return true;
-      }
-    });
-  });
-  if(spec.sort&&spec.sort.field){
-    var sf=spec.sort.field, dir=(spec.sort.dir==='asc')?1:-1;
-    rows.sort(function(a,b){ var x=a[sf], y=b[sf];
-      if(typeof x==='number'&&typeof y==='number') return (x-y)*dir;
-      return String(x==null?'':x).localeCompare(String(y==null?'':y))*dir; });
-  }
-  var MONEY=['tsv','disc','dp','gift','npv','payable','netReal','paid','balance','bkNetComm','bkPaid','bkPending'];
-  function sum(arr,f){ return arr.reduce(function(s,x){ return s+(Number(x[f])||0); },0); }
-  var stats={count:rows.length};
-  // always total the money fields present in the chosen columns (plus the usual suspects)
-  var wanted=(spec.columns&&spec.columns.length)?spec.columns:['tsv','paid','balance'];
-  MONEY.forEach(function(f){ if(wanted.indexOf(f)>=0) stats[f]=sum(rows,f); });
-  (spec.aggregate||[]).forEach(function(a){
-    if(!a||!a.field) return;
-    var f=a.field;
-    if(a.fn==='avg') stats['avg_'+f]=rows.length?Math.round(sum(rows,f)/rows.length):0;
-    else if(a.fn==='max') stats['max_'+f]=rows.reduce(function(m,x){ return Math.max(m,Number(x[f])||0); },0);
-    else if(a.fn==='min') stats['min_'+f]=rows.length?rows.reduce(function(m,x){ return Math.min(m,Number(x[f])||0); },Infinity):0;
-    else if(a.fn==='count') stats['count_'+f]=rows.filter(function(x){ return x[f]!==undefined&&x[f]!==''; }).length;
-    else stats[f]=sum(rows,f);
-  });
-  var groups=null;
-  if(spec.groupBy){
-    var g={};
-    rows.forEach(function(x){
-      var k=String(x[spec.groupBy]===undefined?'\u2014':x[spec.groupBy])||'\u2014';
-      var e=g[k]=g[k]||{key:k,count:0};
-      MONEY.forEach(function(f){ e[f]=(e[f]||0)+(Number(x[f])||0); });
-      e.count++;
-    });
-    groups=Object.keys(g).map(function(k){ return g[k]; })
-      .sort(function(a,b){ return (b.tsv||0)-(a.tsv||0); });
-  }
-  return {rows:rows, stats:stats, groups:groups, skippedFilters:skipped};
-}
-function inrShort_(n){ n=Number(n)||0;
-  if(Math.abs(n)>=1e7) return '\u20b9'+(n/1e7).toFixed(2)+' Cr';
-  if(Math.abs(n)>=1e5) return '\u20b9'+(n/1e5).toFixed(2)+' L';
-  return '\u20b9'+Math.round(n).toLocaleString('en-IN'); }
-function statsLine_(stats, spec){
-  var bits=[stats.count+' unit'+(stats.count===1?'':'s')];
-  ['tsv','paid','balance','bkNetComm','bkPaid','bkPending','netReal','payable','disc'].forEach(function(f){
-    if(stats[f]!==undefined && stats[f]!==0){
-      var lab={tsv:'sale value',paid:'collected',balance:'balance',bkNetComm:'commission',
-               bkPaid:'commission paid',bkPending:'commission pending',netReal:'net realization',
-               payable:'payable',disc:'discount'}[f]||f;
-      bits.push(lab+' '+inrShort_(stats[f]));
-    }
-  });
-  Object.keys(stats).forEach(function(k){
-    if(k.indexOf('avg_')===0) bits.push('avg '+k.slice(4)+' '+inrShort_(stats[k]));
-    if(k.indexOf('max_')===0) bits.push('max '+k.slice(4)+' '+inrShort_(stats[k]));
-  });
-  return bits.join('  \u00b7  ');
-}
-app.post('/api/dashboard-ask', express.json({limit:'100kb'}), async function(req,res){
-  try{
-    if(!CONFIG.CLAUDE_API_KEY) return res.json({ok:false,error:'CLAUDE_API_KEY is not set on the server.'});
-    var q=String((req.body&&req.body.question)||'').substring(0,500);
-    if(!q) return res.json({ok:false,error:'Ask something.'});
-    var d=await fetchDashboard();
-    if(!d||!d.ok) return res.json({ok:false,error:(d&&d.error)||'dashboard data unavailable'});
-    var units=d.units||[];
-    if(!units.length) return res.json({ok:false,error:'No unit rows in the dashboard cache. Run buildDashboardCache in Apps Script.'});
-
-    var sys='You convert a property developer\'s request into a JSON query spec over their unit table.\n'+
-      'Return ONLY JSON. No prose. No markdown fences. Shape:\n'+
-      '{"title":"short heading",\n'+
-      ' "filters":[{"field":"<field>","op":"eq|ne|gt|gte|lt|lte|contains|isTrue|isFalse","value":<number|string>}],\n'+
-      ' "sort":{"field":"<field>","dir":"asc|desc"},\n'+
-      ' "columns":["unit","customer","booked","soldOn","tsv","paid","balance"],\n'+
-      ' "groupBy":"<field or omit>",\n'+
-      ' "aggregate":[{"field":"tsv","fn":"sum"}]}\n'+
-      'CRITICAL RULES:\n'+
-      '- Use ONLY these fields: '+Object.keys(UNIT_FIELDS).join(', ')+'\n'+
-      '- For any date range use bookedTs (epoch milliseconds). Year 2025 = gte 1735689600000 and lte 1767225599000. '+
-        'Year 2026 = gte 1767225600000 and lte 1798761599000. Compute other years the same way.\n'+
-      '- "floors" means isPlot isFalse. "plots" means isPlot isTrue.\n'+
-      '- Amounts are plain rupees: 1 lakh = 100000, 1 crore = 10000000.\n'+
-      '- Counting/summing is done by the server, NOT by you. Never state numbers in the title.\n'+
-      '- Include in "columns" every field the user would want to see, max 7.\n'+
-      '- To group (e.g. "by broker", "by price list") set groupBy to that field.\n\n'+
-      'FIELD MEANINGS:\n'+JSON.stringify(UNIT_FIELDS);
-
-    var resp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
-      headers:{'Content-Type':'application/json','x-api-key':CONFIG.CLAUDE_API_KEY,'anthropic-version':'2023-06-01'},
-      body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:700,system:sys,
-        messages:[{role:'user',content:[{type:'text',text:q}]}]})});
-    if(!resp.ok) return res.json({ok:false,error:'AI error HTTP '+resp.status});
-    var data=await resp.json();
-    var text=''; (data.content||[]).forEach(function(c){ if(c.type==='text') text+=c.text; });
-    text=text.replace(/```json|```/g,'').trim();
-    var spec; try{ spec=JSON.parse(text); }catch(e){
-      return res.json({ok:false,error:'Could not understand that. Try rephrasing.',raw:text.slice(0,200)});
-    }
-    var r=applyViewSpec_(units, spec);
-    res.json({ok:true, spec:spec, title:spec.title||'', answer:statsLine_(r.stats,spec),
-              stats:r.stats, rows:r.rows.slice(0,400), groups:r.groups,
-              skippedFilters:r.skippedFilters, totalMatched:r.rows.length});
-  }catch(e){ res.json({ok:false,error:e.message}); }
-});
-app.get('/api/auth-bind',function(req,res){
-  // Bind an @lid identifier to a phone number so that sender is recognised from now on.
-  // Panel-auth protected (same as every /api/* route), so only you can do this.
-  // The phone must already be an authorised number - this maps identity, it does NOT
-  // grant new access, so a stranger's lid cannot be bound into the whitelist.
-  try{
-    var jid=String(req.query.jid||'').trim();
-    var phone=String(req.query.phone||'').replace(/[^0-9]/g,'');
-    if(!jid||!phone) return res.json({ok:false,error:'need ?jid=<...@lid>&phone=<digits>'});
-    if(jid.indexOf('@lid')<0) return res.json({ok:false,error:'jid must be an @lid identifier'});
-    var allowed=CONFIG.ACCOUNTANT_PHONES.concat([CONFIG.MM_PHONE,CONFIG.SM_PHONE]).concat(CONFIG.TEST_PHONES||[]);
-    if(allowed.indexOf(phone)<0){
-      return res.json({ok:false,error:'that phone is not an authorised number, so binding it would grant new access. Add it to ACCOUNTANT_PHONES first.',authorised:allowed});
-    }
-    lidRemember(jid,phone,'manual bind');
-    res.json({ok:true,bound:{jid:jid,phone:phone},note:'That sender is now recognised. Ask them to resend their message.',map:LID_MAP});
-  }catch(e){ res.json({ok:false,error:e.message}); }
-});
-app.get('/api/auth-unbind',function(req,res){
-  try{
-    var jid=String(req.query.jid||'').trim();
-    if(!jid||!LID_MAP[jid]) return res.json({ok:false,error:'no such binding',map:LID_MAP});
-    delete LID_MAP[jid]; lidMapSave();
-    res.json({ok:true,removed:jid,map:LID_MAP});
-  }catch(e){ res.json({ok:false,error:e.message}); }
-});
-// ── SITE FLOAT: PDC held at the Capital site with Umesh ───────────────────────
-// Site payments are made in PDC only. The pool is tracked as an account so the
-// existing Fund Position machinery (opening / in / out / closing / cheques)
-// picks it up with no new plumbing. A payment "direct from site" is one whose
-// account is Capital Site PDC.
-var SITE_ACCOUNTS=['Capital Site PDC'];
-function isSiteAccount(acct){
-  var a=String(acct||'').trim().toLowerCase();
-  return SITE_ACCOUNTS.some(function(s){ return s.toLowerCase()===a; });
-}
-// Site float position from the ledger: what came into the site pools, what was
-// paid out of them, and therefore what Umesh should be holding right now.
-async function buildSiteFloat(days){
-  days=Math.max(1,Math.min(365,parseInt(days,10)||30));
-  var end=new Date(), start=new Date(Date.now()-days*86400000);
-  var entries=await getLedgerRange(start,end);
-  var pdcIn=0, pdcOut=0, outRows=[], inRows=[];
-  var siteOut=0, officeOut=0;
-  entries.forEach(function(e){
-    var site=isSiteAccount(e.bankAC);
-    if(e.inOut==='OUT'){ if(site){ siteOut+=e.amount; pdcOut+=e.amount; outRows.push(e); } else officeOut+=e.amount; }
-    else if(site && e.inOut==='IN'){ pdcIn+=e.amount; inRows.push(e); }
-    else if(site && e.inOut==='TRANSFER'){ pdcOut+=e.amount; outRows.push(e); }   // handed over / deposited
-  });
-  return { windowDays:days,
-    pdc:{ received:pdcIn, paidOut:pdcOut, holding:pdcIn-pdcOut,
-          receipts:inRows.length, payments:outRows.length },
-    split:{ siteOut:siteOut, officeOut:officeOut,
-            sitePct:(siteOut+officeOut)>0?Math.round(siteOut/(siteOut+officeOut)*100):0 },
-    recentSitePayments:outRows.sort(function(a,b){ return (b.date||'')<(a.date||'')?-1:1; }).slice(0,25)
-      .map(function(e){ return {date:e.date,desc:e.description,head:e.head,mode:e.mode,amount:e.amount}; })
-  };
-}
-// ── RECEIVABLES: what is due per unit, and how collections are eating into it ──
-// Joins three books: the tracker's per-unit balances (payable / paid / balance),
-// the ledger's unit-tagged IN rows (what the accountant actually logged against
-// each unit), and where that money went (site PDC vs office accounts).
-// ── CCM RECEIPT CONFIRMATION ────────────────────────────────────────────────
-// An inflow logged against a CCM unit writes to the Ledger immediately (money
-// arrived), then posts a confirmation card to the capital group. Umesh or Gautam
-// reply "yes <unit>" and only then does it post to that unit's cover. The pending
-// list IS the reconciliation - nothing syncs silently.
-var RECEIPT_STORE='./wa_auth/ccm_receipts.json';
-var RECEIPT_CONFIRMERS=['919873574180','919773592304'];   // Umesh, Gautam
-function isCcmUnit(u){ return /^[0-9]{2,4}[A-Z]?(\s*\([^)]*\))?-(GF|FF|SF|TF|PLOT)$/i.test(String(u||'').trim()); }
-function loadReceipts(){ try{ return JSON.parse(fs.readFileSync(RECEIPT_STORE,'utf8'))||{items:{},seq:{}}; }
-  catch(e){ return {items:{},seq:{}}; } }
-function saveReceipts(s){ try{ fs.mkdirSync('./wa_auth',{recursive:true});
-  fs.writeFileSync(RECEIPT_STORE,JSON.stringify(s,null,2)); }catch(e){ console.log('[Receipt] save failed:',e.message); } }
-function mintReceiptId(store){
-  var d=new Date(), ist=new Date(d.getTime()+19800000);
-  var day=ist.toISOString().slice(2,10).replace(/-/g,'');
-  store.seq=store.seq||{}; store.seq[day]=(store.seq[day]||0)+1;
-  return 'R-'+day+'-'+('00'+store.seq[day]).slice(-3);
-}
-function receiptCard(r){
-  return ['\ud83d\udcb0 *RECEIPT TO CONFIRM* \u2014 '+r.unit,
-    '```',
-    'Amount   '+formatINR(r.amount),
-    'Mode     '+r.mode+(/cash|pdc/i.test(r.mode)?'  \u2192 cash column':'  \u2192 cheque column'),
-    'Date     '+r.date,
-    'From     '+(r.payer||'\u2014'),
-    'Into     '+(r.account||'\u2014'),
-    '```',
-    'Logged in the Ledger already. Reply *yes '+r.unit+'* to post it to the unit\u2019s cover,',
-    'or *no '+r.unit+'* if the unit is wrong.',
-    '_'+r.receiptId+'_'].join('\n');
-}
-// called from the inflow flow right after the ledger row is written
-async function raiseCcmReceipt(o){
-  if(!isCcmUnit(o.unit)) return null;                       // Vrindavan etc. stop at the ledger
-  var store=loadReceipts();
-  var rid=mintReceiptId(store);
-  var rec={ receiptId:rid, unit:String(o.unit).trim().toUpperCase(), amount:Number(o.amount)||0,
-            mode:o.mode||'', date:o.date||'', payer:o.payer||'', account:o.account||'',
-            entity:o.entity||'', status:'pending', raisedBy:o.raisedBy||'', at:Date.now(),
-            ledgerRow:o.ledgerRow||null };
-  store.items[rid]=rec; saveReceipts(store);
-  try{
-    var m=await waClient.sendMessage(CONFIG.CAPITAL_APPROVAL_JID||CONFIG.APPROVAL_GROUP_JID, receiptCard(rec));
-    rec.msgId=m&&m.id&&m.id._serialized; store.items[rid]=rec; saveReceipts(store);
-  }catch(e){ console.log('[Receipt] could not post card:',e.message); }
-  return rec;
-}
-// post a confirmed receipt onto the cover (tracker call is idempotent by receiptId)
-async function postReceiptToCover(rec){
-  var url=process.env.TRACKER_API_URL, secret=process.env.TRACKER_API_SECRET;
-  if(!url) return {ok:false,error:'TRACKER_API_URL not set'};
-  var r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},
-    body:JSON.stringify({secret:secret,action:'receipt',receiptId:rec.receiptId,
-      unit:rec.unit,amount:rec.amount,mode:rec.mode,date:rec.date,source:'inflow-group'})});
-  var txt=await r.text();
-  try{ return JSON.parse(txt); }catch(e){ return {ok:false,error:'tracker did not return JSON: '+txt.slice(0,150)}; }
-}
-// "yes <unit>" / "no <unit>" / "pending receipts" in the capital group
-async function handleCcmReceiptReply(msg, senderPhone){
-  var body=String(msg.body||'').trim();
-  var store=loadReceipts();
-  if(/^pending\s+receipts?$/i.test(body)){
-    var p=Object.keys(store.items).map(function(k){return store.items[k];})
-           .filter(function(x){return x.status==='pending';})
-           .sort(function(a,b){return a.at-b.at;});
-    if(!p.length){ await msg.reply('No receipts awaiting confirmation.'); return true; }
-    var lines=['*RECEIPTS AWAITING CONFIRMATION* ('+p.length+')',''];
-    p.forEach(function(x){
-      var hrs=Math.round((Date.now()-x.at)/3600000);
-      lines.push('\u2022 '+x.unit+'  '+formatINR(x.amount)+'  '+x.mode+'  \u00b7 '+(hrs<1?'just now':hrs+'h ago')+'  ('+x.receiptId+')');
-    });
-    lines.push('','Reply *yes <unit>* to post one to its cover.');
-    await msg.reply(lines.join('\n')); return true;
-  }
-  var m=body.match(/^(yes|no)\s+([0-9]{2,4}[A-Z]?(?:\s*\([^)]*\))?-(?:GF|FF|SF|TF|PLOT))$/i);
-  if(!m) return false;
-  var verdict=m[1].toLowerCase(), unit=m[2].trim().toUpperCase();
-  if(RECEIPT_CONFIRMERS.indexOf(senderPhone)<0){
-    await msg.reply('Only Umesh or Gautam can confirm receipts.'); return true;
-  }
-  var pend=Object.keys(store.items).map(function(k){return store.items[k];})
-          .filter(function(x){return x.unit===unit && x.status==='pending';})
-          .sort(function(a,b){return a.at-b.at;})[0];
-  if(!pend){
-    var already=Object.keys(store.items).map(function(k){return store.items[k];})
-      .filter(function(x){return x.unit===unit && x.status==='posted';}).pop();
-    await msg.reply(already
-      ? ('Nothing pending for '+unit+'. The last one ('+already.receiptId+', '+formatINR(already.amount)+') was already posted.')
-      : ('No pending receipt for '+unit+'.'));
-    return true;
-  }
-  if(verdict==='no'){
-    pend.status='rejected'; pend.rejectedBy=senderPhone; pend.rejectedAt=Date.now();
-    saveReceipts(store);
-    await msg.reply('\u274c '+pend.receiptId+' not posted to '+unit+'. The Ledger row stands \u2014 re-raise it against the right unit.');
-    return true;
-  }
-  var out=await postReceiptToCover(pend);
-  if(!out||!out.ok){
-    await msg.reply('\u26a0\ufe0f Could not post '+pend.receiptId+' to '+unit+': '+((out&&out.error)||'unknown error')+
-      '\nIt stays pending \u2014 reply *yes '+unit+'* to try again.');
-    return true;
-  }
-  pend.status='posted'; pend.postedAt=Date.now(); pend.postedBy=senderPhone;
-  pend.result={tranches:out.tranchesFilled,balanceAfter:out.balanceAfter,duplicate:!!out.duplicate};
-  saveReceipts(store);
-  if(out.duplicate){ await msg.reply('\u2713 '+pend.receiptId+' was already on the cover \u2014 nothing written twice.'); return true; }
-  await msg.reply(['\u2705 Posted to '+unit,'```',
-    'Receipt   '+formatINR(pend.amount)+' ('+out.column+')',
-    'Filled    '+(out.tranchesFilled||[]).join(' | '),
-    'Paid now  '+formatINR(out.paidToDate),
-    'Balance   '+formatINR(out.balanceAfter),
-    '```'].join('\n'));
-  return true;
-}
-app.get('/api/ccm-receipts',function(req,res){
-  var s=loadReceipts();
-  var all=Object.keys(s.items).map(function(k){return s.items[k];}).sort(function(a,b){return b.at-a.at;});
-  res.json({ pending:all.filter(function(x){return x.status==='pending';}),
-             posted:all.filter(function(x){return x.status==='posted';}).slice(0,50),
-             rejected:all.filter(function(x){return x.status==='rejected';}).slice(0,25),
-             confirmers:RECEIPT_CONFIRMERS,
-             note:'Inflows against CCM units post to the capital group for Umesh/Gautam to confirm before they reach the cover.' });
-});
-
-async function buildReceivables(days){
-  days=Math.max(1,Math.min(365,parseInt(days,10)||30));
-  var dash=await fetchDashboard();
-  if(!dash||!dash.ok) return {ok:false,error:(dash&&dash.error)||'dashboard data unavailable'};
-  var units=dash.units||[];
-  if(!units.length) return {ok:false,error:'No unit rows in the dashboard cache. Run buildDashboardCache.'};
-
-  var end=new Date(), start=new Date(Date.now()-days*86400000);
-  var entries=await getLedgerRange(start,end);
-
-  // collections in the window, keyed by unit where the row carries [unit:...]
-  var collected={}, untagged=0, untaggedRows=[], siteIn=0, officeIn=0;
-  entries.forEach(function(e){
-    if(e.inOut!=='IN') return;
-    var u=unitFromNotes(e.notes);
-    if(isSiteAccount(e.bankAC)) siteIn+=e.amount; else officeIn+=e.amount;
-    if(!u){ untagged+=e.amount; if(untaggedRows.length<25) untaggedRows.push({date:e.date,desc:e.description,amount:e.amount,tag:e.tag}); return; }
-    var c=collected[u]=collected[u]||{amount:0,rows:[]};
-    c.amount+=e.amount;
-    c.rows.push({date:e.date,amount:e.amount,mode:e.mode,into:e.bankAC,tag:e.tag});
-  });
-
-  // per-unit position from the tracker, enriched with this window's collections
-  var rows=[], totPayable=0, totPaid=0, totOutstanding=0, collectedInWindow=0;
-  units.forEach(function(u){
-    var payable=Number(u.payable)||0, paid=Number(u.paid)||0;
-    var bal=Number(u.balance)|| (payable>paid?payable-paid:0);
-    var c=collected[u.unit];
-    totPayable+=payable; totPaid+=paid; totOutstanding+=bal;
-    if(c) collectedInWindow+=c.amount;
-    rows.push({unit:u.unit, customer:u.customer||'\u2014', broker:u.broker||'',
-               payable:payable, paidToDate:paid, outstanding:bal,
-               collectedInWindow:c?c.amount:0, receipts:c?c.rows.length:0,
-               pctCollected: payable>0?Math.round(paid/payable*100):0});
-  });
-  rows.sort(function(a,b){ return b.outstanding-a.outstanding; });
-
-  // ledger rows tagged to a unit the tracker does not know about
-  var known={}; units.forEach(function(u){ known[u.unit]=true; });
-  var orphan=Object.keys(collected).filter(function(u){ return !known[u]; })
-              .map(function(u){ return {unit:u, amount:collected[u].amount}; });
-
-  return { ok:true, windowDays:days,
-    totals:{ payable:totPayable, paidToDate:totPaid, outstanding:totOutstanding,
-             collectedInWindow:collectedInWindow,
-             pctCollected: totPayable>0?Math.round(totPaid/totPayable*100):0 },
-    usage:{ intoSitePDC:siteIn, intoOfficeAccounts:officeIn,
-            sitePct:(siteIn+officeIn)>0?Math.round(siteIn/(siteIn+officeIn)*100):0 },
-    untaggedCollections:{ amount:untagged, rows:untaggedRows,
-      note:'IN rows with no [unit:...] tag - logged before the unit question existed, or answered "none".' },
-    orphanUnits:orphan,
-    topOutstanding:rows.filter(function(r){ return r.outstanding>0; }).slice(0,30),
-    movers:rows.filter(function(r){ return r.collectedInWindow>0; })
-             .sort(function(a,b){ return b.collectedInWindow-a.collectedInWindow; }).slice(0,30),
-    units:rows };
-}
-app.get('/api/receivables',async function(req,res){
-  try{ res.json(await buildReceivables(req.query.days||30)); }
-  catch(e){ res.json({ok:false,error:e.message}); }
-});
-// ── CCM RECEIPT CONFIRMATION ─────────────────────────────────────────────────
-// An inflow logged against a CCM unit writes the ledger row immediately (money
-// arrived), then posts a confirmation card to the capital group. Umesh or Gautam
-// confirms, and only then is it written onto the unit's cover. Unconfirmed
-app.get('/api/site-float',async function(req,res){
-  try{ res.json(await buildSiteFloat(req.query.days||30)); }
-  catch(e){ res.json({error:e.message}); }
-});
-app.get('/api/auth-recent',function(req,res){
-  res.json({note:'Most recent DM auth decisions, newest first. A REJECT means the bot silently ignored that message.',
-    whitelist:{accountants:CONFIG.ACCOUNTANT_PHONES, mm:CONFIG.MM_PHONE, sm:CONFIG.SM_PHONE,
-               lidWhitelist:CONFIG.LID_WHITELIST||[]},
-    learnedLidBindings:LID_MAP,
-    howToFix:'If you see a REJECT with an @lid and no phone, call /api/auth-bind?jid=<the jid>&phone=<their number>, then ask them to resend.',
-    decisions:AUTH_LOG});
-});
 app.get('/api/sales-features-status',function(req,res){try{res.json({features:loadSalesFeatures(),note:'Only enabled features respond in the sales group. Booking is the shipped default; the rest stay off until you switch them on here.'});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-feature',function(req,res){try{var name=String(req.query.name||'');var st=String(req.query.state||'').toLowerCase();if(!SALES_FEATURES_DEFAULT.hasOwnProperty(name))return res.json({error:'unknown feature '+name});if(st!=='on'&&st!=='off')return res.json({error:'state must be on|off'});var f=setSalesFeature(name,st==='on');res.json({success:true,feature:name,enabled:f[name],features:f});}catch(e){res.json({error:e.message});}});
 app.get('/api/sales-approval-status',function(req,res){try{res.json({skipApproval:loadSalesSkipApproval(),note:(loadSalesSkipApproval()?'SKIP is ON \u2014 bookings bypass M+S and go straight to the agent re-confirm, then commit.':'Approvals REQUIRED \u2014 bookings need M+S both-yes, then agent re-confirm.')});}catch(e){res.json({error:e.message});}});
@@ -7289,7 +6174,7 @@ app.get('/api/stale-scan',async function(req,res){try{if(!waReady)return res.jso
 app.get('/api/stale-state',function(req,res){try{res.json(loadStaleState());}catch(e){res.json({error:e.message});}});
 app.get('/api/stale-reset',function(req,res){try{saveStaleState({reminded:{}});res.json({success:true,message:'Stale reminder state cleared - next scan will re-send any 30+ min pending items'});}catch(e){res.json({error:e.message});}});
 app.get('/api/eod-send',async function(req,res){try{var r=await sendEODReport(req.query.date);res.json(r);}catch(e){res.json({error:e.message});}});
-app.get('/api/eod-preview',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var audit=await buildApprovalAudit(30);var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);var dayOfWeek=new Date(d).getDay();var isFriday=req.query.friday==='1'||dayOfWeek===5;var weekStats=isFriday?computeWeeklyMatcherStats():null;res.send(buildEODReportHTML({date:d,audit:audit,rec:rec,outliers:outliers,isFriday:isFriday,weekStats:weekStats}));}catch(e){res.status(500).json(errDetail(e));}});
+app.get('/api/eod-preview',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var audit=await buildApprovalAudit(30);var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);var dayOfWeek=new Date(d).getDay();var isFriday=req.query.friday==='1'||dayOfWeek===5;var weekStats=isFriday?computeWeeklyMatcherStats():null;res.send(buildEODReportHTML({date:d,audit:audit,rec:rec,outliers:outliers,isFriday:isFriday,weekStats:weekStats}));}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/eod-image',async function(req,res){try{var d=req.query.date||new Date().toISOString().split('T')[0];var audit=await buildApprovalAudit(30);var rec=await buildReconciliation(30);var outliers=await buildOutliers(rec);var dayOfWeek=new Date(d).getDay();var isFriday=req.query.friday==='1'||dayOfWeek===5;var weekStats=isFriday?computeWeeklyMatcherStats():null;var html=buildEODReportHTML({date:d,audit:audit,rec:rec,outliers:outliers,isFriday:isFriday,weekStats:weekStats});var img=await htmlToImage(html,460,2000);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/match-cache',function(req,res){try{res.json(loadMatchCache());}catch(e){res.json({error:e.message});}});
 app.get('/api/match-cache-clear',function(req,res){try{saveMatchCache({matches:{},rejected:{},manualPaid:{}});res.json({success:true});}catch(e){res.json({error:e.message});}});
@@ -7369,7 +6254,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.11.0-s6.14-dashboard | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.10.0-s5.17 | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
