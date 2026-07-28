@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.11.0-s6.14-dashboard';
+var SERVER_VERSION='2.11.0-s6.15-rawcapture';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -123,6 +123,70 @@ function clearStaleChromiumLocks() {
     });
   } catch(e) { console.error('[WA] lock cleanup:', e.message); }
 }
+// ── v2.11.0-s6.15: RAW REPLY CAPTURE (diagnostic only, changes no behaviour) ──
+// Why this exists: WhatsApp Store reads are currently throwing a minified error, so
+// getQuotedMessage() fails and every promoter swipe-reply verdict is silently dropped.
+// The library sets hasQuotedMsg from data.quotedMsg -- i.e. the quoted message ALREADY
+// arrives inside the incoming payload -- and keeps the raw payload on msg._data. If the
+// quoted id/body are present there, handlePromoterVerdicts can resolve a reply with NO
+// Store call at all. This records what actually arrives so the fix is written against
+// real data. Purely observational: it reads msg._data and writes a file. Nothing else.
+var RAW_CAPTURE_FILE = './wa_auth/raw_capture.json';
+var RAW_CAPTURE_MAX = 10;
+function loadRawCaptures(){
+  try{ if(fs.existsSync(RAW_CAPTURE_FILE)){ var c=JSON.parse(fs.readFileSync(RAW_CAPTURE_FILE,'utf8')); if(c&&Array.isArray(c.items)) return c; } }catch(e){}
+  return { items:[] };
+}
+function saveRawCaptures(c){
+  try{ if(!fs.existsSync('./wa_auth')) fs.mkdirSync('./wa_auth',{recursive:true});
+       fs.writeFileSync(RAW_CAPTURE_FILE, JSON.stringify(c,null,1)); }
+  catch(e){ console.error('[RawCapture] save:', e.message); }
+}
+function rawClip(v,n){ if(v===null||v===undefined) return null; var s=String(v); n=n||300; return s.length>n ? s.substring(0,n)+'\u2026' : s; }
+function rawJid(v){ if(v===null||v===undefined) return null; try{ return String(v._serialized||v.user&&(v.user+'@'+(v.server||''))||v); }catch(e){ return null; } }
+// Records the raw payload of an approval-group message. Wrapped so it can never throw
+// into the message pipeline -- a diagnostic must not be able to break the live bot.
+function captureRawMessage(msg){
+  try{
+    if(!msg || msg.from !== CONFIG.APPROVAL_GROUP_JID) return;
+    var d = msg._data || {};
+    var q = d.quotedMsg || null;
+    var rec = {
+      at: new Date().toISOString(),
+      replyBody: rawClip(msg.body, 200),
+      author: msg.author || msg.from || null,
+      msgId: (msg.id && (msg.id._serialized || msg.id.id)) || null,
+      hasQuotedMsg: !!msg.hasQuotedMsg,
+      // --- the fields that would replace getQuotedMessage() ---
+      quotedStanzaID: d.quotedStanzaID || null,
+      quotedParticipant: rawJid(d.quotedParticipant),
+      quotedRemoteJid: rawJid(d.quotedRemoteJid),
+      quotedMsgPresent: !!q,
+      quotedMsgKeys: q ? Object.keys(q) : [],
+      quotedBody: q ? rawClip(q.body || q.caption, 500) : null,
+      quotedId: (q && q.id) ? rawJid(q.id) : null,
+      quotedFromMe: (q && q.id && q.id.fromMe !== undefined) ? q.id.fromMe : null,
+      // --- sender identity without a Store lookup (needed to place M vs S) ---
+      senderPn: rawJid(d.senderPn),
+      participant: rawJid(d.participant),
+      authorAltKeys: Object.keys(d).filter(function(k){ return /quot|sender|particip|author|lid|\bpn\b/i.test(k); }),
+      // --- everything available, so nothing useful is missed ---
+      allKeys: Object.keys(d)
+    };
+    // Reconstruct the expense id the way the event store writes it, to prove it matches.
+    if(rec.quotedStanzaID){
+      var chat = msg.from;
+      var part = rec.quotedParticipant || rec.author || '';
+      rec.reconstructedId_fromMeTrue  = 'true_'  + chat + '_' + rec.quotedStanzaID + (part ? ('_' + part) : '');
+      rec.reconstructedId_fromMeFalse = 'false_' + chat + '_' + rec.quotedStanzaID + (part ? ('_' + part) : '');
+    }
+    var c = loadRawCaptures();
+    c.items.unshift(rec);
+    if(c.items.length > RAW_CAPTURE_MAX) c.items = c.items.slice(0, RAW_CAPTURE_MAX);
+    saveRawCaptures(c);
+    console.log('[RawCapture]', rec.msgId, '| hasQuoted:', rec.hasQuotedMsg, '| quotedMsgPresent:', rec.quotedMsgPresent, '| stanza:', rec.quotedStanzaID);
+  }catch(e){ console.error('[RawCapture]', e.message); }
+}
 function createWhatsAppClient() {
   clearStaleChromiumLocks();
   // ── WhatsApp Web version pin ────────────────────────────────────────────────
@@ -176,6 +240,7 @@ function createWhatsAppClient() {
     }, 10000);
   });
   waClient.on('message', function(msg) {
+    captureRawMessage(msg);   // v2.11.0-s6.15 diagnostic: record the raw payload before anything can fail
     sales.handleSalesMessage(msg).then(function(handledSales){
       if(handledSales) return;
       return handleInflowFlow(msg).then(function(handledInflow){
@@ -6086,6 +6151,19 @@ app.get('/api/wa-probe',async function(req,res){
   out.reading='If getState and clientInfoWid succeed but getChats/fetchMessages fail, the session is fine and whatsapp-web.js can no longer read the WhatsApp Web store - update the library. If getState itself fails, re-link the session.';
   res.json(out);
 });
+app.get('/api/debug-rawreply',function(req,res){
+  try{
+    var c = loadRawCaptures();
+    res.json({
+      count: c.items.length,
+      howToRead: 'Send a swipe-reply in the approval group, then reload this. If quotedMsgPresent is true and quotedStanzaID / quotedBody are populated, the verdict handler can identify the expense WITHOUT a Store call, and approvals can be fixed without changing library or migrating.',
+      items: c.items
+    });
+  }catch(e){ res.json({error:e.message}); }
+});
+app.get('/api/debug-rawreply-clear',function(req,res){
+  try{ saveRawCaptures({items:[]}); res.json({cleared:true}); }catch(e){ res.json({error:e.message}); }
+});
 app.get('/api/approval-backfill',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var days=parseInt(req.query.days)||30;var commit=req.query.commit==='1'||req.query.commit==='true';var result=await buildVerdictBackfill(days,commit);res.json(result);}catch(e){res.json(errDetail(e));}});
 app.get('/api/event-store',function(req,res){try{var s=loadEventStore();var limit=parseInt(req.query.limit)||200;var evs=s.events.slice(-limit).reverse();var counts={verdict:0,approved:0,paid:0};s.events.forEach(function(e){if(counts[e.type]!=null)counts[e.type]++;});res.json({version:s.version,createdAt:s.createdAt,totalEvents:s.events.length,counts:counts,showing:evs.length,events:evs});}catch(e){res.json({error:e.message});}});
 app.get('/api/payable-code-backfill',function(req,res){try{res.json(buildPayableCodeBackfill(req.query.commit==='1'||req.query.commit==='true'));}catch(e){res.json({error:e.message});}});
@@ -7369,7 +7447,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.11.0-s6.14-dashboard | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.11.0-s6.15-rawcapture | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
