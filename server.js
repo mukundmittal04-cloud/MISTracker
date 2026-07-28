@@ -11,12 +11,12 @@ const express = require('express');
 const { google } = require('googleapis');
 const fetch = require('node-fetch');
 const cron = require('node-cron');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('./wa-adapter'); // v2.12.0: engine = WPPConnect via adapter
 const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.11.0-s6.15-rawcapture';
+var SERVER_VERSION='2.12.0-wpp';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -5599,7 +5599,8 @@ app.get('/health',function(req,res){
   // bot can read or send - Store reads can be broken while the session is fine.
   // waStoreOk is the honest signal: it probes one cheap Store read.
   var lib='unknown';
-  try{ lib=require('whatsapp-web.js/package.json').version; }catch(e){}
+  try{ lib='wppconnect-'+require('@wppconnect-team/wppconnect/package.json').version; }
+  catch(e){ try{ lib=require('whatsapp-web.js/package.json').version; }catch(e2){} }
   res.json({status:'ok',version:SERVER_VERSION,whatsapp:waReady?'connected':'disconnected',
     waLibVersion:lib, waWebPin:process.env.WA_WEB_VERSION_URL||'(none)',
     sheets:sheetsApi?'initialized':'not configured',botEnabled:CONFIG.BOT_ENABLED,visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,visionCacheSize:visionCache.size,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
@@ -7447,7 +7448,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.11.0-s6.15-rawcapture | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.12.0-wpp | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
