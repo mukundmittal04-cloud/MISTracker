@@ -1,18 +1,18 @@
 {
   "name": "fidato-mis-tracker",
-  "version": "2.0.0",
-  "description": "Fidato Group MIS Daily Report + Approval Audit Server",
+  "version": "2.12.0",
+  "description": "Fidato Group MIS Daily Report + Approval Audit Server (engine: WPPConnect via wa-adapter)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "googleapis": "^118.0.0",
-    "node-fetch": "^2.6.9",
-    "node-cron": "^3.0.2",
-    "whatsapp-web.js": "https://codeload.github.com/wwebjs/whatsapp-web.js/tar.gz/refs/heads/main",
-    "qrcode": "^1.5.3",
-    "puppeteer": "^21.6.1"
+    "express": "4.18.2",
+    "googleapis": "118.0.0",
+    "node-fetch": "2.6.9",
+    "node-cron": "3.0.2",
+    "@wppconnect-team/wppconnect": "2.2.4",
+    "qrcode": "1.5.3",
+    "puppeteer": "21.6.1"
   }
 }
