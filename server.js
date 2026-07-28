@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.12.0-wpp';
+var SERVER_VERSION='2.12.1-wpp-undo';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -6165,6 +6165,93 @@ app.get('/api/debug-rawreply',function(req,res){
 app.get('/api/debug-rawreply-clear',function(req,res){
   try{ saveRawCaptures({items:[]}); res.json({cleared:true}); }catch(e){ res.json({error:e.message}); }
 });
+// ── v2.12.1: BACKFILL UNDO (surgical, dry-run by default) ────────────────────
+// Why: the 28 Jul catch-up re-derived verdicts from chat history AFTER the engine
+// swap and minted NEW itemIds for expenses that already existed, so 69 items were
+// re-approved as fresh - including several already PAID. Result: duplicate rows in
+// the payments summary and a real double-payment risk.
+//
+// This removes ONLY what that run created, identified two ways:
+//   verdict events : raw === '[backfill]'   (the marker the backfill writes)
+//   approved events: minted at/after `since` AND whose itemId is referenced only by
+//                    backfill verdicts (never by a human verdict event)
+// Anything a human actually did - real verdicts, every paid/closed/contribution
+// event, the whole ledger - is untouched. Dry-run unless &commit=1.
+function buildBackfillUndo(sinceIso, commit){
+  var store = loadEventStore();
+  var since = Date.parse(sinceIso || '') || 0;
+  var evs = store.events || [];
+
+  // itemIds that have at least one NON-backfill verdict = a human acted on them
+  var humanTouched = {};
+  evs.forEach(function(e){
+    if(e.type==='verdict' && e.raw !== '[backfill]') humanTouched[e.itemId] = true;
+  });
+
+  var dropVerdicts = [], dropApproved = [], keptBecauseHuman = [];
+  evs.forEach(function(e){
+    if(e.type==='verdict' && e.raw==='[backfill]' && (Date.parse(e.at)||0) >= since){
+      dropVerdicts.push(e); return;
+    }
+    if(e.type==='approved' && (Date.parse(e.at)||0) >= since){
+      if(humanTouched[e.itemId]) { keptBecauseHuman.push({itemId:e.itemId, label:e.label, amount:e.amount}); return; }
+      dropApproved.push(e); return;
+    }
+  });
+
+  var dropIds = {};
+  dropVerdicts.concat(dropApproved).forEach(function(e){ dropIds[e.seq] = true; });
+
+  // safety: never drop an item that has a paid/closed event (money already moved)
+  var protectedIds = {};
+  evs.forEach(function(e){ if(e.type==='paid'||e.type==='closed') protectedIds[e.itemId]=true; });
+  var protectedSkipped = [];
+  [dropVerdicts, dropApproved].forEach(function(list){
+    for(var i=list.length-1;i>=0;i--){
+      if(protectedIds[list[i].itemId]){ protectedSkipped.push({itemId:list[i].itemId,label:list[i].label,type:list[i].type}); delete dropIds[list[i].seq]; list.splice(i,1); }
+    }
+  });
+
+  var result = {
+    since: sinceIso || '(all time)',
+    totalEventsBefore: evs.length,
+    wouldRemoveVerdicts: dropVerdicts.length,
+    wouldRemoveApproved: dropApproved.length,
+    keptBecauseHumanAlsoActed: keptBecauseHuman.length,
+    skippedBecauseAlreadyPaidOrClosed: protectedSkipped.length,
+    sampleApprovedToRemove: dropApproved.slice(0,15).map(function(e){ return {itemId:e.itemId, label:e.label, amount:e.amount, code:e.code, at:e.at}; }),
+    committed: !!commit
+  };
+
+  if(commit){
+    var keep = evs.filter(function(e){ return !dropIds[e.seq]; });
+    _eventStoreCache.events = keep;
+    _persistEventStore();
+    // also strip the backfill entries from the verdict-override store
+    try{
+      var v = loadVerdicts(), changed = 0;
+      Object.keys(v).forEach(function(id){
+        ['mm','sm'].forEach(function(r){
+          if(v[id] && v[id][r] && v[id][r].raw === '[backfill]'){ delete v[id][r]; changed++; }
+        });
+        if(v[id] && !v[id].mm && !v[id].sm) delete v[id];
+      });
+      if(changed) saveVerdicts(v);
+      result.verdictOverridesCleaned = changed;
+    }catch(e){ result.verdictStoreError = e.message; }
+    result.totalEventsAfter = keep.length;
+    result.note = 'Removed. Paid/closed items were protected. Re-run the payments summary to confirm the list is clean.';
+  } else {
+    result.note = 'DRY-RUN - nothing changed. Add &commit=1 to apply.';
+  }
+  return result;
+}
+app.get('/api/backfill-undo',function(req,res){
+  try{
+    var since = req.query.since || new Date(Date.now()-6*3600000).toISOString();  // default: last 6h
+    res.json(buildBackfillUndo(since, req.query.commit==='1'||req.query.commit==='true'));
+  }catch(e){ res.json({error:e.message}); }
+});
 app.get('/api/approval-backfill',async function(req,res){try{if(!waReady)return res.json({error:'WhatsApp not connected'});var days=parseInt(req.query.days)||30;var commit=req.query.commit==='1'||req.query.commit==='true';var result=await buildVerdictBackfill(days,commit);res.json(result);}catch(e){res.json(errDetail(e));}});
 app.get('/api/event-store',function(req,res){try{var s=loadEventStore();var limit=parseInt(req.query.limit)||200;var evs=s.events.slice(-limit).reverse();var counts={verdict:0,approved:0,paid:0};s.events.forEach(function(e){if(counts[e.type]!=null)counts[e.type]++;});res.json({version:s.version,createdAt:s.createdAt,totalEvents:s.events.length,counts:counts,showing:evs.length,events:evs});}catch(e){res.json({error:e.message});}});
 app.get('/api/payable-code-backfill',function(req,res){try{res.json(buildPayableCodeBackfill(req.query.commit==='1'||req.query.commit==='true'));}catch(e){res.json({error:e.message});}});
@@ -7448,7 +7535,7 @@ cron.schedule('0 19 * * *',function(){
 initGoogleSheets();
 createWhatsAppClient();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.12.0-wpp | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.12.1-wpp-undo | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
