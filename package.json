@@ -11,7 +11,7 @@
     "googleapis": "^118.0.0",
     "node-fetch": "^2.6.9",
     "node-cron": "^3.0.2",
-    "whatsapp-web.js": "github:wwebjs/whatsapp-web.js",
+    "whatsapp-web.js": "https://codeload.github.com/wwebjs/whatsapp-web.js/tar.gz/refs/heads/main",
     "qrcode": "^1.5.3",
     "puppeteer": "^21.6.1"
   }
