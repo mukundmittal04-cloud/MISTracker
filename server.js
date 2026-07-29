@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.12.4-receipt-routing';
+var SERVER_VERSION='2.12.5-receipt-lid';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -2358,21 +2358,7 @@ async function handleInflowFlow(msg){
     // there can still be answered. Resolved the same way the auth gate does, so an
     // @lid author (linked device) still maps to a real phone.
     try{
-      var _rp = String(msg.author||msg.from||'').split('@')[0].replace(/[^0-9]/g,'');
-      if(_rp.length < 11){
-        var _aj = msg.author||msg.from||'';
-        if(LID_MAP[_aj]) _rp = LID_MAP[_aj];
-        else {
-          try{
-            var _c = await waClient.getContactById(_aj);
-            var _cand = [_c && _c.number, _c && _c.id && _c.id.user];
-            for(var _i=0;_i<_cand.length;_i++){
-              var _d = String(_cand[_i]||'').replace(/[^0-9]/g,'');
-              if(_d.length>=11 && _d.length<=13){ _rp=_d; lidRemember(_aj,_d,'inflow receipt reply'); break; }
-            }
-          }catch(e){}
-        }
-      }
+      var _rp = await resolvePhoneFromJid(msg.author||msg.from||'');
       if(await handleCcmReceiptReply(msg, _rp)) return true;
     }catch(e){ console.error('[Inflow] receipt reply:', e.message); }
 
@@ -2860,8 +2846,8 @@ async function handlePromoterVerdicts(msg){
     // CCM receipt confirmations ("yes 218-FF" / "no 218-FF" / "pending receipts") are
     // handled first: they are Umesh/Gautam's to confirm, not an M+S approval.
     try{
-      var rphone=String(author).split('@')[0].replace(/[^0-9]/g,'');
-      if(rphone.length<11){
+      var rphone=await resolvePhoneFromJid(author);
+      if(false){
         // @lid author - resolve the same way the DM auth gate does, incl. the learned map
         if(LID_MAP[author]) rphone=LID_MAP[author];
         else { try{ var rc=await waClient.getContactById(author);
@@ -7312,6 +7298,38 @@ function receiptCard(r){
     '_'+r.receiptId+'_'].join('\n');
 }
 // called from the inflow flow right after the ledger row is written
+// ── v2.12.5: one correct JID -> phone resolver ───────────────────────────────
+// The old inline versions tested `phone.length < 11` before attempting to resolve
+// an @lid. A WhatsApp lid is ~15 digits, so that test was false and the RAW LID was
+// compared against the confirmer list — which can never match. That is why Gautam's
+// "YES 206-TF" was rejected with "Only Umesh or Gautam can confirm receipts".
+// Correct rule: decide by the JID's SUFFIX, never by length. LID_MAP is consulted
+// first because the auth gate has already resolved and remembered this sender.
+async function resolvePhoneFromJid(jid){
+  var j = String(jid||'');
+  if(!j) return '';
+  if(LID_MAP[j]) return LID_MAP[j];                       // learned by the auth gate
+  if(j.indexOf('@c.us') >= 0){                            // plain phone JID
+    var p = j.split('@')[0].replace(/[^0-9]/g,'');
+    return (p.length>=11 && p.length<=13) ? p : '';
+  }
+  if(j.indexOf('@lid') >= 0){
+    try{
+      var c = await waClient.getContactById(j);
+      var cand = [c && c.number, c && c.id && c.id.user];
+      for(var i=0;i<cand.length;i++){
+        var d = String(cand[i]||'').replace(/[^0-9]/g,'');
+        if(d.length>=11 && d.length<=13){ lidRemember(j, d, 'receipt reply'); return d; }
+      }
+      var names=[c&&c.pushname,c&&c.name,c&&c.shortName,c&&c.verifiedName];
+      for(var n=0;n<names.length;n++){
+        var m=String(names[n]||'').match(/\+?(91)?[\s\-]?(\d{5})[\s\-]?(\d{5})/);
+        if(m){ var mp='91'+m[2]+m[3]; if(mp.length===12){ lidRemember(j, mp, 'receipt reply name'); return mp; } }
+      }
+    }catch(e){ console.log('[Receipt] lid resolve failed for', j, e.message); }
+  }
+  return '';
+}
 async function raiseCcmReceipt(o){
   if(!isCcmUnit(o.unit)) return null;                       // Vrindavan etc. stop at the ledger
   var store=loadReceipts();
@@ -7365,7 +7383,13 @@ async function handleCcmReceiptReply(msg, senderPhone){
   if(!m) return false;
   var verdict=m[1].toLowerCase(), unit=m[2].trim().toUpperCase();
   if(RECEIPT_CONFIRMERS.indexOf(senderPhone)<0){
-    await msg.reply('Only Umesh or Gautam can confirm receipts.'); return true;
+    // v2.12.5: say WHY. A silent "not you" when the sender IS Gautam wasted a live
+    // test; if the phone could not be resolved at all, that is the real fault.
+    console.log('[Receipt] rejected confirm from', msg.author||msg.from, '-> resolved phone:', senderPhone||'(none)');
+    await msg.reply(senderPhone
+      ? ('Only Umesh or Gautam can confirm receipts. Your number resolved as '+senderPhone+'.')
+      : 'Could not identify your number from this reply, so the receipt was not confirmed. Tell M \u2014 the linked device needs binding.');
+    return true;
   }
   var pend=Object.keys(store.items).map(function(k){return store.items[k];})
           .filter(function(x){return x.unit===unit && x.status==='pending';})
@@ -7629,7 +7653,7 @@ initGoogleSheets();
 createWhatsAppClient();
 startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.12.4-receipt-routing | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.12.5-receipt-lid | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
