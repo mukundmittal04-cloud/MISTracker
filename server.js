@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.12.3-wpp-ready';
+var SERVER_VERSION='2.12.4-receipt-routing';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -2352,6 +2352,29 @@ async function handleInflowFlow(msg){
     var body=(msg.body||'').trim();
     if(!body) return false;
     var send=function(t){ return waClient.sendMessage(CONFIG.INFLOW_GROUP_JID, t); };
+
+    // v2.12.4: receipt confirmations now land HERE, so the yes/no handler has to
+    // listen here too. The approval-group copy is kept so any card already posted
+    // there can still be answered. Resolved the same way the auth gate does, so an
+    // @lid author (linked device) still maps to a real phone.
+    try{
+      var _rp = String(msg.author||msg.from||'').split('@')[0].replace(/[^0-9]/g,'');
+      if(_rp.length < 11){
+        var _aj = msg.author||msg.from||'';
+        if(LID_MAP[_aj]) _rp = LID_MAP[_aj];
+        else {
+          try{
+            var _c = await waClient.getContactById(_aj);
+            var _cand = [_c && _c.number, _c && _c.id && _c.id.user];
+            for(var _i=0;_i<_cand.length;_i++){
+              var _d = String(_cand[_i]||'').replace(/[^0-9]/g,'');
+              if(_d.length>=11 && _d.length<=13){ _rp=_d; lidRemember(_aj,_d,'inflow receipt reply'); break; }
+            }
+          }catch(e){}
+        }
+      }
+      if(await handleCcmReceiptReply(msg, _rp)) return true;
+    }catch(e){ console.error('[Inflow] receipt reply:', e.message); }
 
     var st=loadPaidState(); prunePaidState(st);
     var key=who.key+'#io';                 // namespaced so it can't collide with an outflow paid session
@@ -7284,7 +7307,7 @@ function receiptCard(r){
     'From     '+(r.payer||'\u2014'),
     'Into     '+(r.account||'\u2014'),
     '```',
-    'Logged in the Ledger already. Reply *yes '+r.unit+'* to post it to the unit\u2019s cover,',
+    'Logged in the Ledger already. Reply *yes '+r.unit+'* here to post it to the unit\u2019s cover,',
     'or *no '+r.unit+'* if the unit is wrong.',
     '_'+r.receiptId+'_'].join('\n');
 }
@@ -7299,7 +7322,14 @@ async function raiseCcmReceipt(o){
             ledgerRow:o.ledgerRow||null };
   store.items[rid]=rec; saveReceipts(store);
   try{
-    var m=await waClient.sendMessage(CONFIG.CAPITAL_APPROVAL_JID||CONFIG.APPROVAL_GROUP_JID, receiptCard(rec));
+    // v2.12.4: receipt confirmations belong where the money was logged and where
+    // Umesh/Gautam already are — the INFLOW group. Previously this read
+    // CONFIG.CAPITAL_APPROVAL_JID, which is never set on CONFIG (it only exists
+    // inside the sales deps object), so every card silently fell back to the M+S
+    // approval group and cluttered it with collections work.
+    var _rcptJid = CONFIG.INFLOW_GROUP_JID || CONFIG.APPROVAL_GROUP_JID;
+    var m=await waClient.sendMessage(_rcptJid, receiptCard(rec));
+    rec.postedTo = _rcptJid;
     rec.msgId=m&&m.id&&m.id._serialized; store.items[rid]=rec; saveReceipts(store);
   }catch(e){ console.log('[Receipt] could not post card:',e.message); }
   return rec;
@@ -7599,7 +7629,7 @@ initGoogleSheets();
 createWhatsAppClient();
 startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.12.3-wpp-ready | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.12.4-receipt-routing | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
