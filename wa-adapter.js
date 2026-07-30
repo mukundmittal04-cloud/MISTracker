@@ -139,9 +139,27 @@ class Client extends EventEmitter {
 
   async initialize(){
     var self=this;
-    if(this._wpp){                      // already have a live session — re-announce, don't re-create
-      console.log('[adapter] initialize() called again; reusing existing session');
-      this._ready=true; self.emit('ready'); return this;
+    /* v2.13.6 - THE SILENT-BOT BUG. This used to check only that _wpp EXISTED and
+       then emit 'ready'. When the browser died, server.js re-called initialize() ten
+       seconds later, we returned early on a stale handle pointing at a dead page, and
+       waReady went true - so /health said "connected", sends sometimes still worked,
+       but onMessage was NEVER re-registered. Every inbound message vanished, group and
+       DM alike, with nothing in the logs. Verify the session is ALIVE; if not, tear it
+       down and build a real one. */
+    if(this._wpp){
+      var alive=false;
+      for(var _f of ['isConnected','isLogged','isAuthenticated']){
+        if(typeof this._wpp[_f]!=='function') continue;
+        try{ alive = !!(await this._wpp[_f]()); if(alive) break; }catch(e){ alive=false; }
+      }
+      if(alive){
+        console.log('[adapter] initialize() called again; existing session verified LIVE - reusing');
+        this._ready=true; self.emit('ready'); return this;
+      }
+      console.error('[adapter] existing session is DEAD - discarding the stale handle and re-creating (this is what used to silence inbound messages)');
+      try{ if(typeof this._wpp.close==='function') await this._wpp.close(); }catch(e){}
+      try{ if(typeof this._wpp.logout==='function' && false) await this._wpp.logout(); }catch(e){}
+      this._wpp=null; this._ready=false;
     }
     // wwebjs fires qr→authenticated→ready; reproduce that ordering.
     this._wpp = await wppconnect.create({
@@ -170,7 +188,13 @@ class Client extends EventEmitter {
                 '--no-first-run','--disable-gpu','--disable-extensions'] },
         process.env.PUPPETEER_EXECUTABLE_PATH ? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH } : {}
       ),
-      autoClose: 0,
+      /* autoClose: 0 DOES NOT DISABLE IT. Proven from the 30 Jul logs: we passed 0 and
+         wppconnect reported "Auto close configured to 180s" - zero is falsy, so it fell
+         back to its own default. When the session briefly unpaired and nobody scanned
+         within 180s, autoClose CLOSED THE PAGE. Everything after that was a dead
+         browser reporting itself healthy: /health said connected, sends worked for a
+         while, and every inbound message vanished. Pass a large number instead. */
+      autoClose: 2147483647,
       logQR: false, disableWelcome: true, updatesLog: false,
     });
 
@@ -187,6 +211,7 @@ class Client extends EventEmitter {
       try{ self.emit('message', new AdaptedMessage(self, raw)); }
       catch(e){ console.log('[adapter] message wrap failed:', e.message); }
     });
+    console.log('[adapter] onMessage REGISTERED - inbound messages will now be delivered');
     // conflict/logout while running
     if(this._wpp.onStateChange){
       this._wpp.onStateChange(function(st){
@@ -276,6 +301,17 @@ class Client extends EventEmitter {
       r = { _idLookupFailed:true };
     }
     return this._normalizeSendResult(r);
+  }
+  /* Ask the browser, not the cached flag. /health used waReady alone, which a false
+     'ready' emit could set on a dead session. */
+  async probeAlive(){
+    if(!this._wpp) return {alive:false, how:'no session object'};
+    for(var f of ['isConnected','isLogged','isAuthenticated']){
+      if(typeof this._wpp[f]!=='function') continue;
+      try{ var v=await this._wpp[f](); return {alive:!!v, how:f+'()='+v}; }
+      catch(e){ return {alive:false, how:f+'() threw: '+e.message}; }
+    }
+    return {alive:null, how:'no liveness method available on this wppconnect build'};
   }
   /* Is a number reachable? Used by /api/wa-can-message. */
   async canMessage(phone){
