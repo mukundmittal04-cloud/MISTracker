@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.12.5-receipt-lid';
+var SERVER_VERSION='2.13.1-daybook';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -2840,6 +2840,19 @@ function perVerdictNotice(v, whoLabel, label, amount){
   return null;
 }
 async function handlePromoterVerdicts(msg){
+  // ── v2.13 day-book override: M, in the approval group, lifts today's block ──
+  try{
+    if(msg && msg.from===CONFIG.APPROVAL_GROUP_JID && /^daybook\s+override$/i.test(String(msg.body||'').trim())){
+      var _ovPhone = await resolvePhoneFromJid(msg.author||msg.from);
+      if(!daybookMayOverride(_ovPhone)){
+        await msg.reply('You are not authorised to lift the day-book block.'); return true;
+      }
+      var _ov = daybookOverride(_ovPhone);
+      await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, _ov.msg);
+      return true;
+    }
+  }catch(e){ console.log('[Daybook] override:', e.message); }
+
   try{
     if(msg.from !== CONFIG.APPROVAL_GROUP_JID) return false;
     var author = (msg.author||'');
@@ -3350,6 +3363,50 @@ async function handleAccountantDM(msg) {
   console.log('[DM] from', senderInfo.contactName || rawFrom, ':', body.substring(0,80), hasMedia?'[+media]':'');
   var state = loadDMState();
   pruneStaleDMState(state);
+
+  // ── v2.13 day-book: commands first, then the gate. The gate blocks ONLY the
+  // START of a new expense; an in-flight session (draft or cash-sheet) continues.
+  // manual trigger: MM or 537000 DMs "ask abhishek" (or "daybook ask") and the bot
+  // sends him the same closure request the 11pm cron would, then confirms back.
+  if(/^(ask\s+abhishek|daybook\s+ask)$/i.test(body)){
+    var _akPhone = await resolvePhoneFromJid(rawFrom);
+    if(!daybookMayOverride(_akPhone)){
+      await waClient.sendMessage(rawFrom, 'Only M can ask Abhishek to close the day book.');
+      return true;
+    }
+    var _akOut = await daybookAskAbhishek(_akPhone);
+    await waClient.sendMessage(rawFrom, '\u2705 '+_akOut);
+    return true;
+  }
+  var _dbCmd = body.toLowerCase().match(/^daybook\s+(done|status)(?:\s+(\d{1,2}[\/.]\d{1,2}(?:[\/.]\d{2,4})?))?$/);
+  if(_dbCmd){
+    var _dbPhone = await resolvePhoneFromJid(rawFrom);
+    if(_dbCmd[1]==='status'){ await waClient.sendMessage(rawFrom, daybookStatusText()); return true; }
+    if(_dbPhone !== DAYBOOK_CLOSER_PHONE){
+      await waClient.sendMessage(rawFrom, 'Only Abhishek can close the day book. Your number resolved as '+(_dbPhone||'(unknown)')+'.');
+      return true;
+    }
+    var _dbRes = daybookClose(_dbCmd[2]||null, _dbPhone);
+    await waClient.sendMessage(rawFrom, _dbRes.msg);
+    if(_dbRes.closed && _dbRes.wasBlocking){
+      try{ await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID,
+        '\u2705 Day book '+_dbRes.date+' closed by Abhishek \u2014 new expense requests are open again.'); }catch(e){}
+    }
+    return true;
+  }
+  var _entryNow = state[rawFrom];
+  var _midFlow = !!(_entryNow && (_entryNow.step || _entryNow.sheet || (_entryNow.mediaIds&&_entryNow.mediaIds.length)));
+  var _ctrlWord = /^(cancel|status|whoami|help|hi|hello)$/i.test(body) || /^(ask\s+abhishek|daybook\s+)/i.test(body);
+  if(daybookIsBlocking() && !_midFlow && !_ctrlWord){
+    await waClient.sendMessage(rawFrom, daybookBlockMessage());
+    return true;
+  }
+
+  // ── v2.13 cash-sheet session: replies to a pending multi-item list ──
+  if(_entryNow && _entryNow.sheet){
+    var _shOut = await handleSheetReply(state, rawFrom, body, senderInfo);
+    if(_shOut) return true;
+  }
   if(/^\s*(cancel|reset|clear)\s*$/i.test(body)){
     delete state.pending[rawFrom];
     saveDMState(state);
@@ -3966,13 +4023,17 @@ async function handleAccountantDM(msg) {
           // If the image shows 2+ distinct payable amounts, refuse and ask for one at a time.
           // Cheques are exempt (they carry no expense amount).
           if(visionResult.imageType !== 'cheque' && visionResult.amountCount >= 2){
-            await waClient.sendMessage(rawFrom, [
-              'This image looks like it has ' + visionResult.amountCount + ' separate payments in it.',
-              '',
-              'Please send one expense per image — one bill/invoice at a time. Send the first one on its own, then the next after it is posted.',
-              '',
-              'Reply cancel to clear.'
-            ].join('\n'));
+            // v2.13: multi-amount images (site cash sheets, bill lists) are no longer
+            // refused. Read every line, confirm with the accountant, fan out.
+            var _items = await extractCashSheetItems(media);
+            if(!_items || !_items.length){
+              await waClient.sendMessage(rawFrom,
+                'I can see multiple amounts on this image but could not read the individual lines clearly. Please send the bills one at a time.');
+              return true;
+            }
+            state[rawFrom] = { sheet:{ items:_items, step:'confirm' }, ts:Date.now() };
+            saveDMState(state);
+            await waClient.sendMessage(rawFrom, sheetConfirmText(_items));
             return true;
           }
           entry.mediaIds.push(thisMsgId);
@@ -7349,8 +7410,32 @@ async function raiseCcmReceipt(o){
     var m=await waClient.sendMessage(_rcptJid, receiptCard(rec));
     rec.postedTo = _rcptJid;
     rec.msgId=m&&m.id&&m.id._serialized; store.items[rid]=rec; saveReceipts(store);
+    // v2.13 TSV-breach check: if this receipt exceeds what the unit still owes,
+    // ask up front how the excess should be classified, so the "yes" carries it.
+    try{
+      var pv=await trackerReceiptPreview(rec.unit, rec.amount, rec.mode);
+      if(pv && pv.ok && Number(pv.excessOverReceivable)>0){
+        rec.excess=Number(pv.excessOverReceivable); store.items[rid]=rec; saveReceipts(store);
+        await waClient.sendMessage(_rcptJid, ['\u26a0\ufe0f *'+rec.unit+' \u2014 this exceeds the balance owed*','',
+          'Outstanding on the unit: '+formatINR(Math.max(0,Number(pv.balanceBefore)||0)),
+          'This receipt: '+formatINR(rec.amount),
+          'Excess: *'+formatINR(rec.excess)+'*','',
+          'When confirming, say what the excess is:',
+          '\u2022 *yes '+rec.unit+' possession* \u2014 possession charges',
+          '\u2022 *yes '+rec.unit+' interest* \u2014 delay-payment interest',
+          '\u2022 *yes '+rec.unit+' advance* \u2014 advance against sale value'].join('\n'));
+      }
+    }catch(e){ console.log('[Receipt] preview skipped:', e.message); }
   }catch(e){ console.log('[Receipt] could not post card:',e.message); }
   return rec;
+}
+function rec_postJid_(rec){ return rec.postedTo || CONFIG.INFLOW_GROUP_JID || CONFIG.APPROVAL_GROUP_JID; }
+async function trackerReceiptPreview(unit, amount, mode){
+  var url=process.env.TRACKER_API_URL, secret=process.env.TRACKER_API_SECRET;
+  if(!url) return null;
+  var r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},
+    body:JSON.stringify({secret:secret,action:'receipt-preview',unit:unit,amount:amount,mode:mode})});
+  var t=await r.text(); try{ return JSON.parse(t); }catch(e){ return null; }
 }
 // post a confirmed receipt onto the cover (tracker call is idempotent by receiptId)
 async function postReceiptToCover(rec){
@@ -7358,7 +7443,8 @@ async function postReceiptToCover(rec){
   if(!url) return {ok:false,error:'TRACKER_API_URL not set'};
   var r=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain'},
     body:JSON.stringify({secret:secret,action:'receipt',receiptId:rec.receiptId,
-      unit:rec.unit,amount:rec.amount,mode:rec.mode,date:rec.date,source:'inflow-group'})});
+      unit:rec.unit,amount:rec.amount,mode:rec.mode,date:rec.date,source:'inflow-group',
+      excessPurpose:rec.excessPurpose||''})});
   var txt=await r.text();
   try{ return JSON.parse(txt); }catch(e){ return {ok:false,error:'tracker did not return JSON: '+txt.slice(0,150)}; }
 }
@@ -7379,9 +7465,24 @@ async function handleCcmReceiptReply(msg, senderPhone){
     lines.push('','Reply *yes <unit>* to post one to its cover.');
     await msg.reply(lines.join('\n')); return true;
   }
-  var m=body.match(/^(yes|no)\s+([0-9]{2,4}[A-Z]?(?:\s*\([^)]*\))?-(?:GF|FF|SF|TF|PLOT))$/i);
+  // v2.13: after a "no", the confirmer replies `unit <CORRECT-UNIT>` to re-raise
+  var mu=body.match(/^unit\s+([0-9]{2,4}[A-Z]?(?:\s*\([^)]*\))?-(?:GF|FF|SF|TF|PLOT))$/i);
+  if(mu){
+    if(RECEIPT_CONFIRMERS.indexOf(senderPhone)<0){ await msg.reply('Only Umesh or Gautam can reassign receipts.'); return true; }
+    var fixUnit=mu[1].trim().toUpperCase();
+    var fixRec=Object.keys(store.items).map(function(k){return store.items[k];})
+      .filter(function(x){return x.status==='unitfix';}).sort(function(a,b){return b.at-a.at;})[0];
+    if(!fixRec){ await msg.reply('No receipt is waiting for a corrected unit.'); return true; }
+    if(!isCcmUnit(fixUnit)){ await msg.reply(fixUnit+' is not a CCM unit id.'); return true; }
+    fixRec.unit=fixUnit; fixRec.status='pending'; fixRec.reassignedBy=senderPhone; fixRec.reassignedAt=Date.now();
+    saveReceipts(store);
+    try{ var m2=await waClient.sendMessage(rec_postJid_(fixRec), receiptCard(fixRec)); fixRec.msgId=m2&&m2.id&&m2.id._serialized; saveReceipts(store); }catch(e){}
+    await msg.reply('\u21aa\ufe0f '+fixRec.receiptId+' re-raised against *'+fixUnit+'*. Reply *yes '+fixUnit+'* to post it.');
+    return true;
+  }
+  var m=body.match(/^(yes|no)\s+([0-9]{2,4}[A-Z]?(?:\s*\([^)]*\))?-(?:GF|FF|SF|TF|PLOT))(?:\s+(possession|interest|advance))?$/i);
   if(!m) return false;
-  var verdict=m[1].toLowerCase(), unit=m[2].trim().toUpperCase();
+  var verdict=m[1].toLowerCase(), unit=m[2].trim().toUpperCase(), purpose=(m[3]||'').toLowerCase();
   if(RECEIPT_CONFIRMERS.indexOf(senderPhone)<0){
     // v2.12.5: say WHY. A silent "not you" when the sender IS Gautam wasted a live
     // test; if the phone could not be resolved at all, that is the real fault.
@@ -7403,11 +7504,13 @@ async function handleCcmReceiptReply(msg, senderPhone){
     return true;
   }
   if(verdict==='no'){
-    pend.status='rejected'; pend.rejectedBy=senderPhone; pend.rejectedAt=Date.now();
+    // v2.13: do not strand the money — ask for the correct unit and re-raise.
+    pend.status='unitfix'; pend.rejectedBy=senderPhone; pend.rejectedAt=Date.now();
     saveReceipts(store);
-    await msg.reply('\u274c '+pend.receiptId+' not posted to '+unit+'. The Ledger row stands \u2014 re-raise it against the right unit.');
+    await msg.reply('\u274c '+pend.receiptId+' not posted to '+unit+'. The Ledger row stands.\n*Which unit should it go to?* Reply *unit <correct-unit>* (e.g. unit 218-FF).');
     return true;
   }
+  if(purpose){ pend.excessPurpose=purpose; saveReceipts(store); }
   var out=await postReceiptToCover(pend);
   if(!out||!out.ok){
     await msg.reply('\u26a0\ufe0f Could not post '+pend.receiptId+' to '+unit+': '+((out&&out.error)||'unknown error')+
@@ -7426,6 +7529,33 @@ async function handleCcmReceiptReply(msg, senderPhone){
     '```'].join('\n'));
   return true;
 }
+// v2.13: put a receipt back in the queue. Needed when the CCM workbook is restored
+// from version history — the Ledger row survives (different workbook) but the cover
+// posting is gone, and the bot still thinks the receipt is posted. This ONLY flips the
+// bot's status; it writes nothing. Reply `yes <unit>` afterwards to post it again.
+// The tracker is idempotent by receiptId, so if the journal survived it will say
+// "already on the cover" rather than double-count.
+app.get('/api/receipt-reopen',function(req,res){
+  try{
+    var id=String(req.query.id||'').trim().toUpperCase();
+    var unit=String(req.query.unit||'').trim().toUpperCase();
+    var since=req.query.since?Date.parse(req.query.since):0;
+    var store=loadReceipts(), hit=[];
+    Object.keys(store.items).forEach(function(k){
+      var r=store.items[k];
+      if(r.status!=='posted') return;
+      if(id && r.receiptId!==id) return;
+      if(unit && r.unit!==unit) return;
+      if(since && !(r.postedAt>=since)) return;
+      r.status='pending'; delete r.postedAt; delete r.postedBy; delete r.result;
+      hit.push({receiptId:r.receiptId, unit:r.unit, amount:r.amount});
+    });
+    if(hit.length) saveReceipts(store);
+    res.json({ reopened:hit.length, items:hit,
+      note: hit.length ? 'Now pending again — reply "yes <unit>" in the inflow group to post each to its cover. No ledger row was touched.'
+                       : 'Nothing matched. Pass ?id=R-260729-002, or ?unit=206-TF, or ?since=2026-07-29T00:00:00Z' });
+  }catch(e){ res.json({error:e.message}); }
+});
 app.get('/api/ccm-receipts',function(req,res){
   var s=loadReceipts();
   var all=Object.keys(s.items).map(function(k){return s.items[k];}).sort(function(a,b){return b.at-a.at;});
@@ -7653,9 +7783,449 @@ initGoogleSheets();
 createWhatsAppClient();
 startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.12.5-receipt-lid | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.13.1-daybook | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
   console.log('  Endpoint lock: '+((PANEL_USER&&PANEL_PASSWORD)?'ON (Basic Auth on /api/*)':'FAIL-CLOSED (PANEL_USER/PANEL_PASSWORD unset)'));
+});
+// ═════════════════════════════════════════════════════════════════════════════
+// v2.13.0-suite — DAY-BOOK GATE · CASH-SHEET FAN-OUT · BACKLOG · MASTER PANEL
+// Appended module. Splices elsewhere: DM gate + sheet hook, media multi-amount
+// branch, receipt no→unitfix + unit-reassign + purpose token + TSV-breach ask,
+// daybook override in the promoter handler.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── DAY-BOOK ─────────────────────────────────────────────────────────────────
+var DAYBOOK_FILE = './wa_auth/daybook.json';
+var DAYBOOK_CLOSER_PHONE   = '919873574112';   // Abhishek — sole authority to close
+var DAYBOOK_OVERRIDE_PHONES = ['919873095398','917838537000'];   // may override the block and trigger the ask
+function daybookMayOverride(p){ return DAYBOOK_OVERRIDE_PHONES.indexOf(String(p||''))>=0; }
+
+function loadDaybook(){ try{ if(fs.existsSync(DAYBOOK_FILE)) return JSON.parse(fs.readFileSync(DAYBOOK_FILE,'utf8')); }catch(e){} return {}; }
+function saveDaybook(d){ try{ fs.writeFileSync(DAYBOOK_FILE, JSON.stringify(d,null,1)); }catch(e){ console.error('[Daybook] save:',e.message); } }
+function istDateKey(offsetDays){
+  var d=new Date(Date.now()+330*60000+(offsetDays||0)*86400000);
+  return d.toISOString().slice(0,10);                       // YYYY-MM-DD in IST
+}
+function daybookDateLabel(key){ var p=key.split('-'); return p[2]+'/'+p[1]+'/'+p[0]; }
+function parseDaybookDate(txt){                             // dd/mm[/yy] -> key, IST-anchored
+  if(!txt) return null;
+  var m=String(txt).match(/^(\d{1,2})[\/.](\d{1,2})(?:[\/.](\d{2,4}))?$/);
+  if(!m) return null;
+  var dd=parseInt(m[1],10), mo=parseInt(m[2],10);
+  if(dd<1||dd>31||mo<1||mo>12) return null;                 // v2.13: 99/99 must not close a phantom day
+  var y=m[3]?(m[3].length===2?'20'+m[3]:m[3]):istDateKey(0).slice(0,4);
+  return y+'-'+String(mo).padStart(2,'0')+'-'+String(dd).padStart(2,'0');
+}
+function daybookIsBlocking(){
+  var y=istDateKey(-1), d=loadDaybook();
+  var rec=d[y]||{};
+  if(rec.closedAt || rec.overriddenAt) return false;
+  // the block only arms after the 10:30 IST check has fired for that day
+  return !!rec.blockArmedAt;
+}
+function daybookBlockMessage(){
+  var y=istDateKey(-1);
+  return ['\u{1F512} *Yesterday\u2019s day book ('+daybookDateLabel(y)+') is not closed.*','',
+    'New expense requests are on hold until Abhishek completes it and replies *daybook done*.',
+    'Paying, receipts and approvals continue as normal.'].join('\n');
+}
+function daybookStatusText(){
+  var d=loadDaybook(), t=istDateKey(0), y=istDateKey(-1);
+  function line(k){
+    var r=d[k]||{};
+    if(r.closedAt) return daybookDateLabel(k)+' \u2014 closed '+new Date(r.closedAt).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})+(r.entries!=null?(' ('+r.entries+' entries)'):'');
+    if(r.overriddenAt) return daybookDateLabel(k)+' \u2014 OVERRIDDEN by M';
+    return daybookDateLabel(k)+' \u2014 OPEN'+(r.blockArmedAt?' \u00b7 BLOCKING new expenses':'');
+  }
+  return '*DAY BOOK*\n'+line(y)+'\n'+line(t);
+}
+function daybookClose(dateTxt, byPhone){
+  var key = dateTxt ? parseDaybookDate(dateTxt) : istDateKey(-1);
+  if(!key) return {closed:false, msg:'Could not read that date \u2014 use dd/mm, e.g. daybook done 28/07.'};
+  var d=loadDaybook(); var rec=d[key]=d[key]||{};
+  if(rec.closedAt) return {closed:false, msg:'Day book '+daybookDateLabel(key)+' is already closed.'};
+  var wasBlocking = daybookIsBlocking() && key===istDateKey(-1);
+  rec.closedAt=Date.now(); rec.closedBy=byPhone;
+  try{ var lg=daybookLedgerFigures(key); rec.entries=lg.entries; rec.totalIn=lg.totalIn; rec.totalOut=lg.totalOut; }catch(e){}
+  saveDaybook(d);
+  return {closed:true, wasBlocking:wasBlocking, date:daybookDateLabel(key),
+    msg:'\u2705 Day book '+daybookDateLabel(key)+' closed.'+(rec.entries!=null?(' Recorded against '+rec.entries+' ledger entries.'):'')};
+}
+function daybookOverride(byPhone){
+  var y=istDateKey(-1), d=loadDaybook(); var rec=d[y]=d[y]||{};
+  rec.overriddenAt=Date.now(); rec.overriddenBy=byPhone; saveDaybook(d);
+  return {msg:'\u{1F513} Day-book block for '+daybookDateLabel(y)+' lifted by M (override). Abhishek \u2014 the book still needs completing and closing.'};
+}
+// figures for the 11pm ask — count + totals from the Ledger for one IST day
+function daybookLedgerFigures(key){
+  var out={entries:0,totalIn:0,totalOut:0};
+  try{
+    var target=daybookDateLabel(key);
+    var data=(typeof getLedgerCache==='function' && getLedgerCache()) || null;
+    var rows=(data&&data.entries)||[];
+    rows.forEach(function(e){
+      var dt=String(e.date||'');
+      if(dt!==target) return;
+      out.entries++;
+      if(e.inOut==='IN') out.totalIn+=Number(e.amount)||0;
+      else if(e.inOut==='OUT') out.totalOut+=Number(e.amount)||0;
+    });
+  }catch(e){}
+  return out;
+}
+/* Shared by the 11pm cron and the manual "ask abhishek" command. Returns a short
+   line describing what was sent, so the requester gets a confirmation. */
+async function daybookAskAbhishek(manualBy){
+  try{
+    var t=istDateKey(0), d=loadDaybook(); var rec=d[t]=d[t]||{};
+    if(rec.closedAt) return 'Day book '+daybookDateLabel(t)+' is already closed \u2014 nothing to ask.';
+    var fig={entries:null};
+    try{ var lg=await getLedgerData(); var rows=(lg&&lg.entries)||[];
+      var target=daybookDateLabel(t); fig={entries:0,totalIn:0,totalOut:0};
+      rows.forEach(function(e){ if(String(e.date||'')!==target) return;
+        fig.entries++; if(e.inOut==='IN') fig.totalIn+=Number(e.amount)||0; else if(e.inOut==='OUT') fig.totalOut+=Number(e.amount)||0; });
+    }catch(e){}
+    rec.askedAt=(rec.askedAt||[]); rec.askedAt.push(Date.now()); saveDaybook(d);
+    var lines=['\u{1F4D2} *Day book \u2014 '+daybookDateLabel(t)+'*',''];
+    if(fig.entries!=null){
+      lines.push('On the Ledger right now: *'+fig.entries+' entries \u00b7 IN '+formatINR(fig.totalIn)+' \u00b7 OUT '+formatINR(fig.totalOut)+'*');
+      if(fig.entries===0) lines.push('_No entries today \u2014 if it was a nil day, closing it is still one reply._');
+    }
+    lines.push('','Is it complete? Reply *daybook done* to close it.');
+    await waClient.sendMessage(DAYBOOK_CLOSER_PHONE+'@c.us', lines.join('\n'));
+    return 'Asked Abhishek to close '+daybookDateLabel(t)+
+           (fig.entries!=null?(' \u2014 '+fig.entries+' entries \u00b7 IN '+formatINR(fig.totalIn)+' \u00b7 OUT '+formatINR(fig.totalOut)):'');
+  }catch(e){ console.error('[Daybook] ask:', e.message); return 'Could not send it: '+e.message; }
+}
+async function daybookAsk11pm(){ return daybookAskAbhishek(null); }
+
+/* On boot: if 10:30 IST has already passed today and yesterday is still open, arm the
+   block now rather than waiting for tomorrow's cron. A deploy mid-morning otherwise
+   leaves the gate dormant for a whole day. Announce-once guard above stops repeats. */
+function istMinutesOfDay(){ var d=new Date(Date.now()+330*60000); return d.getUTCHours()*60+d.getUTCMinutes(); }
+async function daybookCatchUp(){
+  try{
+    if(istMinutesOfDay() < (10*60+30)) return;          // 10:30 IST not reached yet
+    var y=istDateKey(-1), d=loadDaybook(), rec=d[y]||{};
+    if(rec.closedAt || rec.overriddenAt || rec.blockArmedAt) return;
+    console.log('[Daybook] catch-up: arming the block for '+daybookDateLabel(y));
+    await daybookCheck1030();
+  }catch(e){ console.error('[Daybook] catch-up:', e.message); }
+}
+setTimeout(function(){ daybookCatchUp(); }, 45000);     // after WhatsApp settles
+async function daybookCheck1030(){
+  try{
+    var y=istDateKey(-1), d=loadDaybook(); var rec=d[y]=d[y]||{};
+    if(rec.closedAt || rec.overriddenAt) return;
+    if(rec.blockArmedAt) return;              // already armed and announced today - stay quiet
+    rec.blockArmedAt=Date.now(); saveDaybook(d);
+    try{ await waClient.sendMessage(DAYBOOK_CLOSER_PHONE+'@c.us',
+      '\u26a0\ufe0f Yesterday\u2019s day book ('+daybookDateLabel(y)+') is still open. *New expense requests are now blocked* until it is closed. Reply *daybook done* when finished.'); }catch(e){}
+    try{ await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, ['\u{1F512} *DAY BOOK NOT CLOSED \u2014 '+daybookDateLabel(y)+'*','',
+      'New expense requests are on hold, awaiting Abhishek\u2019s closure of the previous night\u2019s day book.',
+      'Paying, receipts and approvals continue as normal.'].join('\n')); }catch(e){}
+    // two consecutive open days -> tell M directly
+    var y2=istDateKey(-2);
+    if(d[y2] && !d[y2].closedAt && !d[y2].overriddenAt){
+      for(var _oi=0;_oi<DAYBOOK_OVERRIDE_PHONES.length;_oi++){
+        try{ await waClient.sendMessage(DAYBOOK_OVERRIDE_PHONES[_oi]+'@c.us',
+          '\u26a0\ufe0f Day books for '+daybookDateLabel(y2)+' AND '+daybookDateLabel(y)+' are both open \u2014 two days running. Worth a call to Abhishek.'); }catch(e){}
+      }
+    }
+  }catch(e){ console.error('[Daybook] 10:30 check:', e.message); }
+}
+cron.schedule('30 17 * * *', function(){ daybookAsk11pm(); });     // 23:00 IST
+cron.schedule('0 5 * * *',  function(){ daybookCheck1030(); });    // 10:30 IST
+app.get('/api/daybook-status', function(req,res){ res.json({ text:daybookStatusText(), blocking:daybookIsBlocking(), store:loadDaybook() }); });
+app.get('/api/daybook-close',  function(req,res){ var r=daybookClose(req.query.date||null,'panel:MM'); res.json(r); });
+app.get('/api/daybook-override', function(req,res){ res.json(daybookOverride('panel:MM')); });
+app.get('/api/daybook-arm', async function(req,res){
+  try{ var y=istDateKey(-1), d=loadDaybook(), rec=d[y]||{};
+    if(rec.closedAt) return res.json({error:'already closed'});
+    if(rec.blockArmedAt) return res.json({ok:true, already:true, note:'block already armed for '+daybookDateLabel(y)});
+    await daybookCheck1030();
+    res.json({ok:true, armed:daybookDateLabel(y), blocking:daybookIsBlocking()});
+  }catch(e){ res.json({error:e.message}); }
+});
+app.get('/api/daybook-ask', async function(req,res){
+  try{ res.json({ok:true, sent:await daybookAskAbhishek('panel')}); }catch(e){ res.json({error:e.message}); }
+});
+
+// ── CASH-SHEET FAN-OUT ───────────────────────────────────────────────────────
+// Second vision pass: list EVERY line on a multi-amount image.
+async function extractCashSheetItems(media){
+  try{
+    if(!CONFIG.CLAUDE_API_KEY || !media || !media.data) return null;
+    var mime=(media.mimetype||'').toLowerCase();
+    var mediaBlock = mime==='application/pdf'
+      ? { type:'document', source:{ type:'base64', media_type:'application/pdf', data:media.data } }
+      : { type:'image', source:{ type:'base64', media_type:mime, data:media.data } };
+    var prompt='This image is a handwritten or printed list of several payments (a site cash sheet or bill list). '
+      +'List EVERY money line. For each: label (payee/particular, max 8 words), amount in INR as a number, '
+      +'and kind: "expense" if it is money PAID OUT, "receipt" if it is money RECEIVED (look for a Recd/Received column or words like received/recd). '
+      +'Ignore running-balance and total rows. Reply ONLY with JSON on one line: '
+      +'{"items":[{"label":"","amount":0,"kind":"expense"}],"date":""}';
+    var apiResp=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'x-api-key':CONFIG.CLAUDE_API_KEY, 'anthropic-version':'2023-06-01' },
+      body:JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:900,
+        messages:[{ role:'user', content:[ mediaBlock, { type:'text', text:prompt } ] }] })
+    });
+    var data=await apiResp.json();
+    var resp=(data&&data.content&&data.content[0]&&data.content[0].text)||'';
+    var parsed=JSON.parse((resp||'').replace(/```json|```/g,'').trim());
+    var items=(parsed.items||[]).map(function(it){
+      return { label:String(it.label||'').substring(0,120), amount:parseAmount(it.amount),
+               kind:(String(it.kind||'expense').toLowerCase()==='receipt'?'receipt':'expense') };
+    }).filter(function(it){ return it.label && it.amount>0; });
+    return items.slice(0,15);
+  }catch(e){ console.error('[Sheet] extract:', e.message); return null; }
+}
+function sheetConfirmText(items){
+  var ex=items.filter(function(i){return i.kind==='expense';});
+  var rc=items.filter(function(i){return i.kind==='receipt';});
+  var L=['\u{1F4CB} Read *'+items.length+' items* from this image:',''];
+  items.forEach(function(it,i){
+    L.push((i+1)+'. '+(it.kind==='receipt'?'\u{1F4B0} *Received* \u2014 ':'')+it.label+' \u00b7 '+formatINR(it.amount));
+  });
+  L.push('');
+  L.push(ex.length+' expense'+(ex.length===1?'':'s')+(rc.length?(' \u00b7 '+rc.length+' receipt'+(rc.length===1?'':'s')):''));
+  L.push('');
+  L.push('Correct? Reply *yes* \u2014 or *drop 3* to remove a line, *edit 3 <label> <amount>* to fix one, *cancel* to clear.');
+  return L.join('\n');
+}
+async function handleSheetReply(state, rawFrom, body, senderInfo){
+  var entry=state[rawFrom]; if(!entry||!entry.sheet) return false;
+  var sh=entry.sheet, low=body.toLowerCase();
+  function save(){ state[rawFrom]=entry; saveDMState(state); }
+  async function send(t){ await waClient.sendMessage(rawFrom, t); }
+
+  if(low==='cancel'){ delete state[rawFrom]; saveDMState(state); await send('Cleared \u2014 the sheet was not posted.'); return true; }
+
+  if(sh.step==='confirm'){
+    var md=low.match(/^drop\s+(\d{1,2})$/);
+    if(md){ var i=parseInt(md[1],10)-1;
+      if(i<0||i>=sh.items.length){ await send('There is no item '+md[1]+'.'); return true; }
+      var gone=sh.items.splice(i,1)[0]; save();
+      if(!sh.items.length){ delete state[rawFrom]; saveDMState(state); await send('All items removed \u2014 nothing to post.'); return true; }
+      await send('Dropped "'+gone.label+'".\n\n'+sheetConfirmText(sh.items)); return true; }
+    var me=body.match(/^edit\s+(\d{1,2})\s+(.+?)\s+([\d,]+)$/i);
+    if(me){ var j=parseInt(me[1],10)-1;
+      if(j<0||j>=sh.items.length){ await send('There is no item '+me[1]+'.'); return true; }
+      sh.items[j].label=me[2].trim().substring(0,120); sh.items[j].amount=parseAmount(me[3]); save();
+      await send('Updated.\n\n'+sheetConfirmText(sh.items)); return true; }
+    if(low==='yes'||low==='ok'){
+      sh.step='entity'; save();
+      await send('*Which company / entity is this sheet for?* (one answer covers every line)\n'+
+        LEDGER_ENTITIES.map(function(e,i){return (i+1)+'. '+e;}).join('\n')); return true; }
+    await send('Reply *yes*, *drop N*, *edit N <label> <amount>*, or *cancel*.'); return true;
+  }
+
+  if(sh.step==='entity'){
+    var ent=resolvePickOrText(body, LEDGER_ENTITIES);
+    if(!ent){ await send('Pick a number from the list, or type the entity exactly.'); return true; }
+    sh.entity=ent; sh.step='account'; save();
+    await send('*Paid from which account?* (covers every expense line)\n'+
+      LEDGER_ACCOUNTS.map(function(a,i){return (i+1)+'. '+a;}).join('\n')); return true;
+  }
+
+  if(sh.step==='account'){
+    var acc=resolvePickOrText(body, LEDGER_ACCOUNTS);
+    if(!acc){ await send('Pick a number from the list, or type the account exactly.'); return true; }
+    sh.account=acc; save();
+    // fan out
+    var ex=sh.items.filter(function(i){return i.kind==='expense';});
+    var rc=sh.items.filter(function(i){return i.kind==='receipt';});
+    var posted=0, failed=[];
+    for(var k=0;k<ex.length;k++){
+      try{ await postExpenseRequestItem(ex[k].label, ex[k].amount, sh.entity, sh.account, senderInfo.contactName||'accountant'); posted++; }
+      catch(e){ failed.push(ex[k].label+' ('+e.message+')'); }
+      await new Promise(function(r){setTimeout(r,600);});     // pace the group posts
+    }
+    for(var q=0;q<rc.length;q++){
+      try{ await waClient.sendMessage(CONFIG.INFLOW_GROUP_JID, ['\u{1F4B0} *RECEIPT on '+(senderInfo.contactName||'the site')+'\u2019s cash sheet*','',
+        formatINR(rc[q].amount)+' from '+rc[q].label,'',
+        'Log it here with the usual inflow message so it reaches the Ledger \u2014 e.g.:',
+        '`received '+rc[q].amount+' from '+rc[q].label+'`'].join('\n')); }catch(e){}
+    }
+    delete state[rawFrom]; saveDMState(state);
+    var done=['\u2705 Posted *'+posted+' expense request'+(posted===1?'':'s')+'* to the approval group \u2014 M/S to review.'];
+    if(rc.length) done.push('\u{1F4B0} '+rc.length+' receipt'+(rc.length===1?'':'s')+' flagged in the inflow group for logging.');
+    if(failed.length) done.push('\u26a0\ufe0f Failed: '+failed.join('; '));
+    await send(done.join('\n')); return true;
+  }
+  return false;
+}
+function resolvePickOrText(body, list){
+  var n=parseInt(body,10);
+  if(n>=1 && n<=list.length) return list[n-1];
+  var t=body.trim().toLowerCase();
+  var hit=list.filter(function(x){ return x.toLowerCase()===t; })[0];
+  if(hit) return hit;
+  hit=list.filter(function(x){ return x.toLowerCase().indexOf(t)>=0; });
+  return hit.length===1?hit[0]:null;
+}
+// Post ONE expense request exactly the way the single-bill DM flow does.
+async function postExpenseRequestItem(details, amount, entity, fromAccount, postedBy){
+  var lines=['*EXPENSE REQUEST*',''];
+  lines.push('Details: '+details);
+  lines.push('Amount: Rs.'+formatINR(amount));
+  lines.push('Company: '+entity);
+  lines.push('From: '+fromAccount);
+  lines.push('Posted by: '+postedBy+' (cash sheet)');
+  lines.push('');
+  lines.push('M/S please review.');
+  return waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, lines.join('\n'));
+}
+
+// ── BACKLOG (approved \u00b7 unpaid, with bulk actions) ────────────────────────
+function buildBacklog(){
+  var store=loadEventStore(), rows=[];
+  (store.events||[]).forEach(function(e){
+    if(e.type!=='approved') return;
+    var ps=paidStatsForItem(store, e.itemId);
+    var closed=(store.events||[]).some(function(x){ return x.type==='closed' && x.itemId===e.itemId; });
+    if(closed) return;
+    var bal=(Number(e.amount)||0)-(ps.total||0);
+    if(bal<=0) return;
+    var ageDays=Math.floor((Date.now()-(Date.parse(e.at)||Date.now()))/86400000);
+    rows.push({ itemId:e.itemId, label:e.label, code:e.code||'', approved:Number(e.amount)||0,
+                paid:ps.total||0, balance:bal, at:e.at, ageDays:ageDays,
+                bucket: ageDays>90?'90+':(ageDays>30?'31-90':'0-30') });
+  });
+  rows.sort(function(a,b){ return b.ageDays-a.ageDays; });
+  var tot=rows.reduce(function(t,r){return t+r.balance;},0);
+  return { rows:rows, total:tot,
+    buckets:{ '90+':rows.filter(function(r){return r.bucket==='90+';}).length,
+              '31-90':rows.filter(function(r){return r.bucket==='31-90';}).length,
+              '0-30':rows.filter(function(r){return r.bucket==='0-30';}).length } };
+}
+app.get('/api/backlog', function(req,res){
+  var b=buildBacklog();
+  var rowsHtml=b.rows.map(function(r){
+    return '<tr><td><input type="checkbox" class="pk" value="'+encodeURIComponent(r.itemId)+'"></td>'+
+      '<td>'+escapeHtml(r.label||'').substring(0,70)+'</td><td class="num">'+formatINR(r.balance)+'</td>'+
+      '<td>'+(r.code||'\u2014')+'</td><td>'+r.ageDays+'d</td><td>'+r.bucket+'</td></tr>';
+  }).join('');
+  res.send('<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+   +'<title>Backlog</title><style>body{font-family:system-ui;margin:16px;background:#f5f4f0;color:#1e2129}'
+   +'h1{font-size:18px}table{border-collapse:collapse;width:100%;background:#fff}td,th{padding:8px 10px;border-bottom:1px solid #e3e1d9;font-size:13px;text-align:left}'
+   +'.num{font-family:ui-monospace,monospace;text-align:right}.bar{position:sticky;top:0;background:#191c3c;color:#fff;padding:10px 14px;border-radius:8px;margin-bottom:12px;display:flex;gap:10px;align-items:center}'
+   +'button{padding:7px 14px;border-radius:7px;border:0;cursor:pointer;font-size:13px}.wo{background:#a32d2d;color:#fff}.po{background:#1d7a4c;color:#fff}.sel{background:rgba(255,255,255,.15);color:#fff}</style></head><body>'
+   +'<div class="bar"><b>Backlog \u2014 '+b.rows.length+' items \u00b7 \u20b9'+formatINR(b.total)+'</b>'
+   +'<span style="opacity:.7;font-size:12px">90+: '+b.buckets['90+']+' \u00b7 31-90: '+b.buckets['31-90']+' \u00b7 0-30: '+b.buckets['0-30']+'</span>'
+   +'<span style="flex:1"></span>'
+   +'<button class="sel" onclick="document.querySelectorAll(\'.pk\').forEach(c=>c.checked=true)">Select all</button>'
+   +'<button class="wo" onclick="act(\'writeoff\')">Write off selected</button>'
+   +'<button class="po" onclick="act(\'paidout\')">Mark paid outside bot</button></div>'
+   +'<table><tr><th></th><th>Item</th><th>Balance</th><th>Code</th><th>Age</th><th>Bucket</th></tr>'+rowsHtml+'</table>'
+   +'<script>function act(a){var ids=[...document.querySelectorAll(".pk:checked")].map(c=>c.value);'
+   +'if(!ids.length)return alert("Nothing selected");'
+   +'if(!confirm(ids.length+" item(s): "+(a==="writeoff"?"write off the balance? This records a CLOSED event; no ledger row.":"mark as paid outside the bot? Records a PAID event; no ledger row.")))return;'
+   +'fetch("/api/backlog-act?action="+a+"&ids="+ids.join(","),{headers:{}}).then(r=>r.json()).then(j=>{alert(j.done+" done"+(j.failed.length?", failed: "+j.failed.join(", "):""));location.reload();});}'
+   +'</script></body></html>');
+});
+app.get('/api/backlog-act', function(req,res){
+  var action=String(req.query.action||''), ids=String(req.query.ids||'').split(',').filter(Boolean).map(decodeURIComponent);
+  if(['writeoff','paidout'].indexOf(action)<0) return res.json({error:'unknown action'});
+  var store=loadEventStore(), done=0, failed=[];
+  ids.forEach(function(id){
+    try{
+      var ap=findApprovedEvent(store, id);
+      if(!ap){ failed.push(id.slice(-8)+' (no approved event)'); return; }
+      var ps=paidStatsForItem(store, id);
+      if(action==='writeoff'){ recordClosedEvent(id, ap.label, Number(ap.amount)||0, ps.total||0); }
+      else { markItemPaid(id); }
+      done++;
+    }catch(e){ failed.push(id.slice(-8)+' ('+e.message+')'); }
+  });
+  res.json({done:done, failed:failed});
+});
+
+// ── MASTER PANEL (two tabs: Operations + Inventory) ─────────────────────────
+app.get('/api/manual-verdict', async function(req,res){
+  try{
+    var id=String(req.query.item||''), role=String(req.query.role||''), v=String(req.query.v||'yes');
+    var label=String(req.query.label||''), amount=parseAmount(req.query.amount)||0;
+    if(!id || ['mm','sm'].indexOf(role)<0 || ['yes','no'].indexOf(v)<0) return res.json({error:'item, role=mm|sm, v=yes|no required'});
+    var vs=loadVerdicts(); vs[id]=vs[id]||{};
+    vs[id][role]={ verdict:v, amount:0, raw:'[panel:MM]', at:new Date().toISOString() };
+    if(label) vs[id]._label=label; if(amount) vs[id]._amount=amount;
+    saveVerdicts(vs);
+    recordVerdictEvent(id, label, amount, role, v, 0, '[panel:MM]');
+    try{ await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID,
+      '\u{1F4DD} [panel] M recorded '+(role==='mm'?'his own':'S\u2019s')+' '+v.toUpperCase()+' for: '+(label||id.slice(-10))); }catch(e){}
+    var both = vs[id].mm && vs[id].sm && vs[id].mm.verdict==='yes' && vs[id].sm.verdict==='yes';
+    if(both){
+      recordApprovedEvent(id, label, amount);
+      try{ await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, '\u2705 Approved (M+S): '+label+(amount?' Rs.'+formatINR(amount):'')); }catch(e){}
+      try{ await postApprovedToOutflow({ id:id, label:label, amount:amount, description:label }, amount, true); }catch(e){}
+    }
+    res.json({ok:true, both:!!both});
+  }catch(e){ res.json({error:e.message}); }
+});
+app.get('/api/item-clear', function(req,res){
+  try{
+    var id=String(req.query.item||''); if(!id) return res.json({error:'item required'});
+    var store=loadEventStore();
+    if(findApprovedEvent(store,id)) return res.json({error:'already fully approved \u2014 use the backlog page to close it instead'});
+    if((paidStatsForItem(store,id).total||0)>0) return res.json({error:'has paid history \u2014 cannot clear'});
+    var before=(store.events||[]).length;
+    _eventStoreCache.events=(store.events||[]).filter(function(e){ return !(e.type==='verdict' && e.itemId===id); });
+    _persistEventStore();
+    var vs=loadVerdicts(); if(vs[id]){ delete vs[id]; saveVerdicts(vs); }
+    res.json({ok:true, removedEvents:before-_eventStoreCache.events.length});
+  }catch(e){ res.json({error:e.message}); }
+});
+app.get('/api/master', async function(req,res){
+  try{
+    var audit=await buildApprovalAudit(14);
+    var pend=[].concat(audit.partialApproval||[], audit.noApproval||[], audit.onHold||[]);
+    var rows=pend.map(function(e){
+      var mmC=e.mm==='yes'?'<span class="ok">M \u2713</span>':(e.mm==='hold'?'<span class="hd">M hold</span>':'<span class="wt">M pending</span>');
+      var smC=e.sm==='yes'?'<span class="ok">S \u2713</span>':(e.sm==='hold'?'<span class="hd">S hold</span>':'<span class="wt">S pending</span>');
+      var qid=encodeURIComponent(e.id), ql=encodeURIComponent((e.vendor||e.body||'').substring(0,80)), qa=e.amount||0;
+      var acts='';
+      if(e.mm!=='yes') acts+='<button onclick="mv(\''+qid+'\',\'mm\',\''+ql+'\','+qa+')">Record M ok</button>';
+      if(e.sm!=='yes') acts+='<button onclick="mv(\''+qid+'\',\'sm\',\''+ql+'\','+qa+')">Record S ok</button>';
+      acts+='<button class="danger" onclick="cl(\''+qid+'\')">Clear</button>';
+      return '<tr><td>'+escapeHtml((e.vendor||e.body||'').substring(0,60))+'</td><td class="num">'+formatINR(e.amount||0)+'</td>'+
+             '<td>'+mmC+' '+smC+'</td><td>'+acts+'</td></tr>';
+    }).join('');
+    var bk=buildBacklog();
+    res.send('<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+     +'<title>Fidato MIS \u2014 Master</title><style>body{font-family:system-ui;margin:0;background:#f5f4f0;color:#1e2129}'
+     +'header{background:#191c3c;color:#fff;padding:12px 20px;display:flex;gap:12px;align-items:center}header b{font-size:15px}'
+     +'.tabs{display:flex;gap:4px;background:#fff;border-bottom:1px solid #e3e1d9;padding:0 20px}'
+     +'.tab{padding:12px 16px;cursor:pointer;color:#6a6d78;border-bottom:2px solid transparent;font-size:14px}'
+     +'.tab.on{color:#191c3c;border-color:#191c3c;font-weight:600}main{padding:16px 20px;max-width:1100px;margin:0 auto}'
+     +'table{border-collapse:collapse;width:100%;background:#fff;border-radius:8px;overflow:hidden}'
+     +'td,th{padding:9px 12px;border-bottom:1px solid #e3e1d9;font-size:13px;text-align:left}.num{font-family:ui-monospace,monospace;text-align:right}'
+     +'.ok{color:#1d7a4c;font-weight:600}.wt{color:#b77300}.hd{color:#7a5ba6}button{margin:0 3px;padding:5px 10px;border-radius:6px;border:1px solid #cfcdc3;background:#fff;cursor:pointer;font-size:12px}'
+     +'button.danger{color:#a32d2d}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}'
+     +'.card{background:#fff;border:1px solid #e3e1d9;border-radius:10px;padding:12px 14px}.card b{font-size:20px;font-family:ui-monospace,monospace}'
+     +'.card span{font-size:12px;color:#6a6d78;display:block}iframe{width:100%;height:78vh;border:1px solid #e3e1d9;border-radius:8px;background:#fff}'
+     +'.hide{display:none}.links a{margin-right:14px;font-size:13px}</style></head><body>'
+     +'<header><b>Fidato MIS \u2014 master panel</b><span style="opacity:.7;font-size:12px">v2.13</span>'
+     +'<span style="flex:1"></span><span style="font-size:12px;opacity:.8">'+escapeHtml(daybookStatusText().split('\n')[1]||'')+'</span></header>'
+     +'<div class="tabs"><div class="tab on" onclick="sw(0)">Operations</div><div class="tab" onclick="sw(1)">Inventory \u2014 CCM</div></div>'
+     +'<main><section id="p0">'
+     +'<div class="cards"><div class="card"><span>Pending items (14d)</span><b>'+pend.length+'</b></div>'
+     +'<div class="card"><span>Backlog items</span><b>'+bk.rows.length+'</b></div>'
+     +'<div class="card"><span>Backlog value</span><b>\u20b9'+formatINR(bk.total)+'</b></div>'
+     +'<div class="card"><span>Day book</span><b style="font-size:13px">'+(daybookIsBlocking()?'BLOCKING':'ok')+'</b></div></div>'
+     +'<div class="links"><a href="/api/backlog">Backlog \u2014 bulk write-off / mark paid \u2192</a>'
+     +'<a href="/api/panel">Classic panel \u2192</a><a href="/api/outflow-log">Payments log \u2192</a><a href="/api/daybook-status">Day-book JSON \u2192</a></div><br>'
+     +'<table><tr><th>Request</th><th>Amount</th><th>M / S</th><th>Actions</th></tr>'+(rows||'<tr><td colspan=4>Nothing pending in the last 14 days.</td></tr>')+'</table>'
+     +'</section><section id="p1" class="hide"><iframe src="/dashboard"></iframe></section></main>'
+     +'<script>function sw(i){document.querySelectorAll(".tab").forEach((t,k)=>t.classList.toggle("on",k===i));'
+     +'document.getElementById("p0").classList.toggle("hide",i!==0);document.getElementById("p1").classList.toggle("hide",i!==1);}'
+     +'function mv(id,role,label,amt){if(!confirm("Record "+role.toUpperCase()+"\'s YES for:\\n"+decodeURIComponent(label)+"\\n\\nStamped [panel:MM] and announced in the group."))return;'
+     +'fetch("/api/manual-verdict?item="+id+"&role="+role+"&v=yes&label="+label+"&amount="+amt).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);location.reload();});}'
+     +'function cl(id){if(!confirm("Clear all verdicts on this item? It stays in the group; M and S can vote again."))return;'
+     +'fetch("/api/item-clear?item="+id).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);location.reload();});}'
+     +'</script></body></html>');
+  }catch(e){ res.status(500).send('master failed: '+e.message); }
 });
