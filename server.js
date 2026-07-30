@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.13.5-diag';
+var SERVER_VERSION='2.13.7-autoclose';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -250,7 +250,10 @@ function createWhatsAppClient() {
         console.log('[WA] 3+ LOGOUTs in 5min — clearing wa_auth and restarting fresh');
         global._waLogoutLog = [];
         setTimeout(function() {
-          try { if (fs.existsSync('./wa_auth')) { fs.rmSync('./wa_auth', { recursive: true, force: true }); console.log('[WA] wa_auth cleared'); } } catch(e) { console.error('[WA] Clear failed:', e.message); }
+          ['./wa_auth/wpp-tokens','./wa_auth/session'].forEach(function(p){      // session only - see v2.13.7 note above
+            try { if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); console.log('[WA] cleared '+p); } }
+            catch(e) { console.error('[WA] could not clear '+p+':', e.message); }
+          });
           createWhatsAppClient();
         }, 5000);
         return;
@@ -266,6 +269,7 @@ function createWhatsAppClient() {
        failures this morning were impossible to diagnose because nothing proved whether
        a message had even arrived. This line is the difference between reading a log and
        guessing at one. */
+    global._inboundSeenAt = Date.now();
     try{
       var _f=String((msg&&msg.from)||''), _isG=_f.indexOf('@g.us')>=0;
       console.log('[IN]', _isG?'GROUP':'DM', _f,
@@ -5710,6 +5714,9 @@ app.get('/health',function(req,res){
   try{ lib='wppconnect-'+require('@wppconnect-team/wppconnect/package.json').version; }
   catch(e){ try{ lib=require('whatsapp-web.js/package.json').version; }catch(e2){} }
   res.json({status:'ok',version:SERVER_VERSION,whatsapp:waReady?'connected':'disconnected',
+    inboundWired: !!global._inboundSeenAt,
+    lastInboundAt: global._inboundSeenAt ? new Date(global._inboundSeenAt).toISOString() : null,
+    minutesSinceInbound: global._inboundSeenAt ? Math.round((Date.now()-global._inboundSeenAt)/60000) : null,
     waLibVersion:lib, waWebPin:process.env.WA_WEB_VERSION_URL||'(none)',
     qrCaptured: !!latestQR, qrRendered: !!latestQRDataUrl,
     qrPayloadLen: latestQR?String(latestQR).length:0,
@@ -5926,7 +5933,7 @@ var TABS = [
     {ep:'/api/match-cache', ico:'\\uD83D\\uDDC2', label:'Match cache'}
   ]},
   {id:'dz', label:'Danger zone', dz:true, items:[
-    {ep:'/api/wa-reset', ico:'\\uD83D\\uDD04', label:'Reset WhatsApp session (re-pair)', dz:true, confirm:'This LOGS THE BOT OUT of WhatsApp. You will have to re-scan the QR to reconnect. This cannot be undone.'},
+    {ep:'/api/wa-reset', ico:'\\uD83D\\uDD04', label:'Reset WhatsApp session (re-pair)', dz:true, confirm:'Logs the bot out of WhatsApp; you must re-scan the QR to reconnect. Clears ONLY the session - approvals, receipts, payment history and the day book are kept. Cannot be undone.'},
     {ep:'/api/dm-clear', ico:'\\uD83D\\uDDD1', label:'Clear DM state', dz:true, confirm:'This wipes the bot\\u2019s DM state. This cannot be undone.'},
     {ep:'/api/match-cache-clear', ico:'\\uD83E\\uDDF9', label:'Clear match cache', dz:true, confirm:'This clears the reconciliation match cache. This cannot be undone.'},
     {ep:'/api/stale-reset', ico:'\\u267B', label:'Reset stale scan', dz:true, confirm:'This resets the stale-scan state. This cannot be undone.'}
@@ -7730,7 +7737,15 @@ app.get('/api/wa-reset',function(req,res){
     waReady = false;
     latestQR = null; latestQRDataUrl = null;
     try { if (waClient) { waClient.destroy().catch(function(e){}); } } catch(e) {}
-    try { if (fs.existsSync('./wa_auth')) { fs.rmSync('./wa_auth', { recursive: true, force: true }); console.log('[WA] wa_auth folder cleared'); } } catch(e) { console.error('[WA] Clear error:', e.message); }
+    /* v2.13.7: ONLY the session. The old line rmSync'd the whole ./wa_auth folder,
+       taking event_store, ccm_receipts, paid_posted, paid_state, lid_map, daybook and
+       15 other state files with it - while the button's warning mentioned only a QR
+       re-scan. On 30 Jul it was saved purely by an EBUSY error. Never again. */
+    ['./wa_auth/wpp-tokens','./wa_auth/session'].forEach(function(p){
+      try { if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); console.log('[WA] cleared '+p); } }
+      catch(e) { console.error('[WA] could not clear '+p+':', e.message); }
+    });
+    console.log('[WA] state files (event store, receipts, day book, lid map) left INTACT');
     setTimeout(function() { createWhatsAppClient(); }, 3000);
     res.json({ok:true, message:'WhatsApp reset triggered. Wait 30-60s, then check /api/pair for new QR.'});
   } catch(e) { res.json({error:e.message}); }
@@ -7799,7 +7814,7 @@ initGoogleSheets();
 createWhatsAppClient();
 startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.13.5-diag | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.13.7-autoclose | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
@@ -7994,6 +8009,15 @@ app.get('/api/daybook-arm', async function(req,res){
     if(rec.blockArmedAt) return res.json({ok:true, already:true, note:'block already armed for '+daybookDateLabel(y)});
     await daybookCheck1030();
     res.json({ok:true, armed:daybookDateLabel(y), blocking:daybookIsBlocking()});
+  }catch(e){ res.json({error:e.message}); }
+});
+app.get('/api/wa-probe-alive', async function(req,res){
+  try{
+    var p = (typeof waClient.probeAlive==='function') ? await waClient.probeAlive() : {alive:null,how:'adapter too old - redeploy'};
+    res.json({waReadyFlag:waReady, browserSays:p,
+      agree:(p.alive===null)?null:(p.alive===waReady),
+      lastInboundAt: global._inboundSeenAt ? new Date(global._inboundSeenAt).toISOString() : null,
+      note:(p.alive===false&&waReady)?'MISMATCH: the flag says connected but the browser is dead - restart the service':'ok'});
   }catch(e){ res.json({error:e.message}); }
 });
 app.get('/api/dm-send', async function(req,res){
