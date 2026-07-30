@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// wa-adapter.js — v1.0.0  (Fidato MIS migration, 28 Jul 2026)
+// wa-adapter.js  v2.13.2: first-contact sends resolve the wid and retry — v1.0.0  (Fidato MIS migration, 28 Jul 2026)
 //
 // Presents the exact whatsapp-web.js surface server.js + sales.js use, backed
 // by WPPConnect 2.2.4. server.js changes ONE line:
@@ -226,19 +226,68 @@ class Client extends EventEmitter {
     out.id={ _serialized:idStr, id:stanza, fromMe:true };
     return out;
   }
+  /* Resolve a bare phone JID to the wid WhatsApp actually uses. Needed for a
+     number the bot has never messaged: sendText resolves its own result through
+     getMessageById, and with no chat in the store that lookup returns undefined
+     -> "Cannot read properties of undefined (reading 'get')". Checking the number
+     first both creates the addressable wid and tells us if it is on WhatsApp. */
+  async _resolveWid(jid){
+    if(!/@c\.us$/.test(String(jid||''))) return jid;
+    var fns=['checkNumberStatus','getNumberProfile'];
+    for(var i=0;i<fns.length;i++){
+      var fn=this._wpp[fns[i]];
+      if(typeof fn!=='function') continue;
+      try{
+        var st=await fn.call(this._wpp, jid);
+        if(st && st.numberExists===false) return null;              // not on WhatsApp
+        var wid=(st&&st.id&&(st.id._serialized||st.id))||null;
+        if(wid) return String(wid);
+      }catch(e){ /* try the next one */ }
+    }
+    return jid;
+  }
   async sendMessage(jid, content, opts){
     opts=opts||{};
-    var r;
-    if(content instanceof MessageMedia || (content&&content.mimetype&&content.data)){
-      var dataUrl='data:'+content.mimetype+';base64,'+content.data;
-      var fname=content.filename||'file';
-      r = /^image\//.test(content.mimetype)
-        ? await this._wpp.sendImageFromBase64(jid, dataUrl, fname, opts.caption||'')
-        : await this._wpp.sendFileFromBase64(jid, dataUrl, fname, opts.caption||'');
-    } else {
-      r = await this._wpp.sendText(jid, String(content));
+    var self=this, r;
+    async function fire(target){
+      if(content instanceof MessageMedia || (content&&content.mimetype&&content.data)){
+        var dataUrl='data:'+content.mimetype+';base64,'+content.data;
+        var fname=content.filename||'file';
+        return /^image\//.test(content.mimetype)
+          ? self._wpp.sendImageFromBase64(target, dataUrl, fname, opts.caption||'')
+          : self._wpp.sendFileFromBase64(target, dataUrl, fname, opts.caption||'');
+      }
+      return self._wpp.sendText(target, String(content));
+    }
+    try{
+      r = await fire(jid);
+    }catch(err){
+      var m=String((err&&err.message)||err);
+      if(!/getMessageById|reading 'get'/.test(m)) throw err;
+      /* PROVEN 30 Jul: the message IS delivered, then sendText throws while looking
+         its own result up in the store - which has no chat for a number the bot has
+         never written to. So this is a FALSE NEGATIVE, and retrying would send a
+         SECOND copy. Swallow it and return a result with a null id. The only cost is
+         that this one send cannot be tracked by message id; group posts (where the id
+         matters, for swipe-replies) always have a chat, so they never take this path -
+         and it is logged loudly if one ever does. */
+      console.warn('[adapter] send to '+jid+' DELIVERED but the id lookup failed - returning a null id, NOT retrying');
+      if(/@g\.us$/.test(String(jid))) console.error('[adapter] WARNING: a GROUP send hit this path - reply tracking for it will not work');
+      r = { _idLookupFailed:true };
     }
     return this._normalizeSendResult(r);
+  }
+  /* Is a number reachable? Used by /api/wa-can-message. */
+  async canMessage(phone){
+    var jid=String(phone).replace(/[^0-9]/g,'')+'@c.us';
+    var out={jid:jid, reachable:null, wid:null, note:''};
+    try{
+      var wid=await this._resolveWid(jid);
+      if(wid===null){ out.reachable=false; out.note='number is not registered on WhatsApp'; return out; }
+      out.reachable=true; out.wid=wid;
+      out.note=(wid===jid)?'assumed reachable (status check unavailable)':'confirmed on WhatsApp';
+    }catch(e){ out.reachable=null; out.note='check failed: '+e.message; }
+    return out;
   }
 
   async getChats(){
