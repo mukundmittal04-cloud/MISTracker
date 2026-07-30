@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.13.7-autoclose';
+var SERVER_VERSION='2.13.11-sheet-state';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -227,6 +227,10 @@ function createWhatsAppClient() {
     // Detect which we got and handle both.
     latestQR = qr;
     var v = String(qr||'');
+    /* v2.13.10: a QR means there is no session, so the bot CANNOT be ready. Without
+       this, a stale waReady stayed true through an unpair and /health kept reporting
+       connected while the bot sat on a QR screen. */
+    if(waReady){ waReady = false; console.log('[WA] QR shown -> waReady forced FALSE (no session until it is scanned)'); }
     if(v.indexOf('data:image')===0){ latestQRDataUrl = v; console.log('QR generated (pre-rendered image).'); return; }
     if(v.length>2000){ latestQRDataUrl = 'data:image/png;base64,'+v.replace(/^base64,/,''); console.log('QR generated (raw base64).'); return; }
     qrcode.toDataURL(v, function(err, url){
@@ -3106,6 +3110,9 @@ function saveDMState(state) {
 }
 function pruneStaleDMState(state) {
   var now = Date.now();
+  if(!state || !state.pending) { if(state) state.pending = {}; return; }   // v2.13.11: a state
+    // file without .pending used to throw here, which took the whole DM handler down and
+    // returned nothing to the sender - silent, and indistinguishable from the bot being off.
   Object.keys(state.pending).forEach(function(jid){
     var entry = state.pending[jid];
     if(now - new Date(entry.lastUpdate).getTime() > 30*60*1000){
@@ -3386,7 +3393,7 @@ async function handleAccountantDM(msg) {
   // START of a new expense; an in-flight session (draft or cash-sheet) continues.
   // manual trigger: MM or 537000 DMs "ask abhishek" (or "daybook ask") and the bot
   // sends him the same closure request the 11pm cron would, then confirms back.
-  if(/^(ask\s+abhishek|daybook\s+ask)$/i.test(body)){
+  if(/^(ask|message|msg|remind|ping)\s+abhishek$|^daybook\s+ask$/i.test(body)){
     var _akPhone = await resolvePhoneFromJid(rawFrom);
     console.log('[Daybook] "ask abhishek" from', rawFrom, '-> resolved phone', _akPhone,
                 '-> authorised:', daybookMayOverride(_akPhone));
@@ -3414,8 +3421,8 @@ async function handleAccountantDM(msg) {
     }
     return true;
   }
-  var _entryNow = state[rawFrom];
-  var _midFlow = !!(_entryNow && (_entryNow.step || _entryNow.sheet || (_entryNow.mediaIds&&_entryNow.mediaIds.length)));
+  var _entryNow = (state.pending||{})[rawFrom];      // v2.13.9: state lives under .pending, not at the top level
+  var _midFlow = !!(_entryNow && (_entryNow.askedFor || _entryNow.sheet || _entryNow.details || _entryNow.amount || (_entryNow.mediaIds&&_entryNow.mediaIds.length)));
   var _ctrlWord = /^(cancel|status|whoami|help|hi|hello)$/i.test(body) || /^(ask\s+abhishek|daybook\s+)/i.test(body);
   if(daybookIsBlocking() && !_midFlow && !_ctrlWord){
     await waClient.sendMessage(rawFrom, daybookBlockMessage());
@@ -4051,7 +4058,8 @@ async function handleAccountantDM(msg) {
                 'I can see multiple amounts on this image but could not read the individual lines clearly. Please send the bills one at a time.');
               return true;
             }
-            state[rawFrom] = { sheet:{ items:_items, step:'confirm' }, ts:Date.now() };
+            state.pending = state.pending || {};
+            state.pending[rawFrom] = { sheet:{ items:_items, step:'confirm' }, lastUpdate:new Date().toISOString() };
             saveDMState(state);
             await waClient.sendMessage(rawFrom, sheetConfirmText(_items));
             return true;
@@ -5713,7 +5721,9 @@ app.get('/health',function(req,res){
   var lib='unknown';
   try{ lib='wppconnect-'+require('@wppconnect-team/wppconnect/package.json').version; }
   catch(e){ try{ lib=require('whatsapp-web.js/package.json').version; }catch(e2){} }
-  res.json({status:'ok',version:SERVER_VERSION,whatsapp:waReady?'connected':'disconnected',
+  res.json({status:'ok',version:SERVER_VERSION,
+    whatsapp: latestQRDataUrl ? 'WAITING FOR QR SCAN' : (waReady?'connected':'disconnected'),
+    needsQrScan: !!latestQRDataUrl,
     inboundWired: !!global._inboundSeenAt,
     lastInboundAt: global._inboundSeenAt ? new Date(global._inboundSeenAt).toISOString() : null,
     minutesSinceInbound: global._inboundSeenAt ? Math.round((Date.now()-global._inboundSeenAt)/60000) : null,
@@ -7814,7 +7824,7 @@ initGoogleSheets();
 createWhatsAppClient();
 startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.13.7-autoclose | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.13.11-sheet-state | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
@@ -8002,7 +8012,7 @@ cron.schedule('30 17 * * *', function(){ daybookAsk11pm(); });     // 23:00 IST
 cron.schedule('0 5 * * *',  function(){ daybookCheck1030(); });    // 10:30 IST
 app.get('/api/daybook-status', function(req,res){ res.json({ text:daybookStatusText(), blocking:daybookIsBlocking(), store:loadDaybook() }); });
 app.get('/api/daybook-close',  function(req,res){ var r=daybookClose(req.query.date||null,'panel:MM'); res.json(r); });
-app.get('/api/daybook-override', function(req,res){ res.json(daybookOverride('panel:MM')); });
+app.get('/api/daybook-override', function(req,res){ var r=daybookOverride('panel'); res.json({ok:true, msg:r.msg, blocking:daybookIsBlocking()}); });
 app.get('/api/daybook-arm', async function(req,res){
   try{ var y=istDateKey(-1), d=loadDaybook(), rec=d[y]||{};
     if(rec.closedAt) return res.json({error:'already closed'});
@@ -8087,19 +8097,20 @@ function sheetConfirmText(items){
   return L.join('\n');
 }
 async function handleSheetReply(state, rawFrom, body, senderInfo){
-  var entry=state[rawFrom]; if(!entry||!entry.sheet) return false;
+  state.pending = state.pending || {};
+  var entry=state.pending[rawFrom]; if(!entry||!entry.sheet) return false;
   var sh=entry.sheet, low=body.toLowerCase();
-  function save(){ state[rawFrom]=entry; saveDMState(state); }
+  function save(){ entry.lastUpdate=new Date().toISOString(); state.pending[rawFrom]=entry; saveDMState(state); }
   async function send(t){ await waClient.sendMessage(rawFrom, t); }
 
-  if(low==='cancel'){ delete state[rawFrom]; saveDMState(state); await send('Cleared \u2014 the sheet was not posted.'); return true; }
+  if(low==='cancel'){ delete state.pending[rawFrom]; saveDMState(state); await send('Cleared \u2014 the sheet was not posted.'); return true; }
 
   if(sh.step==='confirm'){
     var md=low.match(/^drop\s+(\d{1,2})$/);
     if(md){ var i=parseInt(md[1],10)-1;
       if(i<0||i>=sh.items.length){ await send('There is no item '+md[1]+'.'); return true; }
       var gone=sh.items.splice(i,1)[0]; save();
-      if(!sh.items.length){ delete state[rawFrom]; saveDMState(state); await send('All items removed \u2014 nothing to post.'); return true; }
+      if(!sh.items.length){ delete state.pending[rawFrom]; saveDMState(state); await send('All items removed \u2014 nothing to post.'); return true; }
       await send('Dropped "'+gone.label+'".\n\n'+sheetConfirmText(sh.items)); return true; }
     var me=body.match(/^edit\s+(\d{1,2})\s+(.+?)\s+([\d,]+)$/i);
     if(me){ var j=parseInt(me[1],10)-1;
@@ -8111,6 +8122,13 @@ async function handleSheetReply(state, rawFrom, body, senderInfo){
       await send('*Which company / entity is this sheet for?* (one answer covers every line)\n'+
         LEDGER_ENTITIES.map(function(e,i){return (i+1)+'. '+e;}).join('\n')); return true; }
     await send('Reply *yes*, *drop N*, *edit N <label> <amount>*, or *cancel*.'); return true;
+  }
+  if(['confirm','entity','account'].indexOf(sh.step)<0){
+    // defensive: an unknown step would otherwise leak a sheet-shaped object into the
+    // single-bill draft logic, which expects details/amount/askedFor
+    delete state.pending[rawFrom]; saveDMState(state);
+    await send('That sheet session was in an unexpected state, so I cleared it. Please send the image again.');
+    return true;
   }
 
   if(sh.step==='entity'){
@@ -8140,7 +8158,7 @@ async function handleSheetReply(state, rawFrom, body, senderInfo){
         'Log it here with the usual inflow message so it reaches the Ledger \u2014 e.g.:',
         '`received '+rc[q].amount+' from '+rc[q].label+'`'].join('\n')); }catch(e){}
     }
-    delete state[rawFrom]; saveDMState(state);
+    delete state.pending[rawFrom]; saveDMState(state);
     var done=['\u2705 Posted *'+posted+' expense request'+(posted===1?'':'s')+'* to the approval group \u2014 M/S to review.'];
     if(rc.length) done.push('\u{1F4B0} '+rc.length+' receipt'+(rc.length===1?'':'s')+' flagged in the inflow group for logging.');
     if(failed.length) done.push('\u26a0\ufe0f Failed: '+failed.join('; '));
@@ -8305,7 +8323,11 @@ app.get('/api/master', async function(req,res){
      +'<div class="cards"><div class="card"><span>Pending items (14d)</span><b>'+pend.length+'</b></div>'
      +'<div class="card"><span>Backlog items</span><b>'+bk.rows.length+'</b></div>'
      +'<div class="card"><span>Backlog value</span><b>\u20b9'+formatINR(bk.total)+'</b></div>'
-     +'<div class="card"><span>Day book</span><b style="font-size:13px">'+(daybookIsBlocking()?'BLOCKING':'ok')+'</b></div></div>'
+     +'<div class="card"><span>Day book</span><b style="font-size:13px">'+(daybookIsBlocking()?'BLOCKING':'ok')+'</b>'
+     +'<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">'
+     +(daybookIsBlocking()?'<button onclick="db(\'override\')" style="background:#1d7a4c;color:#fff;border:0">Lift block</button>':'')
+     +'<button onclick="db(\'ask\')">Ask Abhishek</button>'
+     +'</div></div></div>'
      +'<div class="links"><a href="/api/backlog">Backlog \u2014 bulk write-off / mark paid \u2192</a>'
      +'<a href="/api/panel">Classic panel \u2192</a><a href="/api/outflow-log">Payments log \u2192</a><a href="/api/daybook-status">Day-book JSON \u2192</a></div><br>'
      +'<table><tr><th>Request</th><th>Amount</th><th>M / S</th><th>Actions</th></tr>'+(rows||'<tr><td colspan=4>Nothing pending in the last 14 days.</td></tr>')+'</table>'
@@ -8314,6 +8336,8 @@ app.get('/api/master', async function(req,res){
      +'document.getElementById("p0").classList.toggle("hide",i!==0);document.getElementById("p1").classList.toggle("hide",i!==1);}'
      +'function mv(id,role,label,amt){if(!confirm("Record "+role.toUpperCase()+"\'s YES for:\\n"+decodeURIComponent(label)+"\\n\\nStamped [panel:MM] and announced in the group."))return;'
      +'fetch("/api/manual-verdict?item="+id+"&role="+role+"&v=yes&label="+label+"&amount="+amt).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);location.reload();});}'
+     +'function db(a){var q=(a==="override")?"Lift the day-book block for yesterday? Expense requests reopen immediately.":"Send Abhishek the day-book closure request now?";'
+     +'if(!confirm(q))return;fetch("/api/daybook-"+a).then(r=>r.json()).then(j=>{alert(j.msg||j.sent||j.note||JSON.stringify(j));location.reload();});}'
      +'function cl(id){if(!confirm("Clear all verdicts on this item? It stays in the group; M and S can vote again."))return;'
      +'fetch("/api/item-clear?item="+id).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);location.reload();});}'
      +'</script></body></html>');
