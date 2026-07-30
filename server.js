@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.13.1-daybook';
+var SERVER_VERSION='2.13.2-daybook';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -3370,6 +3370,8 @@ async function handleAccountantDM(msg) {
   // sends him the same closure request the 11pm cron would, then confirms back.
   if(/^(ask\s+abhishek|daybook\s+ask)$/i.test(body)){
     var _akPhone = await resolvePhoneFromJid(rawFrom);
+    console.log('[Daybook] "ask abhishek" from', rawFrom, '-> resolved phone', _akPhone,
+                '-> authorised:', daybookMayOverride(_akPhone));
     if(!daybookMayOverride(_akPhone)){
       await waClient.sendMessage(rawFrom, 'Only M can ask Abhishek to close the day book.');
       return true;
@@ -7783,7 +7785,7 @@ initGoogleSheets();
 createWhatsAppClient();
 startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.13.1-daybook | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.13.2-daybook | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
@@ -7895,6 +7897,7 @@ async function daybookAskAbhishek(manualBy){
     }
     lines.push('','Is it complete? Reply *daybook done* to close it.');
     await waClient.sendMessage(DAYBOOK_CLOSER_PHONE+'@c.us', lines.join('\n'));
+    console.log('[Daybook] ask sent to Abhishek for '+daybookDateLabel(t)+(manualBy?(' (manual, by '+manualBy+')'):' (11pm cron)'));
     return 'Asked Abhishek to close '+daybookDateLabel(t)+
            (fig.entries!=null?(' \u2014 '+fig.entries+' entries \u00b7 IN '+formatINR(fig.totalIn)+' \u00b7 OUT '+formatINR(fig.totalOut)):'');
   }catch(e){ console.error('[Daybook] ask:', e.message); return 'Could not send it: '+e.message; }
@@ -7914,19 +7917,42 @@ async function daybookCatchUp(){
     await daybookCheck1030();
   }catch(e){ console.error('[Daybook] catch-up:', e.message); }
 }
-setTimeout(function(){ daybookCatchUp(); }, 45000);     // after WhatsApp settles
+/* WAIT FOR waReady, don't guess at it. The first build used a flat 45s timer and
+   fired while WPPConnect was still loading the page: the block armed in the state
+   file but every sendMessage inside it failed into its catch, so the group notice
+   and Abhishek's DM were silently lost. Poll instead, and give up after 5 minutes
+   rather than arming a block nobody can be told about. */
+(function daybookCatchUpWhenReady(){
+  var waited=0;
+  var iv=setInterval(function(){
+    waited+=5000;
+    if(typeof waReady!=='undefined' && waReady){
+      clearInterval(iv);
+      console.log('[Daybook] WhatsApp ready after '+(waited/1000)+'s - running catch-up');
+      daybookCatchUp();
+    } else if(waited>=300000){
+      clearInterval(iv);
+      console.error('[Daybook] catch-up skipped: WhatsApp never became ready in 5 min');
+    }
+  }, 5000);
+})();
 async function daybookCheck1030(){
   try{
     var y=istDateKey(-1), d=loadDaybook(); var rec=d[y]=d[y]||{};
     if(rec.closedAt || rec.overriddenAt) return;
     if(rec.blockArmedAt) return;              // already armed and announced today - stay quiet
+    if(!waReady){ console.error('[Daybook] NOT arming '+daybookDateLabel(y)+' - WhatsApp not ready, nobody could be told'); return; }
     rec.blockArmedAt=Date.now(); saveDaybook(d);
     try{ await waClient.sendMessage(DAYBOOK_CLOSER_PHONE+'@c.us',
-      '\u26a0\ufe0f Yesterday\u2019s day book ('+daybookDateLabel(y)+') is still open. *New expense requests are now blocked* until it is closed. Reply *daybook done* when finished.'); }catch(e){}
+      '\u26a0\ufe0f Yesterday\u2019s day book ('+daybookDateLabel(y)+') is still open. *New expense requests are now blocked* until it is closed. Reply *daybook done* when finished.');
+      console.log('[Daybook] blocked '+daybookDateLabel(y)+' - DM sent to Abhishek');
+    }catch(e){ console.error('[Daybook] DM to Abhishek FAILED:', e.message); }
     try{ await waClient.sendMessage(CONFIG.APPROVAL_GROUP_JID, ['\u{1F512} *DAY BOOK NOT CLOSED \u2014 '+daybookDateLabel(y)+'*','',
       'New expense requests are on hold, awaiting Abhishek\u2019s closure of the previous night\u2019s day book.',
-      'Paying, receipts and approvals continue as normal.'].join('\n')); }catch(e){}
-    // two consecutive open days -> tell M directly
+      'Paying, receipts and approvals continue as normal.'].join('\n'));
+      console.log('[Daybook] block notice posted to the approval group');
+    }catch(e){ console.error('[Daybook] group notice FAILED:', e.message); }
+    // two consecutive open days -> tell the override holders directly
     var y2=istDateKey(-2);
     if(d[y2] && !d[y2].closedAt && !d[y2].overriddenAt){
       for(var _oi=0;_oi<DAYBOOK_OVERRIDE_PHONES.length;_oi++){
