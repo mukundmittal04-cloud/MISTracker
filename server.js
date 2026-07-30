@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.13.2-daybook';
+var SERVER_VERSION='2.13.5-diag';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -262,6 +262,18 @@ function createWhatsAppClient() {
     }, 10000);
   });
   waClient.on('message', function(msg) {
+    /* v2.13.5: log EVERY inbound message before any routing. Three separate silent
+       failures this morning were impossible to diagnose because nothing proved whether
+       a message had even arrived. This line is the difference between reading a log and
+       guessing at one. */
+    try{
+      var _f=String((msg&&msg.from)||''), _isG=_f.indexOf('@g.us')>=0;
+      console.log('[IN]', _isG?'GROUP':'DM', _f,
+                  '| author', String((msg&&msg.author)||'-'),
+                  '| fromMe', !!(msg&&msg.fromMe),
+                  '| body', String((msg&&msg.body)||'').substring(0,60).replace(/\n/g,' '),
+                  (msg&&msg.hasMedia)?'| +media':'');
+    }catch(e){ console.log('[IN] (could not log this message:', e.message, ')'); }
     captureRawMessage(msg);   // v2.11.0-s6.15 diagnostic: record the raw payload before anything can fail
     sales.handleSalesMessage(msg).then(function(handledSales){
       if(handledSales) return;
@@ -270,11 +282,13 @@ function createWhatsAppClient() {
         return handlePaidFlow(msg).then(function(handledPaid){
           if(handledPaid) return;
           return handlePromoterVerdicts(msg).then(function(handled){
-            if(!handled) return handleAccountantDM(msg);
+            if(!handled) return handleAccountantDM(msg).catch(function(e){
+              console.error('[DM handler] THREW for', String((msg&&msg.from)||''), ':', e && e.message, '\n', e && e.stack);
+            });
           });
         });
       });
-    }).catch(function(e){ console.error('[Msg handler]', e.message); });
+    }).catch(function(e){ console.error('[Msg handler] THREW:', e && e.message, '\n', e && e.stack); });
   });
   waClient.initialize().catch(function(e) { console.error('WA init failed:', e.message); });
 }
@@ -7785,7 +7799,7 @@ initGoogleSheets();
 createWhatsAppClient();
 startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.13.2-daybook | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.13.5-diag | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
@@ -7850,7 +7864,9 @@ function daybookClose(dateTxt, byPhone){
   if(rec.closedAt) return {closed:false, msg:'Day book '+daybookDateLabel(key)+' is already closed.'};
   var wasBlocking = daybookIsBlocking() && key===istDateKey(-1);
   rec.closedAt=Date.now(); rec.closedBy=byPhone;
-  try{ var lg=daybookLedgerFigures(key); rec.entries=lg.entries; rec.totalIn=lg.totalIn; rec.totalOut=lg.totalOut; }catch(e){}
+  // figures are recorded asynchronously after the close so the reply is instant
+  daybookLedgerFigures(key).then(function(lg){ if(!lg) return;
+    var dd=loadDaybook(); if(dd[key]){ dd[key].entries=lg.entries; dd[key].totalIn=lg.totalIn; dd[key].totalOut=lg.totalOut; saveDaybook(dd); } });
   saveDaybook(d);
   return {closed:true, wasBlocking:wasBlocking, date:daybookDateLabel(key),
     msg:'\u2705 Day book '+daybookDateLabel(key)+' closed.'+(rec.entries!=null?(' Recorded against '+rec.entries+' ledger entries.'):'')};
@@ -7861,43 +7877,48 @@ function daybookOverride(byPhone){
   return {msg:'\u{1F513} Day-book block for '+daybookDateLabel(y)+' lifted by M (override). Abhishek \u2014 the book still needs completing and closing.'};
 }
 // figures for the 11pm ask — count + totals from the Ledger for one IST day
-function daybookLedgerFigures(key){
+/* getLedgerData(isoKey) already filters the sheet to that one day and returns rows
+   whose .date is a Date OBJECT. The first build compared String(thatDate) against a
+   'dd/mm/yyyy' label, which can never match - so every ask reported 0 entries even on
+   a busy day. Pass the ISO key and just total what comes back. */
+async function daybookLedgerFigures(key){
   var out={entries:0,totalIn:0,totalOut:0};
   try{
-    var target=daybookDateLabel(key);
-    var data=(typeof getLedgerCache==='function' && getLedgerCache()) || null;
-    var rows=(data&&data.entries)||[];
+    var rows=await getLedgerData(key) || [];
     rows.forEach(function(e){
-      var dt=String(e.date||'');
-      if(dt!==target) return;
       out.entries++;
-      if(e.inOut==='IN') out.totalIn+=Number(e.amount)||0;
-      else if(e.inOut==='OUT') out.totalOut+=Number(e.amount)||0;
+      if(String(e.inOut).toUpperCase()==='IN')  out.totalIn  += Number(e.amount)||0;
+      if(String(e.inOut).toUpperCase()==='OUT') out.totalOut += Number(e.amount)||0;
     });
-  }catch(e){}
+  }catch(e){ console.error('[Daybook] ledger figures for '+key+':', e.message); return null; }
   return out;
 }
 /* Shared by the 11pm cron and the manual "ask abhishek" command. Returns a short
    line describing what was sent, so the requester gets a confirmation. */
 async function daybookAskAbhishek(manualBy){
   try{
-    var t=istDateKey(0), d=loadDaybook(); var rec=d[t]=d[t]||{};
+    /* Ask about the day that actually needs closing. If yesterday is still open and
+       blocking, asking about TODAY is useless - he could reply "daybook done", close
+       today, and the block would stay up. Chase the blocking day first. */
+    var d=loadDaybook(), yk=istDateKey(-1), tk=istDateKey(0);
+    var yRec=d[yk]||{};
+    var chasingBlock = !yRec.closedAt && !yRec.overriddenAt && !!yRec.blockArmedAt;
+    var t = chasingBlock ? yk : tk;
+    var rec=d[t]=d[t]||{};
     if(rec.closedAt) return 'Day book '+daybookDateLabel(t)+' is already closed \u2014 nothing to ask.';
-    var fig={entries:null};
-    try{ var lg=await getLedgerData(); var rows=(lg&&lg.entries)||[];
-      var target=daybookDateLabel(t); fig={entries:0,totalIn:0,totalOut:0};
-      rows.forEach(function(e){ if(String(e.date||'')!==target) return;
-        fig.entries++; if(e.inOut==='IN') fig.totalIn+=Number(e.amount)||0; else if(e.inOut==='OUT') fig.totalOut+=Number(e.amount)||0; });
-    }catch(e){}
+    var fig=await daybookLedgerFigures(t);
+    if(!fig) fig={entries:null};
     rec.askedAt=(rec.askedAt||[]); rec.askedAt.push(Date.now()); saveDaybook(d);
-    var lines=['\u{1F4D2} *Day book \u2014 '+daybookDateLabel(t)+'*',''];
+    var dLabel=daybookDateLabel(t), ddmm=dLabel.slice(0,5);
+    var lines=['\u{1F4D2} *Day book \u2014 '+dLabel+'*',''];
+    if(chasingBlock) lines.push('\u26a0\ufe0f *New expense requests are on hold until this day is closed.*','');
     if(fig.entries!=null){
-      lines.push('On the Ledger right now: *'+fig.entries+' entries \u00b7 IN '+formatINR(fig.totalIn)+' \u00b7 OUT '+formatINR(fig.totalOut)+'*');
-      if(fig.entries===0) lines.push('_No entries today \u2014 if it was a nil day, closing it is still one reply._');
+      lines.push('On the Ledger for '+ddmm+': *'+fig.entries+' entries \u00b7 IN '+formatINR(fig.totalIn)+' \u00b7 OUT '+formatINR(fig.totalOut)+'*');
+      if(fig.entries===0) lines.push('_No entries on that date \u2014 if it was a nil day, closing it is still one reply._');
     }
-    lines.push('','Is it complete? Reply *daybook done* to close it.');
+    lines.push('','Is it complete? Reply *daybook done '+ddmm+'* to close it.');
     await waClient.sendMessage(DAYBOOK_CLOSER_PHONE+'@c.us', lines.join('\n'));
-    console.log('[Daybook] ask sent to Abhishek for '+daybookDateLabel(t)+(manualBy?(' (manual, by '+manualBy+')'):' (11pm cron)'));
+    console.log('[Daybook] ask sent to Abhishek for '+daybookDateLabel(t)+(chasingBlock?' [BLOCKING day]':'')+(manualBy?(' (manual, by '+manualBy+')'):' (11pm cron)')+' - '+(fig.entries==null?'figures unavailable':(fig.entries+' entries')));
     return 'Asked Abhishek to close '+daybookDateLabel(t)+
            (fig.entries!=null?(' \u2014 '+fig.entries+' entries \u00b7 IN '+formatINR(fig.totalIn)+' \u00b7 OUT '+formatINR(fig.totalOut)):'');
   }catch(e){ console.error('[Daybook] ask:', e.message); return 'Could not send it: '+e.message; }
@@ -7973,6 +7994,25 @@ app.get('/api/daybook-arm', async function(req,res){
     if(rec.blockArmedAt) return res.json({ok:true, already:true, note:'block already armed for '+daybookDateLabel(y)});
     await daybookCheck1030();
     res.json({ok:true, armed:daybookDateLabel(y), blocking:daybookIsBlocking()});
+  }catch(e){ res.json({error:e.message}); }
+});
+app.get('/api/dm-send', async function(req,res){
+  try{
+    if(!waReady) return res.json({error:'WhatsApp not ready'});
+    var p=String(req.query.phone||'').replace(/[^0-9]/g,'');
+    var txt=String(req.query.text||'MIS bot test \u2014 '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));
+    if(!p) return res.json({error:'pass ?phone=919773592304&text=hello'});
+    var r=await waClient.sendMessage(p+'@c.us', txt);
+    res.json({ok:true, to:p, id:(r&&r.id&&r.id._serialized)||null,
+              note:(r&&r.id&&r.id._serialized)?'sent and tracked':'sent (id lookup failed \u2014 delivery still happened)'});
+  }catch(e){ res.json({error:e.message}); }
+});
+app.get('/api/wa-can-message', async function(req,res){
+  try{
+    var p=String(req.query.phone||'').replace(/[^0-9]/g,'');
+    if(!p) return res.json({error:'pass ?phone=919873574112'});
+    if(typeof waClient.canMessage!=='function') return res.json({error:'adapter too old - redeploy'});
+    res.json(await waClient.canMessage(p));
   }catch(e){ res.json({error:e.message}); }
 });
 app.get('/api/daybook-ask', async function(req,res){
