@@ -147,10 +147,16 @@ class Client extends EventEmitter {
        DM alike, with nothing in the logs. Verify the session is ALIVE; if not, tear it
        down and build a real one. */
     if(this._wpp){
+      /* v2.13.10: isConnected() FIRST was wrong. It reports whether the PAGE is
+         talking to WhatsApp's servers - which is true while a QR code is on screen.
+         On 30 Jul it passed on an UNPAIRED session, emitted 'ready', and /health
+         claimed connected while nobody could reach the bot. isLogged() is the one
+         that means "there is a session". Require it; isConnected alone proves nothing. */
       var alive=false;
-      for(var _f of ['isConnected','isLogged','isAuthenticated']){
+      for(var _f of ['isLogged','isAuthenticated']){
         if(typeof this._wpp[_f]!=='function') continue;
-        try{ alive = !!(await this._wpp[_f]()); if(alive) break; }catch(e){ alive=false; }
+        try{ alive = !!(await this._wpp[_f]()); }catch(e){ alive=false; }
+        break;                                    // trust the first AUTH check available
       }
       if(alive){
         console.log('[adapter] initialize() called again; existing session verified LIVE - reusing');
@@ -306,7 +312,7 @@ class Client extends EventEmitter {
      'ready' emit could set on a dead session. */
   async probeAlive(){
     if(!this._wpp) return {alive:false, how:'no session object'};
-    for(var f of ['isConnected','isLogged','isAuthenticated']){
+    for(var f of ['isLogged','isAuthenticated','isConnected']){   // auth first - isConnected is true on a QR screen
       if(typeof this._wpp[f]!=='function') continue;
       try{ var v=await this._wpp[f](); return {alive:!!v, how:f+'()='+v}; }
       catch(e){ return {alive:false, how:f+'() threw: '+e.message}; }
