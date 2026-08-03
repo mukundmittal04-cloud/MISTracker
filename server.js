@@ -16,7 +16,7 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const initSales = require('./sales'); // s6.9 sales booking module
-var SERVER_VERSION='2.13.11-sheet-state';
+var SERVER_VERSION='2.14.0-queue-gate';
 const app = express();
 app.use(express.json());
 const CONFIG = {
@@ -5431,6 +5431,85 @@ async function sendEODReport(dateStr) {
   }
 }
 // ── Report HTML (legacy daily MIS report) ─────────────────────────────────────
+/* ============================================================
+   FUND POSITION IMAGE (v2.13.13) - second image of the daily post.
+   Every account across every company, with the usable / blocked split spelled
+   out. getFundPosition() stops reading at the TOTAL row, so the sheet's own
+   "Less: Blocked / PDC" footer never reaches us - we recompute that split from
+   each row's Status instead, which also means it stays right when an account
+   changes status.
+   NOTE ON DATE: the Fund Position tab is a LIVE snapshot keyed to its own DATE
+   cell, not per-day history. So this image always shows the CURRENT position,
+   even when the accompanying day report is for an earlier date. The caption
+   says so, rather than implying it is that date's closing position.
+   ============================================================ */
+function buildFundPositionHTML(accounts, forDate){
+  var acc=(accounts||[]).filter(function(a){ return a && (a.company||a.bankAC); });
+  function isBlocked(a){ return /block/i.test(String(a.status||'')); }
+  var usable=acc.filter(function(a){ return !isBlocked(a); });
+  var blocked=acc.filter(isBlocked);
+  function sum(list,k){ return list.reduce(function(t,a){ return t+(Number(a[k])||0); },0); }
+  var tOpen=sum(acc,'opening'), tIn=sum(acc,'todayIn'), tOut=sum(acc,'todayOut'),
+      tClose=sum(acc,'closing'), tChq=sum(acc,'cheques'), tNet=sum(acc,'netBal');
+  var uNet=sum(usable,'netBal'), bNet=sum(blocked,'netBal');
+
+  var h='<html><head><meta charset="utf-8"><style>'
+   +'*{box-sizing:border-box}body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:22px;background:#f5f4f0;color:#1e2129}'
+   +'.hdr{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid #191c3c;padding-bottom:10px;margin-bottom:16px}'
+   +'h1{font-size:22px;margin:0;color:#191c3c}.sub{font-size:12px;color:#6a6d78;margin-top:3px}'
+   +'.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}'
+   +'.mc{border:1px solid #d8d6cc;border-radius:10px;padding:11px 13px;background:#fff}'
+   +'.mc .l{font-size:11px;color:#6a6d78;text-transform:uppercase;letter-spacing:.4px}'
+   +'.mc .v{font-size:20px;font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-top:3px}'
+   +'.mc.us{background:#f0fdf6;border-color:#bbe7cf}.mc.bl{background:#fef4f3;border-color:#f3c9c4}.mc.tt{background:#f3f6fd;border-color:#c9d6f3}'
+   +'.sec{background:#191c3c;color:#fff;font-size:12px;font-weight:600;padding:6px 10px;border-radius:6px 6px 0 0;margin-top:14px}'
+   +'table{border-collapse:collapse;width:100%;background:#fff;font-size:12px}'
+   +'th{background:#eceae2;text-align:left;padding:6px 8px;font-size:11px;color:#3a3e5e;border-bottom:1px solid #d8d6cc}'
+   +'td{padding:5px 8px;border-bottom:1px solid #eeece4}'
+   +'.amt{text-align:right;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}'
+   +'.z{color:#b6b3a8}.rd{color:#a32d2d}.gn{color:#1d7a4c}'
+   +'tr.tot td{background:#eceae2;font-weight:700;border-top:2px solid #191c3c}'
+   +'.pill{display:inline-block;font-size:10px;padding:1px 6px;border-radius:8px;font-weight:700}'
+   +'.pill.u{background:#e3f3ea;color:#1d7a4c}.pill.b{background:#f7e3e1;color:#a32d2d}'
+   +'</style></head><body>';
+  h+='<div class="hdr"><div><h1>Fund Position \u2014 all companies</h1>'
+    +'<div class="sub">Live position as at '+escapeHtml(String(forDate||''))+' \u00b7 '+acc.length+' accounts</div></div></div>';
+  h+='<div class="cards">'
+    +'<div class="mc us"><div class="l">Usable</div><div class="v gn">'+formatINR(uNet)+'</div></div>'
+    +'<div class="mc bl"><div class="l">Blocked</div><div class="v rd">'+formatINR(bNet)+'</div></div>'
+    +'<div class="mc tt"><div class="l">Total net</div><div class="v">'+formatINR(tNet)+'</div></div>'
+    +'</div>';
+
+  function money(v,cls){ v=Number(v)||0; return '<td class="amt '+(v===0?'z':(cls||''))+'">'+(v===0?'\u2013':formatINR(v))+'</td>'; }
+  function rows(list){
+    return list.map(function(a){
+      return '<tr><td>'+escapeHtml(a.company||'')+'</td><td>'+escapeHtml(a.bankAC||'')+'</td>'
+        +money(a.opening)+money(a.todayIn,'gn')+money(a.todayOut,'rd')+money(a.closing)
+        +money(a.cheques,'rd')+money(a.netBal)
+        +'<td><span class="pill '+(isBlocked(a)?'b">BLOCKED':'u">USABLE')+'</span></td></tr>';
+    }).join('');
+  }
+  var head='<tr><th>Company / Entity</th><th>Bank A/C</th><th class="amt">Opening</th>'
+    +'<th class="amt">Today IN</th><th class="amt">Today OUT</th><th class="amt">Closing</th>'
+    +'<th class="amt">Cheques (15d)</th><th class="amt">Net</th><th>Status</th></tr>';
+
+  if(usable.length){
+    h+='<div class="sec">Usable \u2014 '+usable.length+' account'+(usable.length===1?'':'s')+'</div>';
+    h+='<table>'+head+rows(usable.slice().sort(function(x,y){ return (Number(y.netBal)||0)-(Number(x.netBal)||0); }))+'</table>';
+  }
+  if(blocked.length){
+    h+='<div class="sec">Blocked \u2014 not available to spend</div>';
+    h+='<table>'+head+rows(blocked)+'</table>';
+  }
+  h+='<div class="sec">Group total</div><table>'+head
+    +'<tr class="tot"><td colspan="2">ALL ACCOUNTS ('+acc.length+')</td>'
+    +money(tOpen)+money(tIn,'gn')+money(tOut,'rd')+money(tClose)+money(tChq,'rd')+money(tNet)
+    +'<td></td></tr></table>';
+  h+='<div class="sub" style="margin-top:12px">Opening and today\u2019s movement are auto-calculated from the Ledger. '
+    +'Cheques issued covers the next 15 days. Blocked accounts are excluded from the usable figure.</div>';
+  return h+'</body></html>';
+}
+
 async function generateDailyReport(dateStr){
   var entries=await getLedgerData(dateStr);var fp=await getFundPosition();
   var tIn=0,tOut=0,inflows=[],outflows=[];
@@ -5442,6 +5521,17 @@ async function generateDailyReport(dateStr){
     if(isSiteAccount(e.bankAC)){ siteOut.push(e); siteTot+=e.amount; }
     else { officeOut.push(e); officeTot+=e.amount; }
   });
+  /* v2.13.12: spend per ACCOUNT. The site-vs-office split only means something once the
+     account names distinguish a site pool from a company account; right now 'PDC' is a
+     company account, so that split would report Site 0 / Office 100% and imply a
+     classification nobody has made. Per-account is true today either way. */
+  var byAcct={};
+  outflows.forEach(function(e){
+    var a=(e.bankAC||'(no account)').trim()||'(no account)';
+    if(!byAcct[a]) byAcct[a]={total:0,items:[]};
+    byAcct[a].total+=e.amount; byAcct[a].items.push(e);
+  });
+
   // receivables snapshot - best-effort: the report must still render if the tracker is slow or down
   var recv=null;
   try{
@@ -5458,6 +5548,7 @@ async function generateDailyReport(dateStr){
   }catch(e){ console.log('[Report] receivables unavailable:', e.message); }
   return{date:dateStr,totalIn:tIn,totalOut:tOut,net:tIn-tOut,inflows:inflows,outflows:outflows,byTag:byTag,
     siteOutflows:siteOut,officeOutflows:officeOut,siteTotal:siteTot,officeTotal:officeTot,
+    byAccount:byAcct,
     receivables:recv,
     fundPosition:fp,entryCount:entries.length};
 }
@@ -5506,7 +5597,18 @@ function buildReportHTML(data){
 
   // ---- site vs office, right at the top: the question you actually ask ----
   var sT=(data.siteTotal||0), oT=(data.officeTotal||0), tT=sT+oT;
-  if(tT>0){
+  var accKeys=Object.keys(data.byAccount||{}).sort(function(a,b){ return data.byAccount[b].total-data.byAccount[a].total; });
+  if(sT<=0 && accKeys.length){
+    // no site-pool account matched, so show where the money actually went out from
+    h+='<div class="sec s">Paid from <span class="cnt">by account</span></div>';
+    h+='<table><tr><th>Account</th><th style="text-align:right">Items</th><th style="text-align:right">Amount</th></tr>';
+    accKeys.forEach(function(a){
+      h+='<tr><td>'+escapeHtml(a)+'</td><td class="amt">'+data.byAccount[a].items.length+
+         '</td><td class="amt rd">'+formatINR(data.byAccount[a].total)+'</td></tr>';
+    });
+    h+='</table>';
+  }
+  else if(tT>0){
     var sp=Math.round(sT/tT*100), op=100-sp;
     h+='<div class="sec s">Paid from <span class="cnt">site vs office</span></div>';
     h+='<div class="split">'
@@ -6541,7 +6643,48 @@ app.get('/api/debug-replies',async function(req,res){try{if(!waReady)return res.
 }catch(e){res.json({error:e.message});}});
 app.get('/api/preview',async function(req,res){try{res.send(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])));}catch(e){res.status(500).json({error:e.message});}});
 app.get('/api/preview-image',async function(req,res){try{var img=await htmlToImage(buildReportHTML(await generateDailyReport(req.query.date||new Date().toISOString().split('T')[0])),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);res.set('Content-Type','image/png');res.set('Content-Length',String(buf.length));res.set('Cache-Control','no-store');res.end(buf);}catch(e){res.status(500).json(errDetail(e));}});
-app.get('/api/daily-report',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});if(!CONFIG.BOT_ENABLED)return res.json({error:'Bot paused'});var d=req.query.date||new Date().toISOString().split('T')[0];var data=await generateDailyReport(d);var img=await htmlToImage(buildReportHTML(data),800,1200);var buf=Buffer.isBuffer(img)?img:Buffer.from(img);await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),{caption:'MIS Report - '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)});res.json({success:true,date:d});}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/daily-report',async function(req,res){
+  try{
+    if(!waReady) return res.json({error:'Not connected'});
+    if(!CONFIG.BOT_ENABLED) return res.json({error:'Bot paused'});
+    var d=req.query.date||new Date().toISOString().split('T')[0];
+    var only=String(req.query.only||'');                       // 'day' or 'fund' to send just one
+    var data=await generateDailyReport(d);
+    var sent=[];
+    if(only!=='fund'){
+      var img=await htmlToImage(buildReportHTML(data),800,1200);
+      var buf=Buffer.isBuffer(img)?img:Buffer.from(img);
+      await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,
+        new MessageMedia('image/png',buf.toString('base64'),'MIS_'+d+'.png'),
+        {caption:'MIS Report \u2014 '+d+'\nIN: '+formatINR(data.totalIn)+' | OUT: '+formatINR(data.totalOut)+' | NET: '+formatINR(data.net)+'\n(1/2 \u2014 day book)'});
+      sent.push('day');
+    }
+    // image 2: fund position across every company
+    if(only!=='day'){
+      try{
+        var accs=data.fundPosition||[];
+        if(accs.length){
+          var usable=accs.filter(function(a){return !/block/i.test(String(a.status||''));})
+                         .reduce(function(t,a){return t+(Number(a.netBal)||0);},0);
+          var total=accs.reduce(function(t,a){return t+(Number(a.netBal)||0);},0);
+          var fh=buildFundPositionHTML(accs, new Date().toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata'}));
+          var fimg=await htmlToImage(fh, 1000, 40+accs.length*30+380);
+          var fbuf=Buffer.isBuffer(fimg)?fimg:Buffer.from(fimg);
+          await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,
+            new MessageMedia('image/png',fbuf.toString('base64'),'FUND_'+d+'.png'),
+            {caption:'Fund Position \u2014 all companies (live)\nUsable: '+formatINR(usable)+' | Total net: '+formatINR(total)+'\n(2/2 \u2014 current position, not '+d+' closing)'});
+          sent.push('fund');
+        } else sent.push('fund-skipped-empty');
+      }catch(e){ console.error('[Report] fund image failed:', e.message); sent.push('fund-failed:'+e.message); }
+    }
+    res.json({success:true,date:d,sent:sent});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.get('/api/fund-position-preview',async function(req,res){
+  try{ var accs=await getFundPosition();
+    res.type('html').send(buildFundPositionHTML(accs, new Date().toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata'})));
+  }catch(e){ res.status(500).send('failed: '+e.message); }
+});
 app.get('/api/test-send',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});await waClient.sendMessage(CONFIG.WHATSAPP_GROUP_JID,'MIS Bot test - '+new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}));res.json({success:true});}catch(e){res.json({error:e.message});}});
 app.get('/api/report-status',function(req,res){res.json({botEnabled:CONFIG.BOT_ENABLED,whatsapp:waReady,version:'2.8.17',visionEnabled:CONFIG.CLAUDE_API_KEY?true:false,reverseScanWindowDays:REVERSE_SCAN_WINDOW_DAYS,reverseScanMinAmount:REVERSE_SCAN_MIN_AMOUNT});});
 app.get('/api/vision-test',async function(req,res){try{if(!waReady)return res.json({error:'Not connected'});var msgId=req.query.msgId;if(!msgId)return res.json({error:'pass ?msgId=...'});var chat=await waClient.getChatById(CONFIG.APPROVAL_GROUP_JID);var msgs=await chat.fetchMessages({limit:200});var target=null;for(var i=0;i<msgs.length;i++){var sid=msgs[i].id._serialized||msgs[i].id.id;if(sid===msgId){target=msgs[i];break;}}if(!target)return res.json({error:'message not found in last 200'});if(!target.hasMedia)return res.json({error:'no media'});var media=await target.downloadMedia();if(!media)return res.json({error:'failed to download'});visionCache.delete(msgId);var result=await extractFromImage(media,msgId);res.json({msgId:msgId,mimetype:media.mimetype,dataSize:media.data?media.data.length:0,parsed:result});}catch(e){res.json({error:e.message});}});
@@ -7824,7 +7967,7 @@ initGoogleSheets();
 createWhatsAppClient();
 startReadyHeal();
 app.listen(CONFIG.PORT,function(){
-  console.log('\nFidato MIS Server v2.13.11-sheet-state | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
+  console.log('\nFidato MIS Server v2.14.0-queue-gate | Port:',CONFIG.PORT,'| Vision:',CONFIG.CLAUDE_API_KEY?'enabled':'disabled');
   console.log('  ReverseScan: window='+REVERSE_SCAN_WINDOW_DAYS+'d, floor=Rs.'+REVERSE_SCAN_MIN_AMOUNT);
   console.log('  Report top-N: stale='+STALE_TOP_N+' (recent='+STALE_RECENT_HOURS+'h), reconciliation='+REPORT_TOP_N);
   console.log('  Smart DM parsing: enabled (free-form vendor/amount/company/account extraction)');
@@ -7838,6 +7981,28 @@ app.listen(CONFIG.PORT,function(){
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ── DAY-BOOK ─────────────────────────────────────────────────────────────────
+/* Dismissed pending items. buildApprovalAudit derives the pending queue by READING
+   GROUP HISTORY, not from the event store - so clearing an item's verdicts does not
+   remove it from the queue, it comes straight back on the next read. Dismissal has to
+   be its own persisted list that the queue is filtered against. */
+var DISMISS_FILE = './wa_auth/dismissed_pending.json';
+function loadDismissed(){ try{ if(fs.existsSync(DISMISS_FILE)) return JSON.parse(fs.readFileSync(DISMISS_FILE,'utf8')); }catch(e){} return {items:{}}; }
+function saveDismissed(d){ try{ fs.writeFileSync(DISMISS_FILE, JSON.stringify(d,null,1)); }catch(e){ console.error('[Dismiss] save:',e.message); } }
+function isDismissed(id){ var d=loadDismissed(); return !!(d.items && d.items[id]); }
+
+/* Master switch for the day-book gate. OFF means the gate never blocks and the
+   two crons do nothing - the feature is dormant, not deleted, and the state file
+   is untouched so turning it back on resumes exactly where it left off. */
+var GATE_FILE = './wa_auth/daybook_gate.json';
+function daybookGateEnabled(){
+  try{ if(fs.existsSync(GATE_FILE)) return !!JSON.parse(fs.readFileSync(GATE_FILE,'utf8')).enabled; }catch(e){}
+  return true;                                  // default ON, matching previous behaviour
+}
+function setDaybookGate(on,by){
+  try{ fs.writeFileSync(GATE_FILE, JSON.stringify({enabled:!!on, changedAt:new Date().toISOString(), changedBy:by||'panel'},null,1)); }catch(e){}
+  return daybookGateEnabled();
+}
+
 var DAYBOOK_FILE = './wa_auth/daybook.json';
 var DAYBOOK_CLOSER_PHONE   = '919873574112';   // Abhishek — sole authority to close
 var DAYBOOK_OVERRIDE_PHONES = ['919873095398','917838537000'];   // may override the block and trigger the ask
@@ -7860,6 +8025,7 @@ function parseDaybookDate(txt){                             // dd/mm[/yy] -> key
   return y+'-'+String(mo).padStart(2,'0')+'-'+String(dd).padStart(2,'0');
 }
 function daybookIsBlocking(){
+  if(!daybookGateEnabled()) return false;        // feature switched off from the panel
   var y=istDateKey(-1), d=loadDaybook();
   var rec=d[y]||{};
   if(rec.closedAt || rec.overriddenAt) return false;
@@ -7922,6 +8088,7 @@ async function daybookLedgerFigures(key){
    line describing what was sent, so the requester gets a confirmation. */
 async function daybookAskAbhishek(manualBy){
   try{
+    if(!daybookGateEnabled() && !manualBy) return 'day-book gate is switched off';
     /* Ask about the day that actually needs closing. If yesterday is still open and
        blocking, asking about TODAY is useless - he could reply "daybook done", close
        today, and the block would stay up. Chase the blocking day first. */
@@ -7984,6 +8151,7 @@ async function daybookCatchUp(){
 })();
 async function daybookCheck1030(){
   try{
+    if(!daybookGateEnabled()){ console.log('[Daybook] gate is OFF - skipping the morning check'); return; }
     var y=istDateKey(-1), d=loadDaybook(); var rec=d[y]=d[y]||{};
     if(rec.closedAt || rec.overriddenAt) return;
     if(rec.blockArmedAt) return;              // already armed and announced today - stay quiet
@@ -8274,6 +8442,76 @@ app.get('/api/manual-verdict', async function(req,res){
     res.json({ok:true, both:!!both});
   }catch(e){ res.json({error:e.message}); }
 });
+/* Dismiss ONE pending item from the queue. Records who and when. Refuses if the item
+   is already approved or has payment history - those go through the backlog page. */
+app.get('/api/pending-dismiss', function(req,res){
+  try{
+    var id=String(req.query.item||''); if(!id) return res.json({error:'item required'});
+    var store=loadEventStore();
+    if(findApprovedEvent(store,id)) return res.json({error:'already fully approved - close it on the backlog page instead'});
+    if((paidStatsForItem(store,id).total||0)>0) return res.json({error:'has payment history - cannot dismiss'});
+    var d=loadDismissed(); d.items=d.items||{};
+    d.items[id]={at:new Date().toISOString(), by:String(req.query.by||'panel'), reason:String(req.query.reason||'stale')};
+    saveDismissed(d);
+    res.json({ok:true, dismissed:id, total:Object.keys(d.items).length});
+  }catch(e){ res.json({error:e.message}); }
+});
+
+/* Dismiss EVERY pending item currently in the queue. Dry-run by default: shows what it
+   would remove. Add &commit=1 to apply. Approved and part-paid items are always skipped. */
+app.get('/api/pending-dismiss-all', async function(req,res){
+  try{
+    var commit=String(req.query.commit||'')==='1';
+    var days=Number(req.query.days||14)||14;
+    var audit=await buildApprovalAudit(days);
+    var store=loadEventStore();
+    var d=loadDismissed(); d.items=d.items||{};
+    var all=[].concat(audit.partialApproval||[], audit.noApproval||[], audit.onHold||[]);
+    var would=[], skipped=[];
+    all.forEach(function(e){
+      if(d.items[e.id]) return;                                  // already dismissed
+      if(findApprovedEvent(store,e.id)){ skipped.push({id:e.id,why:'approved'}); return; }
+      if((paidStatsForItem(store,e.id).total||0)>0){ skipped.push({id:e.id,why:'has payments'}); return; }
+      would.push({id:e.id, label:String(e.vendor||e.body||'').substring(0,70), amount:e.amount||0});
+    });
+    if(commit){
+      would.forEach(function(w){
+        d.items[w.id]={at:new Date().toISOString(), by:String(req.query.by||'panel'), reason:String(req.query.reason||'bulk stale clear')};
+      });
+      saveDismissed(d);
+    }
+    res.json({ok:true, mode:(commit?'APPLIED':'dry run - add &commit=1 to apply'),
+      wouldDismiss:would.length, skipped:skipped.length, skippedDetail:skipped.slice(0,20),
+      items:would.slice(0,100), totalDismissedNow:Object.keys(d.items).length});
+  }catch(e){ res.json({error:e.message}); }
+});
+
+/* Undo: bring dismissed items back into the queue. */
+app.get('/api/pending-restore', function(req,res){
+  try{
+    var id=String(req.query.item||'');
+    var d=loadDismissed(); d.items=d.items||{};
+    if(id==='all'){ var n=Object.keys(d.items).length; d.items={}; saveDismissed(d); return res.json({ok:true,restored:n}); }
+    if(!id) return res.json({error:'pass ?item=<id> or ?item=all'});
+    if(!d.items[id]) return res.json({error:'not dismissed'});
+    delete d.items[id]; saveDismissed(d);
+    res.json({ok:true, restored:id, remaining:Object.keys(d.items).length});
+  }catch(e){ res.json({error:e.message}); }
+});
+
+/* Day-book gate master switch. */
+app.get('/api/daybook-gate', function(req,res){
+  try{
+    var q=String(req.query.set||'').toLowerCase();
+    if(q==='off'||q==='on'){
+      var now=setDaybookGate(q==='on', String(req.query.by||'panel'));
+      return res.json({ok:true, enabled:now, blocking:daybookIsBlocking(),
+        msg:'Day-book gate is now '+(now?'ON':'OFF')+(now?'':' - it will not block, and the nightly ask and morning check are dormant. State is preserved.')});
+    }
+    res.json({enabled:daybookGateEnabled(), blocking:daybookIsBlocking(), usage:'?set=off or ?set=on'});
+  }catch(e){ res.json({error:e.message}); }
+});
+
 app.get('/api/item-clear', function(req,res){
   try{
     var id=String(req.query.item||''); if(!id) return res.json({error:'item required'});
@@ -8290,7 +8528,10 @@ app.get('/api/item-clear', function(req,res){
 app.get('/api/master', async function(req,res){
   try{
     var audit=await buildApprovalAudit(14);
-    var pend=[].concat(audit.partialApproval||[], audit.noApproval||[], audit.onHold||[]);
+    var dis=loadDismissed();
+    var pendAll=[].concat(audit.partialApproval||[], audit.noApproval||[], audit.onHold||[]);
+    var pend=pendAll.filter(function(e){ return !(dis.items && dis.items[e.id]); });
+    var hiddenCount=pendAll.length-pend.length;
     var rows=pend.map(function(e){
       var mmC=e.mm==='yes'?'<span class="ok">M \u2713</span>':(e.mm==='hold'?'<span class="hd">M hold</span>':'<span class="wt">M pending</span>');
       var smC=e.sm==='yes'?'<span class="ok">S \u2713</span>':(e.sm==='hold'?'<span class="hd">S hold</span>':'<span class="wt">S pending</span>');
@@ -8299,6 +8540,7 @@ app.get('/api/master', async function(req,res){
       if(e.mm!=='yes') acts+='<button onclick="mv(\''+qid+'\',\'mm\',\''+ql+'\','+qa+')">Record M ok</button>';
       if(e.sm!=='yes') acts+='<button onclick="mv(\''+qid+'\',\'sm\',\''+ql+'\','+qa+')">Record S ok</button>';
       acts+='<button class="danger" onclick="cl(\''+qid+'\')">Clear</button>';
+      acts+='<button class="danger" onclick="dm(\''+qid+'\')">Dismiss</button>';
       return '<tr><td>'+escapeHtml((e.vendor||e.body||'').substring(0,60))+'</td><td class="num">'+formatINR(e.amount||0)+'</td>'+
              '<td>'+mmC+' '+smC+'</td><td>'+acts+'</td></tr>';
     }).join('');
@@ -8323,11 +8565,19 @@ app.get('/api/master', async function(req,res){
      +'<div class="cards"><div class="card"><span>Pending items (14d)</span><b>'+pend.length+'</b></div>'
      +'<div class="card"><span>Backlog items</span><b>'+bk.rows.length+'</b></div>'
      +'<div class="card"><span>Backlog value</span><b>\u20b9'+formatINR(bk.total)+'</b></div>'
-     +'<div class="card"><span>Day book</span><b style="font-size:13px">'+(daybookIsBlocking()?'BLOCKING':'ok')+'</b>'
+     +'<div class="card"><span>Day book</span><b style="font-size:13px">'+(!daybookGateEnabled()?'GATE OFF':(daybookIsBlocking()?'BLOCKING':'ok'))+'</b>'
      +'<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">'
      +(daybookIsBlocking()?'<button onclick="db(\'override\')" style="background:#1d7a4c;color:#fff;border:0">Lift block</button>':'')
-     +'<button onclick="db(\'ask\')">Ask Abhishek</button>'
+     +(daybookGateEnabled()?'<button onclick="db(\'ask\')">Ask Abhishek</button>':'')
+     +(daybookGateEnabled()
+        ? '<button class="danger" onclick="gate(\'off\')">Turn gate OFF</button>'
+        : '<button style="background:#1d7a4c;color:#fff;border:0" onclick="gate(\'on\')">Turn gate ON</button>')
      +'</div></div></div>'
+     +(pend.length?('<div style="margin:10px 0"><button class="danger" style="padding:8px 14px" onclick="dmAll()">'
+        +'Dismiss all '+pend.length+' pending items</button>'
+        +'<span style="font-size:12px;color:#6a6d78;margin-left:10px">removes them from this queue only \u2014 nothing is deleted, approved and part-paid items are skipped</span></div>'):'')
+     +(hiddenCount?('<div style="font-size:12px;color:#6a6d78;margin:6px 0">'+hiddenCount
+        +' item(s) previously dismissed and hidden. <a href="/api/pending-restore?item=all">Restore them</a></div>'):'')
      +'<div class="links"><a href="/api/backlog">Backlog \u2014 bulk write-off / mark paid \u2192</a>'
      +'<a href="/api/panel">Classic panel \u2192</a><a href="/api/outflow-log">Payments log \u2192</a><a href="/api/daybook-status">Day-book JSON \u2192</a></div><br>'
      +'<table><tr><th>Request</th><th>Amount</th><th>M / S</th><th>Actions</th></tr>'+(rows||'<tr><td colspan=4>Nothing pending in the last 14 days.</td></tr>')+'</table>'
@@ -8336,6 +8586,19 @@ app.get('/api/master', async function(req,res){
      +'document.getElementById("p0").classList.toggle("hide",i!==0);document.getElementById("p1").classList.toggle("hide",i!==1);}'
      +'function mv(id,role,label,amt){if(!confirm("Record "+role.toUpperCase()+"\'s YES for:\\n"+decodeURIComponent(label)+"\\n\\nStamped [panel:MM] and announced in the group."))return;'
      +'fetch("/api/manual-verdict?item="+id+"&role="+role+"&v=yes&label="+label+"&amount="+amt).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);location.reload();});}'
+     +'function dm(id){if(!confirm("Dismiss this item from the pending queue?\\n\\nIt stays in the group and in history \u2014 it is only hidden from this list."))return;'
+     +'fetch("/api/pending-dismiss?item="+id).then(r=>r.json()).then(j=>{if(j.error)alert(j.error);location.reload();});}'
+     +'function dmAll(){fetch("/api/pending-dismiss-all").then(r=>r.json()).then(j=>{'
+     +'if(j.error)return alert(j.error);'
+     +'if(!j.wouldDismiss)return alert("Nothing to dismiss.");'
+     +'if(!confirm("Dismiss "+j.wouldDismiss+" pending item(s)?\\n\\n"'
+     +'+(j.skipped?("Skipping "+j.skipped+" that are approved or part-paid.\\n\\n"):"")'
+     +'+"Nothing is deleted. They stay in the group and in history, and can be restored."))return;'
+     +'fetch("/api/pending-dismiss-all?commit=1").then(r=>r.json()).then(k=>{alert("Dismissed "+k.wouldDismiss+" item(s).");location.reload();});});}'
+     +'function gate(a){var q=(a==="off")'
+     +'?"Turn the day-book gate OFF?\\n\\nIt will stop blocking expense requests, and the nightly ask and morning check go dormant. Nothing is lost \u2014 turning it back on resumes where it left off."'
+     +':"Turn the day-book gate back ON?";'
+     +'if(!confirm(q))return;fetch("/api/daybook-gate?set="+a).then(r=>r.json()).then(j=>{alert(j.msg||JSON.stringify(j));location.reload();});}'
      +'function db(a){var q=(a==="override")?"Lift the day-book block for yesterday? Expense requests reopen immediately.":"Send Abhishek the day-book closure request now?";'
      +'if(!confirm(q))return;fetch("/api/daybook-"+a).then(r=>r.json()).then(j=>{alert(j.msg||j.sent||j.note||JSON.stringify(j));location.reload();});}'
      +'function cl(id){if(!confirm("Clear all verdicts on this item? It stays in the group; M and S can vote again."))return;'
